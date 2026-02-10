@@ -629,10 +629,10 @@ async def auth_github_callback(code: str, state: str = ""):
     user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
     # For desktop apps: redirect to custom scheme with token
-    # For web: return JSON
     if state.startswith("forge-ide"):
         return RedirectResponse(f"forge-ide://auth?token={token}")
-    return {"token": token, "user": user_info}
+    # For browser: show success page
+    return auth.success_page(user_info, token)
 
 
 # ── Auth: Google OAuth ────────────────────────────────────────────
@@ -651,7 +651,7 @@ async def auth_google_callback(code: str, state: str = ""):
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
     if state.startswith("forge-ide"):
         return RedirectResponse(f"forge-ide://auth?token={token}")
-    return {"token": token, "user": user_info}
+    return auth.success_page(user_info, token)
 
 
 # ── Auth: Current user ────────────────────────────────────────────

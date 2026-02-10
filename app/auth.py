@@ -24,6 +24,7 @@ from typing import Optional
 import httpx
 import jwt
 from fastapi import HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,47 @@ async def google_exchange_code(code: str) -> dict:
             "avatar": user_data.get("picture", ""),
             "username": user_data.get("email", "").split("@")[0],
         }
+
+
+# ── Success page ──────────────────────────────────────────────────
+
+def success_page(user_info: dict, token: str) -> HTMLResponse:
+    """Return a nice HTML page after successful OAuth."""
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Forge AI — Signed In</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                   background: #1e1e2e; color: #cdd6f4; display: flex;
+                   justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+            .card {{ background: #313244; border-radius: 12px; padding: 40px;
+                    max-width: 400px; text-align: center; box-shadow: 0 4px 24px rgba(0,0,0,0.3); }}
+            .avatar {{ width: 64px; height: 64px; border-radius: 50%; margin-bottom: 16px; }}
+            h1 {{ font-size: 24px; margin-bottom: 8px; color: #a6e3a1; }}
+            p {{ color: #9399b2; margin-bottom: 24px; }}
+            .name {{ font-size: 18px; font-weight: 600; }}
+            .email {{ color: #9399b2; font-size: 14px; }}
+            .token-box {{ background: #1e1e2e; border-radius: 8px; padding: 12px;
+                         font-family: monospace; font-size: 11px; word-break: break-all;
+                         color: #89b4fa; margin-top: 16px; max-height: 60px; overflow: hidden; }}
+            .hint {{ color: #6c7086; font-size: 12px; margin-top: 16px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <img class="avatar" src="{user_info.get('avatar', '')}" alt="">
+            <h1>✓ Signed in!</h1>
+            <p class="name">{user_info.get('name', '')}</p>
+            <p class="email">{user_info.get('email', '')}</p>
+            <p>You can now use Forge AI in the IDE.</p>
+            <div class="hint">You can close this tab.</div>
+            <div class="token-box">{token[:50]}...</div>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 # ── User DB operations ───────────────────────────────────────────
