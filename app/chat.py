@@ -90,7 +90,8 @@ def build_context_from_results(search_results: list, trace_data: dict = None, im
     if search_results:
         parts.append("## Relevant Code\n")
         for r in search_results[:8]:
-            parts.append(f"### {r['symbol_type']} `{r['name']}` — `{r['file_path']}:{r['start_line']}-{r['end_line']}`")
+            sym_type = r.get('symbol_type') or r.get('kind', 'symbol')
+            parts.append(f"### {sym_type} `{r['name']}` — `{r['file_path']}:{r['start_line']}-{r['end_line']}`")
             if r.get("signature"):
                 parts.append(f"Signature: `{r['signature']}`")
             parts.append(f"```\n{r['content']}\n```")
