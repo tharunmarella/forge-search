@@ -12,6 +12,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -21,7 +22,7 @@ load_dotenv()  # Load .env file for local dev (no-op if missing)
 
 from fastapi import FastAPI, HTTPException
 
-from . import store, embeddings
+from . import store, embeddings, watcher
 from .models import (
     IndexRequest, IndexResponse,
     SearchRequest, SearchResponse, SearchResult, RelatedSymbol,
@@ -29,6 +30,7 @@ from .models import (
     HealthResponse,
     TraceRequest, TraceResponse, TraceNode, TraceEdge,
     ImpactRequest, ImpactResponse, AffectedFile, AffectedSymbol,
+    WatchRequest, WatchResponse,
 )
 from .parser import parse_file, SymbolDef, SymbolRef, FileParseResult
 
@@ -449,6 +451,156 @@ async def impact_analysis(req: ImpactRequest):
     )
 
 
+# ── Internal: index files (reusable by /index and /watch) ─────────
+
+async def _index_files_internal(workspace_id: str, files: list[dict]) -> dict:
+    """Shared indexing logic used by both /index endpoint and watcher."""
+    total_nodes = 0
+    total_rels = 0
+    total_embeddings = 0
+    files_indexed = 0
+
+    for file_payload in files:
+        try:
+            existing_hash = await store.get_file_hash(workspace_id, file_payload["path"])
+            parse_result = parse_file(file_payload["path"], file_payload["content"])
+
+            if existing_hash == parse_result.content_hash:
+                continue
+
+            calls_map, called_by_map = _build_context_maps(parse_result)
+
+            enriched_texts: dict[str, str] = {}
+            for defn in parse_result.definitions:
+                uid = f"{defn.file_path}:{defn.name}:{defn.start_line}"
+                enriched_texts[uid] = _build_enriched_text(
+                    defn, calls_map, called_by_map, parse_result.imports,
+                )
+
+            if enriched_texts:
+                texts_list = list(enriched_texts.values())
+                uids_list = list(enriched_texts.keys())
+                raw_embeddings = await embeddings.embed_batch(texts_list)
+                embedding_map = dict(zip(uids_list, raw_embeddings))
+                total_embeddings += len(embedding_map)
+            else:
+                embedding_map = {}
+
+            stats = await store.index_file_result(
+                workspace_id, parse_result, embedding_map, enriched_texts
+            )
+            total_nodes += stats["nodes_created"]
+            total_rels += stats["relationships_created"]
+
+            if parse_result.references:
+                await store.build_call_edges(workspace_id, parse_result.references)
+                total_rels += len(parse_result.references)
+
+            if parse_result.imports:
+                await store.build_import_edges(
+                    workspace_id, file_payload["path"], parse_result.imports
+                )
+
+            files_indexed += 1
+        except Exception as e:
+            logger.error("Failed to index %s: %s", file_payload["path"], e, exc_info=True)
+            continue
+
+    return {
+        "files_indexed": files_indexed,
+        "nodes_created": total_nodes,
+        "relationships_created": total_rels,
+        "embeddings_generated": total_embeddings,
+    }
+
+
+# ── POST /watch ───────────────────────────────────────────────────
+
+@app.post("/watch", response_model=WatchResponse)
+async def watch_directory(req: WatchRequest):
+    """
+    Start intelligent watching of a codebase directory.
+
+    - Debounces rapid saves (AI agents edit many files at once)
+    - Skips non-code files and gitignored paths
+    - Detects structural changes (new/deleted/renamed symbols)
+    - Cascade re-embeds callers when a function signature changes
+    """
+    from pathlib import Path
+
+    root = Path(req.root_path)
+    if not root.exists():
+        raise HTTPException(status_code=400, detail=f"Path does not exist: {req.root_path}")
+
+    # If already watching, stop the old watcher
+    watcher.stop_watching(req.workspace_id)
+
+    # Do an initial scan and index
+    stats = await watcher.scan_and_index(
+        req.workspace_id, root, store, _index_files_internal,
+    )
+
+    # Start background watcher
+    task = asyncio.create_task(
+        watcher.start_watching(
+            req.workspace_id, root, store, _index_files_internal,
+        )
+    )
+    watcher._watchers[req.workspace_id] = task
+
+    return WatchResponse(
+        workspace_id=req.workspace_id,
+        status="watching",
+        files_scanned=stats["files_scanned"],
+        files_changed=stats["files_changed"],
+        symbols_added=stats["symbols_added"],
+        symbols_removed=stats["symbols_removed"],
+        symbols_modified=stats["symbols_modified"],
+        cascade_reembeds=stats["cascade_reembeds"],
+        time_ms=stats["time_ms"],
+    )
+
+
+# ── POST /scan ────────────────────────────────────────────────────
+
+@app.post("/scan", response_model=WatchResponse)
+async def scan_directory(req: WatchRequest):
+    """
+    One-shot intelligent scan — detect and index only what changed.
+    Same intelligence as /watch but doesn't start a background watcher.
+    """
+    from pathlib import Path
+
+    root = Path(req.root_path)
+    if not root.exists():
+        raise HTTPException(status_code=400, detail=f"Path does not exist: {req.root_path}")
+
+    stats = await watcher.scan_and_index(
+        req.workspace_id, root, store, _index_files_internal,
+    )
+
+    return WatchResponse(
+        workspace_id=req.workspace_id,
+        status="scan_complete",
+        files_scanned=stats["files_scanned"],
+        files_changed=stats["files_changed"],
+        symbols_added=stats["symbols_added"],
+        symbols_removed=stats["symbols_removed"],
+        symbols_modified=stats["symbols_modified"],
+        cascade_reembeds=stats["cascade_reembeds"],
+        time_ms=stats["time_ms"],
+    )
+
+
+# ── DELETE /watch ─────────────────────────────────────────────────
+
+@app.delete("/watch/{workspace_id}")
+async def stop_watch(workspace_id: str):
+    """Stop watching a workspace."""
+    stopped = watcher.stop_watching(workspace_id)
+    return {"workspace_id": workspace_id, "stopped": stopped}
+
+
 # ── GET /health ───────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
@@ -459,5 +611,5 @@ async def health():
     return HealthResponse(
         status=status,
         store_ok=store_ok,
-        version="0.2.0",
+        version="1.0.0",
     )

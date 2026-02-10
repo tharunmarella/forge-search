@@ -137,3 +137,23 @@ class ImpactResponse(BaseModel):
     total_affected: int
     files_affected: int
     by_file: list[AffectedFile]
+
+
+# ── Watch models ─────────────────────────────────────────────────
+
+
+class WatchRequest(BaseModel):
+    workspace_id: str
+    root_path: str  # Absolute path to codebase directory
+
+
+class WatchResponse(BaseModel):
+    workspace_id: str
+    status: str  # "watching", "stopped", "scan_complete"
+    files_scanned: int = 0
+    files_changed: int = 0
+    symbols_added: int = 0
+    symbols_removed: int = 0
+    symbols_modified: int = 0
+    cascade_reembeds: int = 0
+    time_ms: float = 0
