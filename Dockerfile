@@ -14,6 +14,6 @@ COPY app/ ./app/
 RUN mkdir -p /app/data
 ENV STORE_DB_PATH=/app/data/forge_search.db
 
-EXPOSE 8000
+EXPOSE 8080
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
