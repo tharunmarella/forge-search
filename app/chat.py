@@ -47,30 +47,36 @@ async def chat_with_context(
     ]
 
     t0 = time.time()
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+            )
+            resp_status = resp.status_code
+            resp_text = resp.text
+            resp_data = resp.json() if resp_status == 200 else None
+    except Exception as e:
+        logger.error("Groq API call failed: %s", e)
+        return {"response": f"Groq API error: {e}", "tokens": 0, "time_ms": 0, "model": GROQ_MODEL}
 
-    if resp.status_code != 200:
-        return {"response": f"Groq error: {resp.text[:300]}", "tokens": 0, "time_ms": 0, "model": GROQ_MODEL}
+    if resp_status != 200:
+        return {"response": f"Groq error ({resp_status}): {resp_text[:300]}", "tokens": 0, "time_ms": 0, "model": GROQ_MODEL}
 
-    data = resp.json()
-    usage = data.get("usage", {})
+    usage = resp_data.get("usage", {})
     elapsed_ms = (time.time() - t0) * 1000
 
     return {
-        "response": data["choices"][0]["message"]["content"],
+        "response": resp_data["choices"][0]["message"]["content"],
         "tokens": usage.get("completion_tokens", 0),
         "time_ms": round(elapsed_ms, 1),
         "model": GROQ_MODEL,

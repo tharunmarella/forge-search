@@ -678,25 +678,30 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     """
     t0 = time.monotonic()
 
-    # 1. Search for relevant code
-    search_results = await store.vector_search(req.workspace_id, await embeddings.embed_query(req.question), top_k=8)
-    flat_results = [r["symbol"] for r in search_results]
+    try:
+        # 1. Search for relevant code
+        query_emb = await embeddings.embed_query(req.question)
+        search_results = await store.vector_search(req.workspace_id, query_emb, top_k=8)
+        flat_results = [r["symbol"] for r in search_results]
 
-    # 2. Optionally trace top result
-    trace_data = None
-    if flat_results and req.include_trace:
-        top_name = flat_results[0]["name"]
-        trace_data = await store.trace_call_chain(req.workspace_id, top_name, direction="both", max_depth=2)
+        # 2. Optionally trace top result
+        trace_data = None
+        if flat_results and req.include_trace:
+            top_name = flat_results[0]["name"]
+            trace_data = await store.trace_call_chain(req.workspace_id, top_name, direction="both", max_depth=2)
 
-    # 3. Optionally get impact
-    impact_data = None
-    if flat_results and req.include_impact:
-        top_name = flat_results[0]["name"]
-        impact_data = await store.impact_analysis(req.workspace_id, top_name, max_depth=3)
+        # 3. Optionally get impact
+        impact_data = None
+        if flat_results and req.include_impact:
+            top_name = flat_results[0]["name"]
+            impact_data = await store.impact_analysis(req.workspace_id, top_name, max_depth=3)
 
-    # 4. Build context and ask LLM
-    context = chat.build_context_from_results(flat_results, trace_data, impact_data)
-    llm_result = await chat.chat_with_context(req.question, context, req.max_tokens, req.temperature)
+        # 4. Build context and ask LLM
+        context = chat.build_context_from_results(flat_results, trace_data, impact_data)
+        llm_result = await chat.chat_with_context(req.question, context, req.max_tokens, req.temperature)
+    except Exception as e:
+        logger.error("Chat failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)[:200]}")
 
     elapsed = (time.monotonic() - t0) * 1000
 
