@@ -157,3 +157,25 @@ class WatchResponse(BaseModel):
     symbols_modified: int = 0
     cascade_reembeds: int = 0
     time_ms: float = 0
+
+
+# ── Chat models ──────────────────────────────────────────────────
+
+
+class ChatRequest(BaseModel):
+    workspace_id: str
+    question: str
+    include_trace: bool = Field(default=True, description="Include call chain for top result")
+    include_impact: bool = Field(default=False, description="Include impact analysis for top result")
+    max_tokens: int = Field(default=1024, ge=1, le=4096)
+    temperature: float = Field(default=0.1, ge=0, le=1)
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    model: str
+    tokens: int = 0
+    context_symbols: int = 0
+    search_time_ms: float = 0
+    llm_time_ms: float = 0
+    total_time_ms: float = 0

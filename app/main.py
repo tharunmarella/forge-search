@@ -1,12 +1,21 @@
 """
 Forge Search API — Code intelligence for any codebase.
 
-Endpoints:
+Auth:
+  GET  /auth/github          — Start GitHub OAuth
+  GET  /auth/github/callback — GitHub OAuth callback
+  GET  /auth/google          — Start Google OAuth
+  GET  /auth/google/callback — Google OAuth callback
+  GET  /auth/me              — Current user info
+
+Code Intelligence:
   POST /index    — Parse + embed + store code symbols
   POST /search   — Semantic code search
   POST /trace    — Deep call chain traversal
   POST /impact   — Blast radius analysis
-  POST /reindex  — Force full re-index
+  POST /chat     — AI chat (search context + Groq Kimi-K2)
+  POST /watch    — Intelligent file watcher
+  POST /scan     — One-shot intelligent scan
   GET  /health   — Healthcheck
 """
 
@@ -20,9 +29,11 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file for local dev (no-op if missing)
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 
-from . import store, embeddings, watcher
+from fastapi.responses import RedirectResponse
+
+from . import store, embeddings, watcher, auth, chat
 from .models import (
     IndexRequest, IndexResponse,
     SearchRequest, SearchResponse, SearchResult, RelatedSymbol,
@@ -31,6 +42,7 @@ from .models import (
     TraceRequest, TraceResponse, TraceNode, TraceEdge,
     ImpactRequest, ImpactResponse, AffectedFile, AffectedSymbol,
     WatchRequest, WatchResponse,
+    ChatRequest, ChatResponse,
 )
 from .parser import parse_file, SymbolDef, SymbolRef, FileParseResult
 
@@ -142,7 +154,8 @@ async def lifespan(app: FastAPI):
     """Startup/shutdown hooks."""
     logger.info("Starting Forge Search API...")
     await store.ensure_schema()
-    logger.info("Store ready")
+    auth.ensure_user_table(store._get_conn())
+    logger.info("Store ready (auth enabled)")
     yield
     logger.info("Shutting down...")
     await store.close_driver()
@@ -599,6 +612,103 @@ async def stop_watch(workspace_id: str):
     """Stop watching a workspace."""
     stopped = watcher.stop_watching(workspace_id)
     return {"workspace_id": workspace_id, "stopped": stopped}
+
+
+# ── Auth: GitHub OAuth ────────────────────────────────────────────
+
+@app.get("/auth/github")
+async def auth_github():
+    """Start GitHub OAuth flow — redirects to GitHub."""
+    return RedirectResponse(auth.github_auth_url())
+
+
+@app.get("/auth/github/callback")
+async def auth_github_callback(code: str, state: str = ""):
+    """GitHub OAuth callback — creates user, returns JWT."""
+    user_info = await auth.github_exchange_code(code)
+    user_id = auth.upsert_user(store._get_conn(), user_info)
+    token = auth.create_token(user_id, user_info["email"], user_info["name"])
+    # For desktop apps: redirect to custom scheme with token
+    # For web: return JSON
+    if state.startswith("forge-ide"):
+        return RedirectResponse(f"forge-ide://auth?token={token}")
+    return {"token": token, "user": user_info}
+
+
+# ── Auth: Google OAuth ────────────────────────────────────────────
+
+@app.get("/auth/google")
+async def auth_google():
+    """Start Google OAuth flow — redirects to Google."""
+    return RedirectResponse(auth.google_auth_url())
+
+
+@app.get("/auth/google/callback")
+async def auth_google_callback(code: str, state: str = ""):
+    """Google OAuth callback — creates user, returns JWT."""
+    user_info = await auth.google_exchange_code(code)
+    user_id = auth.upsert_user(store._get_conn(), user_info)
+    token = auth.create_token(user_id, user_info["email"], user_info["name"])
+    if state.startswith("forge-ide"):
+        return RedirectResponse(f"forge-ide://auth?token={token}")
+    return {"token": token, "user": user_info}
+
+
+# ── Auth: Current user ────────────────────────────────────────────
+
+@app.get("/auth/me")
+async def auth_me(user: dict = Depends(auth.require_user)):
+    """Get current authenticated user."""
+    return {"user_id": user["sub"], "email": user["email"], "name": user["name"]}
+
+
+# ── POST /chat ────────────────────────────────────────────────────
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_user)):
+    """
+    AI Chat — asks a question about the codebase.
+
+    1. Searches for relevant code (semantic search)
+    2. Optionally traces call chains
+    3. Sends context + question to Groq Kimi-K2
+    4. Returns precise, codebase-aware answer
+
+    No API keys needed — user just signs in.
+    """
+    t0 = time.monotonic()
+
+    # 1. Search for relevant code
+    search_results = await store.vector_search(req.workspace_id, await embeddings.embed_query(req.question), top_k=8)
+    flat_results = [r["symbol"] for r in search_results]
+
+    # 2. Optionally trace top result
+    trace_data = None
+    if flat_results and req.include_trace:
+        top_name = flat_results[0]["name"]
+        trace_data = await store.trace_call_chain(req.workspace_id, top_name, direction="both", max_depth=2)
+
+    # 3. Optionally get impact
+    impact_data = None
+    if flat_results and req.include_impact:
+        top_name = flat_results[0]["name"]
+        impact_data = await store.impact_analysis(req.workspace_id, top_name, max_depth=3)
+
+    # 4. Build context and ask LLM
+    context = chat.build_context_from_results(flat_results, trace_data, impact_data)
+    llm_result = await chat.chat_with_context(req.question, context, req.max_tokens, req.temperature)
+
+    elapsed = (time.monotonic() - t0) * 1000
+
+    return ChatResponse(
+        answer=llm_result["response"],
+        model=llm_result["model"],
+        tokens=llm_result["tokens"],
+        context_symbols=len(flat_results),
+        search_time_ms=round(elapsed - llm_result["time_ms"], 1),
+        llm_time_ms=llm_result["time_ms"],
+        total_time_ms=round(elapsed, 1),
+    )
 
 
 # ── GET /health ───────────────────────────────────────────────────
