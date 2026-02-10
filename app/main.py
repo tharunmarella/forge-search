@@ -1,11 +1,13 @@
 """
-Forge Search API -- FastAPI application.
+Forge Search API — Code intelligence for any codebase.
 
 Endpoints:
-  POST /index    -- Parse + embed + store files in Neo4j
-  POST /search   -- Semantic + graph search
-  POST /reindex  -- Force full re-index of a workspace
-  GET  /health   -- Healthcheck
+  POST /index    — Parse + embed + store code symbols
+  POST /search   — Semantic code search
+  POST /trace    — Deep call chain traversal
+  POST /impact   — Blast radius analysis
+  POST /reindex  — Force full re-index
+  GET  /health   — Healthcheck
 """
 
 from __future__ import annotations
@@ -14,16 +16,21 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file for local dev (no-op if missing)
+
 from fastapi import FastAPI, HTTPException
 
-from . import graph, embeddings
+from . import store, embeddings
 from .models import (
     IndexRequest, IndexResponse,
     SearchRequest, SearchResponse, SearchResult, RelatedSymbol,
     ReindexRequest,
     HealthResponse,
+    TraceRequest, TraceResponse, TraceNode, TraceEdge,
+    ImpactRequest, ImpactResponse, AffectedFile, AffectedSymbol,
 )
-from .parser import parse_file
+from .parser import parse_file, SymbolDef, SymbolRef, FileParseResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,23 +39,117 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Context-enriched embedding text ──────────────────────────────
+
+def _build_enriched_text(
+    defn: SymbolDef,
+    calls_map: dict[str, list[str]],
+    called_by_map: dict[str, list[str]],
+    imports: list[str],
+) -> str:
+    """
+    Build a context-enriched text for a symbol to embed.
+
+    Instead of embedding raw source code, we prepend structured context
+    so the embedding captures *what this code means in the system*:
+      - Where it lives (file path, module)
+      - What it is (kind, parent type)
+      - What it connects to (calls, called by)
+      - Its actual code
+
+    This is how a developer reads code: with surrounding context.
+    """
+    parts: list[str] = []
+
+    # Location context
+    parts.append(f"[File] {defn.file_path}")
+
+    # Module hint from file path (e.g., "database/connection_manager")
+    module = defn.file_path.rsplit(".", 1)[0].replace("/src/", "/").replace("\\", "/")
+    parts.append(f"[Module] {module}")
+
+    # Symbol identity
+    parts.append(f"[{defn.kind.capitalize()}] {defn.name}")
+
+    if defn.parent:
+        parts.append(f"[Parent] {defn.parent}")
+
+    # Signature (the most important single line)
+    if defn.signature:
+        parts.append(f"[Signature] {defn.signature}")
+
+    # Relationship context -- what does this symbol connect to?
+    outgoing = calls_map.get(defn.name)
+    if outgoing:
+        # Deduplicate and limit
+        unique_calls = list(dict.fromkeys(outgoing))[:15]
+        parts.append(f"[Calls] {', '.join(unique_calls)}")
+
+    incoming = called_by_map.get(defn.name)
+    if incoming:
+        unique_callers = list(dict.fromkeys(incoming))[:10]
+        parts.append(f"[Called by] {', '.join(unique_callers)}")
+
+    # Key imports for module-level context
+    if imports:
+        # Keep short -- just the first few meaningful imports
+        short_imports = [imp.split("::")[-1].split(".")[-1] for imp in imports[:8]]
+        parts.append(f"[Imports] {', '.join(short_imports)}")
+
+    # The actual source code
+    parts.append("")
+    parts.append(defn.content)
+
+    return "\n".join(parts)
+
+
+def _build_context_maps(
+    parse_result: FileParseResult,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """
+    From a file's parse result, build:
+      - calls_map:     {caller_name: [callee_name, ...]}
+      - called_by_map: {callee_name: [caller_name, ...]}
+    """
+    calls_map: dict[str, list[str]] = {}
+    called_by_map: dict[str, list[str]] = {}
+
+    # Set of defined symbol names in this file for filtering
+    defined_names = {d.name for d in parse_result.definitions}
+
+    for ref in parse_result.references:
+        if not ref.context_name:
+            continue
+        # Only include if both caller and callee are defined in this file
+        # (cross-file relationships are handled by the graph layer)
+        caller = ref.context_name
+        callee = ref.name
+
+        calls_map.setdefault(caller, []).append(callee)
+
+        if callee in defined_names:
+            called_by_map.setdefault(callee, []).append(caller)
+
+    return calls_map, called_by_map
+
+
 # ── App lifecycle ─────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown hooks."""
     logger.info("Starting Forge Search API...")
-    await graph.ensure_schema()
-    logger.info("Neo4j schema ready")
+    await store.ensure_schema()
+    logger.info("Store ready")
     yield
     logger.info("Shutting down...")
-    await graph.close_driver()
+    await store.close_driver()
 
 
 app = FastAPI(
     title="Forge Search API",
-    description="Cloud-hosted code intelligence with Neo4j graph + Gemini embeddings",
-    version="0.1.0",
+    description="Code intelligence API — semantic search, call tracing, impact analysis",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -58,7 +159,7 @@ app = FastAPI(
 @app.post("/index", response_model=IndexResponse)
 async def index_files(req: IndexRequest):
     """
-    Index source files into the code graph.
+    Index source files into the code store.
 
     Incremental: only re-indexes files whose content hash has changed.
     """
@@ -73,7 +174,7 @@ async def index_files(req: IndexRequest):
     for file_payload in req.files:
         try:
             # Check if file has changed
-            existing_hash = await graph.get_file_hash(workspace_id, file_payload.path)
+            existing_hash = await store.get_file_hash(workspace_id, file_payload.path)
 
             # Parse the file
             parse_result = parse_file(file_payload.path, file_payload.content)
@@ -82,29 +183,44 @@ async def index_files(req: IndexRequest):
                 logger.debug("Skipping unchanged file: %s", file_payload.path)
                 continue
 
-            # Generate embeddings for all definitions
-            contents_to_embed = [d.content for d in parse_result.definitions]
-            if contents_to_embed:
-                embedding_map = await embeddings.embed_texts_to_map(contents_to_embed)
+            # Build context maps from references (what calls what)
+            calls_map, called_by_map = _build_context_maps(parse_result)
+
+            # Build context-enriched text for each definition
+            # This is what gets embedded -- raw code + structured context
+            enriched_texts: dict[str, str] = {}  # defn uid -> enriched text
+            for defn in parse_result.definitions:
+                uid = f"{defn.file_path}:{defn.name}:{defn.start_line}"
+                enriched_texts[uid] = _build_enriched_text(
+                    defn, calls_map, called_by_map, parse_result.imports,
+                )
+
+            # Generate embeddings from enriched text
+            if enriched_texts:
+                texts_list = list(enriched_texts.values())
+                uids_list = list(enriched_texts.keys())
+                raw_embeddings = await embeddings.embed_batch(texts_list)
+                # Map uid -> embedding for graph storage
+                embedding_map = dict(zip(uids_list, raw_embeddings))
                 total_embeddings += len(embedding_map)
             else:
                 embedding_map = {}
 
-            # Store in Neo4j
-            stats = await graph.index_file_result(
-                workspace_id, parse_result, embedding_map
+            # Store in Neo4j (pass enriched texts for storage too)
+            stats = await store.index_file_result(
+                workspace_id, parse_result, embedding_map, enriched_texts
             )
             total_nodes += stats["nodes_created"]
             total_rels += stats["relationships_created"]
 
             # Build call graph edges from references
             if parse_result.references:
-                await graph.build_call_edges(workspace_id, parse_result.references)
+                await store.build_call_edges(workspace_id, parse_result.references)
                 total_rels += len(parse_result.references)
 
             # Build import edges
             if parse_result.imports:
-                await graph.build_import_edges(
+                await store.build_import_edges(
                     workspace_id, file_payload.path, parse_result.imports
                 )
 
@@ -152,7 +268,7 @@ async def search_code(req: SearchRequest):
 
     # Vector search
     try:
-        raw_results = await graph.vector_search(
+        raw_results = await store.vector_search(
             req.workspace_id, query_embedding, req.top_k
         )
     except Exception as e:
@@ -170,7 +286,7 @@ async def search_code(req: SearchRequest):
     # Expand neighbors for graph context
     symbol_uids = [r["symbol"]["uid"] for r in raw_results]
     try:
-        neighbors = await graph.expand_neighbors(req.workspace_id, symbol_uids)
+        neighbors = await store.expand_neighbors(req.workspace_id, symbol_uids)
     except Exception as e:
         logger.warning("Neighbor expansion failed: %s", e)
         neighbors = []
@@ -220,7 +336,7 @@ async def search_code(req: SearchRequest):
         ))
 
     # Get workspace stats
-    stats = await graph.get_workspace_stats(req.workspace_id)
+    stats = await store.get_workspace_stats(req.workspace_id)
     elapsed = (time.monotonic() - t0) * 1000
 
     logger.info(
@@ -242,7 +358,7 @@ async def search_code(req: SearchRequest):
 @app.post("/reindex", response_model=IndexResponse)
 async def reindex_workspace(req: ReindexRequest):
     """Force a full re-index by clearing the workspace first."""
-    await graph.clear_workspace(req.workspace_id)
+    await store.clear_workspace(req.workspace_id)
     # Return empty response -- the caller should follow up with /index
     return IndexResponse(
         workspace_id=req.workspace_id,
@@ -254,15 +370,94 @@ async def reindex_workspace(req: ReindexRequest):
     )
 
 
+# ── POST /trace ───────────────────────────────────────────────────
+
+@app.post("/trace", response_model=TraceResponse)
+async def trace_symbol(req: TraceRequest):
+    """
+    Deep call-chain traversal.
+
+    Walks the CALLS graph upstream and/or downstream from a symbol
+    to build the full execution flow — like a developer tracing through
+    the code to understand "how does this work end to end?"
+
+    Returns a subgraph of nodes and edges.
+    """
+    t0 = time.monotonic()
+
+    result = await store.trace_call_chain(
+        req.workspace_id,
+        req.symbol_name,
+        direction=req.direction,
+        max_depth=req.max_depth,
+    )
+
+    elapsed = (time.monotonic() - t0) * 1000
+    logger.info(
+        "Trace workspace=%s symbol=%r direction=%s -> %d nodes, %d edges in %.0fms",
+        req.workspace_id, req.symbol_name, req.direction,
+        len(result["nodes"]), len(result["edges"]), elapsed,
+    )
+
+    return TraceResponse(
+        root=result["root"],
+        nodes=[TraceNode(**n) for n in result["nodes"]],
+        edges=[TraceEdge(**e) for e in result["edges"]],
+        depth_reached=result["depth_reached"],
+    )
+
+
+# ── POST /impact ──────────────────────────────────────────────────
+
+@app.post("/impact", response_model=ImpactResponse)
+async def impact_analysis(req: ImpactRequest):
+    """
+    Blast radius analysis.
+
+    "If I change this symbol, what else is affected?"
+
+    Walks upstream through CALLS, BELONGS_TO, and file IMPORTS
+    to find every symbol and file that depends on the target.
+    Groups results by file for a developer-friendly view.
+    """
+    t0 = time.monotonic()
+
+    result = await store.impact_analysis(
+        req.workspace_id,
+        req.symbol_name,
+        max_depth=req.max_depth,
+    )
+
+    elapsed = (time.monotonic() - t0) * 1000
+    logger.info(
+        "Impact workspace=%s symbol=%r -> %d affected across %d files in %.0fms",
+        req.workspace_id, req.symbol_name,
+        result["total_affected"], result["files_affected"], elapsed,
+    )
+
+    return ImpactResponse(
+        symbol=result["symbol"],
+        total_affected=result["total_affected"],
+        files_affected=result["files_affected"],
+        by_file=[
+            AffectedFile(
+                file_path=f["file_path"],
+                symbols=[AffectedSymbol(**s) for s in f["symbols"]],
+            )
+            for f in result["by_file"]
+        ],
+    )
+
+
 # ── GET /health ───────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """Healthcheck endpoint."""
-    neo4j_ok = await graph.check_connection()
-    status = "healthy" if neo4j_ok else "degraded"
+    store_ok = await store.check_connection()
+    status = "healthy" if store_ok else "degraded"
     return HealthResponse(
         status=status,
-        neo4j_connected=neo4j_ok,
-        version="0.1.0",
+        store_ok=store_ok,
+        version="0.2.0",
     )

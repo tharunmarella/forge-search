@@ -1,22 +1,35 @@
-FROM python:3.12-slim
+# forge-search — Code Intelligence API
+# Runs on Railway Pro (CPU only, no GPU needed)
+#
+# Embeddings: jina-code-v2 (baked into image, ~600MB RAM)
+# Store: numpy + SQLite (persistent volume)
+# LLM: Groq API (external, free tier)
+
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system deps for tree-sitter native builds
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python deps first (better layer caching)
+# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Pre-download embedding model (baked in = no cold start download)
+RUN python3 -c "\
+from sentence_transformers import SentenceTransformer; \
+m = SentenceTransformer('jinaai/jina-embeddings-v2-base-code', trust_remote_code=True); \
+print(f'Model cached: dims={m.get_sentence_embedding_dimension()}')"
+
+# Copy app
 COPY app/ ./app/
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import httpx; r = httpx.get('http://localhost:8000/health'); r.raise_for_status()"
+# Data directory for SQLite (mount Railway volume here)
+RUN mkdir -p /app/data
+ENV STORE_DB_PATH=/app/data/forge_search.db
 
 EXPOSE 8000
 

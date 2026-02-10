@@ -67,5 +67,73 @@ class IndexResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    neo4j_connected: bool
-    version: str = "0.1.0"
+    store_ok: bool
+    version: str = "0.2.0"
+
+
+# ── Deep traversal models ────────────────────────────────────────
+
+
+class TraceRequest(BaseModel):
+    workspace_id: str
+    symbol_name: str
+    direction: str = Field(
+        default="both",
+        description="'upstream' (who calls me), 'downstream' (what do I call), or 'both'",
+    )
+    max_depth: int = Field(default=5, ge=1, le=10)
+
+
+class TraceNode(BaseModel):
+    name: str
+    kind: str
+    file_path: str
+    signature: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    depth: int = 0
+    direction: str = ""  # "root", "upstream", "downstream"
+
+
+class TraceEdge(BaseModel):
+    from_symbol: str = Field(alias="from")
+    to_symbol: str = Field(alias="to")
+    type: str  # "CALLS", "BELONGS_TO"
+
+    class Config:
+        populate_by_name = True
+
+
+class TraceResponse(BaseModel):
+    root: str
+    nodes: list[TraceNode]
+    edges: list[TraceEdge]
+    depth_reached: int
+
+
+class ImpactRequest(BaseModel):
+    workspace_id: str
+    symbol_name: str
+    max_depth: int = Field(default=4, ge=1, le=8)
+
+
+class AffectedSymbol(BaseModel):
+    name: str
+    kind: str
+    signature: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    distance: int = 0
+    impact_type: str = ""  # "caller", "sibling_member", "importing_file"
+
+
+class AffectedFile(BaseModel):
+    file_path: str
+    symbols: list[AffectedSymbol]
+
+
+class ImpactResponse(BaseModel):
+    symbol: str
+    total_affected: int
+    files_affected: int
+    by_file: list[AffectedFile]
