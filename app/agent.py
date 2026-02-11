@@ -29,6 +29,7 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
+from langsmith import traceable
 
 from . import store, embeddings, chat as chat_utils
 
@@ -266,6 +267,7 @@ SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "
 
 # ── Pre-Enrichment Logic ──────────────────────────────────────────
 
+@traceable(name="pre_enrichment", run_type="chain", tags=["enrichment"])
 async def build_pre_enrichment(
     workspace_id: str,
     question: str,
@@ -347,6 +349,7 @@ def extract_symbols_from_text(text: str) -> list[str]:
 
 # ── Documentation Lookup (Context7 + DevDocs.io) ──────────────────
 
+@traceable(name="fetch_documentation", run_type="tool", tags=["documentation"])
 async def _fetch_documentation(library: str, query: str) -> str:
     """
     Fetch documentation from Context7 and DevDocs.io.
@@ -379,6 +382,7 @@ async def _fetch_documentation(library: str, query: str) -> str:
         return f"No documentation found for '{library}' with query '{query}'. Try a different library name or query."
 
 
+@traceable(name="query_context7", run_type="retriever", tags=["documentation", "context7"])
 async def _query_context7(library: str, query: str) -> str:
     """Query Context7 MCP API for library documentation."""
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -457,6 +461,7 @@ async def _query_context7(library: str, query: str) -> str:
         return ""
 
 
+@traceable(name="query_devdocs", run_type="retriever", tags=["documentation", "devdocs"])
 async def _query_devdocs(library: str, query: str) -> str:
     """Query DevDocs.io API for documentation."""
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -599,6 +604,7 @@ async def _query_devdocs(library: str, query: str) -> str:
 
 # ── Graph Nodes ───────────────────────────────────────────────────
 
+@traceable(name="enrich_context_node", run_type="chain", tags=["enrichment"])
 async def enrich_context(state: AgentState) -> dict:
     """First node: gather context BEFORE calling the LLM.
     
@@ -643,6 +649,7 @@ async def enrich_context(state: AgentState) -> dict:
     return {"enriched_context": context}
 
 
+@traceable(name="call_model_node", run_type="chain", tags=["llm"])
 async def call_model(state: AgentState) -> dict:
     """The 'Brain' node - LLM reasoning with full context."""
     enriched_context = state.get('enriched_context', '')
@@ -682,6 +689,7 @@ async def call_model(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
+@traceable(name="execute_server_tools", run_type="chain", tags=["server-tools"])
 async def execute_server_tools(state: AgentState) -> dict:
     """Execute tools that run on the server (search, trace, impact)."""
     workspace_id = state['workspace_id']

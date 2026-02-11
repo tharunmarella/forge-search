@@ -31,15 +31,16 @@ from dotenv import load_dotenv
 load_dotenv()  # Load .env file for local dev (no-op if missing)
 
 # ── LangSmith Tracing ─────────────────────────────────────────────
-# LangGraph/LangChain auto-traces when these env vars are set.
-# No code changes needed - just set the env vars!
-#
-# Required env vars:
+# LangGraph/LangChain auto-traces when these env vars are set:
 #   LANGSMITH_TRACING=true
 #   LANGSMITH_API_KEY=lsv2_pt_...
 #   LANGSMITH_PROJECT=forgeIDE  (optional, defaults to "default")
 #
-# All LangGraph agent runs, LLM calls, and tool executions will be traced.
+# We enhance the auto-tracing with:
+#   - run_name per conversation turn (e.g., "forge-chat:turn-1")
+#   - metadata (workspace, user, conversation_id, turn number)
+#   - tags (workspace, continuation/new, user)
+#   - @traceable on sub-functions (pre-enrichment, doc lookup, server tools)
 
 from fastapi import FastAPI, HTTPException, Depends
 
@@ -703,14 +704,16 @@ async def stop_watch(workspace_id: str):
 # ── Auth: GitHub OAuth ────────────────────────────────────────────
 
 @app.get("/auth/github")
-async def auth_github():
+async def auth_github(state: str = ""):
     """Start GitHub OAuth flow — redirects to GitHub."""
-    return RedirectResponse(auth.github_auth_url())
+    logger.info("[auth] GitHub OAuth start, state=%r", state)
+    return RedirectResponse(auth.github_auth_url(state=state))
 
 
 @app.get("/auth/github/callback")
 async def auth_github_callback(code: str, state: str = ""):
     """GitHub OAuth callback — creates user, returns JWT."""
+    logger.info("[auth] GitHub callback received, state=%r", state)
     user_info = await auth.github_exchange_code(code)
     user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
@@ -741,14 +744,15 @@ async def auth_github_callback(code: str, state: str = ""):
 # ── Auth: Google OAuth ────────────────────────────────────────────
 
 @app.get("/auth/google")
-async def auth_google():
+async def auth_google(state: str = ""):
     """Start Google OAuth flow — redirects to Google."""
-    return RedirectResponse(auth.google_auth_url())
+    return RedirectResponse(auth.google_auth_url(state=state))
 
 
 @app.get("/auth/google/callback")
 async def auth_google_callback(code: str, state: str = ""):
     """Google OAuth callback — creates user, returns JWT."""
+    logger.info("[auth] Google callback received, state=%r", state)
     user_info = await auth.google_exchange_code(code)
     user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
@@ -794,6 +798,7 @@ async def auth_poll(session_id: str):
         - {"status": "expired"} if session expired or not found
     """
     if session_id not in _pending_auth:
+        # Only log every ~12th poll (once per minute at 5s interval) to avoid spam
         return {"status": "pending"}
     
     entry = _pending_auth[session_id]
@@ -801,9 +806,12 @@ async def auth_poll(session_id: str):
     # Check expiry
     if entry["expires"] < time.time():
         del _pending_auth[session_id]
+        logger.info("[auth] Poll session %s expired", session_id)
         return {"status": "expired"}
     
     # Token is ready - remove from store and return
+    logger.info("[auth] Poll session %s SUCCESS, delivering token for %s", 
+                session_id, entry["user_info"].get("email", "?"))
     del _pending_auth[session_id]
     return {
         "status": "success",
@@ -891,7 +899,38 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         attached_files_dict = attached_files_dict_new
 
     try:
-        config = {"configurable": {"thread_id": conv_id}}
+        # ── LangSmith-enriched config ──────────────────────────────
+        # Compute turn number from stored state
+        turn_number = 1
+        if stored:
+            # Count HumanMessage in history to determine turn
+            turn_number = sum(1 for m in messages if isinstance(m, HumanMessage))
+        
+        user_email = user.get("email", "anonymous") if user else "anonymous"
+        user_name = user.get("name", "") if user else ""
+
+        config = {
+            "configurable": {"thread_id": conv_id},
+            "run_name": f"forge-chat:{req.workspace_id}:turn-{turn_number}",
+            "tags": [
+                f"workspace:{req.workspace_id}",
+                f"user:{user_email}",
+                "continuation" if is_continuation else "new-conversation",
+            ],
+            "metadata": {
+                "conversation_id": conv_id,
+                "workspace_id": req.workspace_id,
+                "user_email": user_email,
+                "user_name": user_name,
+                "turn_number": turn_number,
+                "is_continuation": is_continuation,
+                "question": (req.question or "")[:200],  # First 200 chars for searchability
+                "num_messages": len(messages),
+                "num_attached_files": len(attached_files_dict),
+                "enriched_context_chars": len(enriched_context),
+            },
+        }
+
         logger.info("[chat] Invoking agent for workspace=%s conv=%s with %d messages (continuation=%s, enriched=%d chars)", 
                    req.workspace_id, conv_id, len(messages), is_continuation, len(enriched_context))
         
