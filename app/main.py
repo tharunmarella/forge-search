@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Depends
 
 from fastapi.responses import RedirectResponse
 
-from . import store, embeddings, watcher, auth, chat
+from . import store, embeddings, watcher, auth, chat, agent
 from .models import (
     IndexRequest, IndexResponse,
     SearchRequest, SearchResponse, SearchResult, RelatedSymbol,
@@ -42,9 +42,11 @@ from .models import (
     TraceRequest, TraceResponse, TraceNode, TraceEdge,
     ImpactRequest, ImpactResponse, AffectedFile, AffectedSymbol,
     WatchRequest, WatchResponse,
-    ChatRequest, ChatResponse,
+    ChatRequest, ChatResponse, ToolResultPayload, AttachedFile
 )
 from .parser import parse_file, SymbolDef, SymbolRef, FileParseResult
+
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -667,53 +669,104 @@ async def auth_me(user: dict = Depends(auth.require_user)):
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_user)):
     """
-    AI Chat — asks a question about the codebase.
-
-    1. Searches for relevant code (semantic search)
-    2. Optionally traces call chains
-    3. Sends context + question to Groq Kimi-K2
-    4. Returns precise, codebase-aware answer
-
-    No API keys needed — user just signs in.
+    AI Chat — LangGraph-powered multi-turn coding agent.
+    
+    1. Orchestrates reasoning via LangGraph.
+    2. Executes cloud tools (search, trace) locally on the server.
+    3. Requests IDE tools (read, write, execute) via callbacks.
     """
     t0 = time.monotonic()
 
+    # 1. Reconstruct message history
+    messages = []
+    if req.history:
+        for m in req.history:
+            if m["type"] == "human":
+                messages.append(HumanMessage(content=m["content"]))
+            elif m["type"] == "ai":
+                # Handle AI messages with tool calls
+                tool_calls = m.get("tool_calls", [])
+                messages.append(AIMessage(content=m["content"], tool_calls=tool_calls))
+            elif m["type"] == "tool":
+                messages.append(ToolMessage(content=m["content"], tool_call_id=m["tool_call_id"]))
+
+    # 2. Add new user question if provided
+    if req.question:
+        messages.append(HumanMessage(content=req.question))
+
+    # 3. Add tool results from IDE if provided
+    if req.tool_results:
+        for res in req.tool_results:
+            messages.append(ToolMessage(
+                content=res.output,
+                tool_call_id=res.call_id,
+                status="success" if res.success else "error"
+            ))
+
+    # 4. Build attached files dict
+    attached_files_dict = {}
+    if req.attached_files:
+        for af in req.attached_files:
+            attached_files_dict[af.path] = af.content
+
     try:
-        # 1. Search for relevant code
-        query_emb = await embeddings.embed_query(req.question)
-        search_results = await store.vector_search(req.workspace_id, query_emb, top_k=8)
-        flat_results = [r["symbol"] for r in search_results]
+        # 5. Run the LangGraph agent
+        # We run until it hits a breakpoint (pause for IDE) or finishes
+        config = {"configurable": {"thread_id": req.workspace_id}}
+        result = await agent.forge_agent.ainvoke(
+            {
+                "messages": messages, 
+                "workspace_id": req.workspace_id,
+                "attached_files": attached_files_dict,
+                "enriched_context": "",  # Will be filled by the enrich node
+            },
+            config=config
+        )
+        
+        final_messages = result["messages"]
+        last_message = final_messages[-1]
+        
+        # 5. Determine response status
+        status = "done"
+        tool_calls = None
+        answer = None
+        
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            # Check if any tool calls are for the IDE
+            ide_tools = ["read_file", "write_to_file", "replace_in_file", "execute_command"]
+            if any(tc["name"] in ide_tools for tc in last_message.tool_calls):
+                status = "requires_action"
+                tool_calls = last_message.tool_calls
+            else:
+                # This shouldn't happen with the current graph logic but for safety:
+                answer = last_message.content
+        else:
+            answer = last_message.content
 
-        # 2. Optionally trace top result
-        trace_data = None
-        if flat_results and req.include_trace:
-            top_name = flat_results[0]["name"]
-            trace_data = await store.trace_call_chain(req.workspace_id, top_name, direction="both", max_depth=2)
+        # 6. Serialize history for the IDE
+        serialized_history = []
+        for m in final_messages:
+            m_type = "human" if isinstance(m, HumanMessage) else "ai" if isinstance(m, AIMessage) else "tool"
+            entry = {"type": m_type, "content": m.content}
+            if m_type == "ai" and m.tool_calls:
+                entry["tool_calls"] = m.tool_calls
+            if m_type == "tool":
+                entry["tool_call_id"] = m.tool_call_id
+            serialized_history.append(entry)
 
-        # 3. Optionally get impact
-        impact_data = None
-        if flat_results and req.include_impact:
-            top_name = flat_results[0]["name"]
-            impact_data = await store.impact_analysis(req.workspace_id, top_name, max_depth=3)
+        elapsed = (time.monotonic() - t0) * 1000
+        
+        return ChatResponse(
+            answer=answer,
+            tool_calls=tool_calls,
+            history=serialized_history,
+            status=status,
+            total_time_ms=round(elapsed, 1)
+        )
 
-        # 4. Build context and ask LLM
-        context = chat.build_context_from_results(flat_results, trace_data, impact_data)
-        llm_result = await chat.chat_with_context(req.question, context, req.max_tokens, req.temperature)
     except Exception as e:
-        logger.error("Chat failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)[:200]}")
-
-    elapsed = (time.monotonic() - t0) * 1000
-
-    return ChatResponse(
-        answer=llm_result["response"],
-        model=llm_result["model"],
-        tokens=llm_result["tokens"],
-        context_symbols=len(flat_results),
-        search_time_ms=round(elapsed - llm_result["time_ms"], 1),
-        llm_time_ms=llm_result["time_ms"],
-        total_time_ms=round(elapsed, 1),
-    )
+        logger.error("Agent execution failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)[:200]}")
 
 
 # ── GET /health ───────────────────────────────────────────────────

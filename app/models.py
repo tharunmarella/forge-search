@@ -162,20 +162,37 @@ class WatchResponse(BaseModel):
 # ── Chat models ──────────────────────────────────────────────────
 
 
+class ToolResultPayload(BaseModel):
+    call_id: str
+    output: str
+    success: bool
+
+
+class AttachedFile(BaseModel):
+    """A file attached by the IDE with its live content."""
+    path: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     workspace_id: str
-    question: str
-    include_trace: bool = Field(default=True, description="Include call chain for top result")
-    include_impact: bool = Field(default=False, description="Include impact analysis for top result")
+    question: str | None = None
+    # Support for multi-turn tool results from the IDE
+    tool_results: list[ToolResultPayload] | None = None
+    # Live file contents from the IDE (open files, recently edited, etc.)
+    attached_files: list[AttachedFile] | None = None
+    # History of messages (serialized LangChain messages)
+    history: list[dict] | None = None
     max_tokens: int = Field(default=1024, ge=1, le=4096)
     temperature: float = Field(default=0.1, ge=0, le=1)
 
 
 class ChatResponse(BaseModel):
-    answer: str
-    model: str
+    answer: str | None = None
+    tool_calls: list[dict] | None = None
+    # Updated history to send back to the IDE
+    history: list[dict] | None = None
+    status: str  # "done", "requires_action", "error"
+    model: str = "moonshotai/kimi-k2-instruct-0905"
     tokens: int = 0
-    context_symbols: int = 0
-    search_time_ms: float = 0
-    llm_time_ms: float = 0
     total_time_ms: float = 0
