@@ -1,11 +1,9 @@
 """
-Code embeddings via Jina AI API.
+Code embeddings via Voyage AI API.
 
-Uses jinaai/jina-embeddings-v2-base-code hosted by Jina.
-No local model, no torch, no GPU. Just an API call.
-
-768 dims, trained on 5.5M code-text pairs, 161 programming languages.
-Free tier: 1M tokens/month.
+Uses voyage-code-3 - purpose-built for code retrieval.
+1024 dims, trained specifically for code search.
+Free tier: 200M tokens/month.
 """
 
 from __future__ import annotations
@@ -22,12 +20,12 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────
 
-JINA_API_KEY = os.getenv("JINA_API_KEY", "")
-JINA_MODEL = os.getenv("JINA_MODEL", "jina-embeddings-v2-base-code")
-JINA_URL = "https://api.jina.ai/v1/embeddings"
-BATCH_SIZE = 64
-MAX_TEXT_LENGTH = 8000
-DIMENSIONS = 768
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
+VOYAGE_MODEL = os.getenv("VOYAGE_MODEL", "voyage-code-3")
+VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
+BATCH_SIZE = 128  # Voyage supports up to 128 texts per request
+MAX_TEXT_LENGTH = 16000  # voyage-code-3 supports up to 16K tokens
+DIMENSIONS = 1024  # voyage-code-3 outputs 1024 dimensions
 
 
 def get_dimensions() -> int:
@@ -40,23 +38,29 @@ def _truncate(text: str, max_len: int = MAX_TEXT_LENGTH) -> str:
     return text[:max_len] + "\n... [truncated]"
 
 
-# ── Jina API call ─────────────────────────────────────────────────
+# ── Voyage API call ─────────────────────────────────────────────────
 
-async def _call_jina(texts: list[str]) -> list[list[float]]:
-    """Call Jina's embedding API."""
-    if not JINA_API_KEY:
-        raise RuntimeError("JINA_API_KEY not set. Get one at https://jina.ai/embeddings/")
+async def _call_voyage(texts: list[str], input_type: str = "document") -> list[list[float]]:
+    """Call Voyage AI's embedding API.
+    
+    Args:
+        texts: List of texts to embed
+        input_type: Either "document" (for indexing) or "query" (for search queries)
+    """
+    if not VOYAGE_API_KEY:
+        raise RuntimeError("VOYAGE_API_KEY not set. Get one at https://dash.voyageai.com/")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
-            JINA_URL,
+            VOYAGE_URL,
             headers={
-                "Authorization": f"Bearer {JINA_API_KEY}",
+                "Authorization": f"Bearer {VOYAGE_API_KEY}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": JINA_MODEL,
+                "model": VOYAGE_MODEL,
                 "input": texts,
+                "input_type": input_type,
             },
         )
         resp.raise_for_status()
@@ -69,14 +73,14 @@ async def _call_jina(texts: list[str]) -> list[list[float]]:
 # ── Public API ────────────────────────────────────────────────────
 
 async def embed_query(text: str) -> list[float]:
-    """Embed a single query string."""
+    """Embed a single query string (for search)."""
     text = _truncate(text)
-    results = await _call_jina([text])
+    results = await _call_voyage([text], input_type="query")
     return results[0]
 
 
 async def embed_batch(texts: Sequence[str]) -> list[list[float]]:
-    """Embed a batch of texts. Splits into sub-batches for API limits."""
+    """Embed a batch of texts (for indexing). Splits into sub-batches for API limits."""
     if not texts:
         return []
 
@@ -92,7 +96,7 @@ async def embed_batch(texts: Sequence[str]) -> list[list[float]]:
         logger.info("Embedding batch %d/%d (%d texts)", batch_idx + 1, total_batches, len(batch))
         t0 = time.monotonic()
 
-        batch_embeddings = await _call_jina(batch)
+        batch_embeddings = await _call_voyage(batch, input_type="document")
 
         logger.info("Batch %d/%d done in %.2fs", batch_idx + 1, total_batches, time.monotonic() - t0)
         all_embeddings.extend(batch_embeddings)

@@ -3,7 +3,7 @@ Postgres + pgvector code store.
 
 Everything in one database:
   - Symbols, files, edges in relational tables
-  - 768-dim embeddings with pgvector (native vector search in SQL)
+  - 1024-dim embeddings with pgvector (Voyage voyage-code-3)
   - Graph traversal via recursive CTEs
   - No in-memory state needed (stateless API instances)
 """
@@ -18,10 +18,12 @@ from typing import Any
 import psycopg2
 import psycopg2.extras
 
+from . import embeddings
+
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-VECTOR_DIMENSIONS = 768
+VECTOR_DIMENSIONS = embeddings.get_dimensions()  # 1024 for voyage-code-3
 
 # ── Connection ────────────────────────────────────────────────────
 
@@ -41,6 +43,26 @@ def _cursor():
 
 
 # ── Schema ────────────────────────────────────────────────────────
+
+def _migrate_embedding_dimensions(cur):
+    """Migrate embedding column from 768 dims (Jina) to 1024 dims (Voyage)."""
+    # Check current column dimensions
+    cur.execute("""
+        SELECT a.atttypmod 
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        WHERE c.relname = 'symbols' AND a.attname = 'embedding'
+    """)
+    row = cur.fetchone()
+    if row:
+        current_dims = row[0] if isinstance(row, tuple) else row.get('atttypmod', 0)
+        if current_dims > 0 and current_dims != VECTOR_DIMENSIONS:
+            logger.info(f"Migrating embedding column from {current_dims} to {VECTOR_DIMENSIONS} dimensions")
+            # Clear embeddings and alter column type
+            cur.execute("UPDATE symbols SET embedding = NULL")
+            cur.execute(f"ALTER TABLE symbols ALTER COLUMN embedding TYPE vector({VECTOR_DIMENSIONS})")
+            logger.info("Embedding dimension migration complete - reindexing required")
+
 
 async def ensure_schema():
     """Create tables + pgvector index."""
@@ -69,9 +91,12 @@ async def ensure_schema():
             content TEXT DEFAULT '',
             enriched_content TEXT DEFAULT '',
             parent TEXT DEFAULT '',
-            embedding vector(768)
+            embedding vector({dims})
         )
-    """)
+    """.format(dims=VECTOR_DIMENSIONS))
+    
+    # Migrate if needed (handles Jina 768 -> Voyage 1024 transition)
+    _migrate_embedding_dimensions(cur)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS edges (
             id SERIAL PRIMARY KEY,
