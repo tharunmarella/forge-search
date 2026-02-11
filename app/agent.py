@@ -179,13 +179,17 @@ async def build_pre_enrichment(
     try:
         query_emb = await embeddings.embed_query(question)
         search_results = await store.vector_search(workspace_id, query_emb, top_k=8)
-        flat_results = [r["symbol"] for r in search_results]
+        logger.info("Pre-enrichment: got %d search results for workspace=%s", len(search_results), workspace_id)
         
-        if flat_results:
+        if search_results:
+            flat_results = [r["symbol"] for r in search_results]
             context_text = chat_utils.build_context_from_results(flat_results)
             parts.append(context_text)
+            logger.info("Pre-enrichment: built context len=%d", len(context_text))
+        else:
+            logger.warning("Pre-enrichment: no results for query in workspace %s", workspace_id)
     except Exception as e:
-        logger.warning("Pre-enrichment search failed: %s", e)
+        logger.warning("Pre-enrichment search failed: %s", e, exc_info=True)
     
     # 3. Extract symbol names from question for trace analysis
     # Simple heuristic: look for CamelCase or snake_case identifiers
@@ -287,10 +291,18 @@ async def execute_server_tools(state: AgentState) -> dict:
         try:
             if tool_name == "codebase_search":
                 query = args.get('query', '')
+                logger.info("codebase_search: query=%s, workspace=%s", query, workspace_id)
                 query_emb = await embeddings.embed_query(query)
                 results = await store.vector_search(workspace_id, query_emb, top_k=8)
-                flat_results = [r["symbol"] for r in results]
-                content = chat_utils.build_context_from_results(flat_results)
+                logger.info("codebase_search: got %d results", len(results))
+                
+                if results:
+                    # Extract symbol dicts and build context
+                    flat_results = [r["symbol"] for r in results]
+                    content = chat_utils.build_context_from_results(flat_results)
+                    logger.info("codebase_search: built context len=%d", len(content))
+                else:
+                    content = "No results found for this query. Try a different search term or use read_file to explore specific files."
                 
             elif tool_name == "trace_call_chain":
                 symbol = args.get('symbol_name', '')
