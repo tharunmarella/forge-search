@@ -82,6 +82,11 @@ else:
 
 from collections import OrderedDict
 
+# ── Pending auth tokens (for polling-based OAuth) ──────────────────
+# When IDE initiates OAuth with state=poll-{session_id}, the callback
+# stores the token here. IDE polls GET /auth/poll/{session_id}.
+_pending_auth: dict[str, dict] = {}  # session_id -> {token, user_info, expires}
+
 class ConversationStore:
     """Simple LRU cache for conversation state."""
     def __init__(self, max_size: int = 200):
@@ -709,9 +714,26 @@ async def auth_github_callback(code: str, state: str = ""):
     user_info = await auth.github_exchange_code(code)
     user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
-    # For desktop apps: redirect to custom scheme with token
+    
+    # Polling-based auth: store token for IDE to poll
+    if state.startswith("poll-"):
+        session_id = state[5:]  # Remove "poll-" prefix
+        _pending_auth[session_id] = {
+            "token": token,
+            "user_info": user_info,
+            "expires": time.time() + 300,  # 5 minute expiry
+        }
+        # Clean up old entries
+        now = time.time()
+        for sid in list(_pending_auth.keys()):
+            if _pending_auth[sid]["expires"] < now:
+                del _pending_auth[sid]
+        return auth.success_page(user_info, token)
+    
+    # Legacy: custom URL scheme (may not work on all platforms)
     if state.startswith("forge-ide"):
         return RedirectResponse(f"forge-ide://auth?token={token}")
+    
     # For browser: show success page
     return auth.success_page(user_info, token)
 
@@ -730,6 +752,21 @@ async def auth_google_callback(code: str, state: str = ""):
     user_info = await auth.google_exchange_code(code)
     user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
+    
+    # Polling-based auth: store token for IDE to poll
+    if state.startswith("poll-"):
+        session_id = state[5:]
+        _pending_auth[session_id] = {
+            "token": token,
+            "user_info": user_info,
+            "expires": time.time() + 300,
+        }
+        now = time.time()
+        for sid in list(_pending_auth.keys()):
+            if _pending_auth[sid]["expires"] < now:
+                del _pending_auth[sid]
+        return auth.success_page(user_info, token)
+    
     if state.startswith("forge-ide"):
         return RedirectResponse(f"forge-ide://auth?token={token}")
     return auth.success_page(user_info, token)
@@ -741,6 +778,39 @@ async def auth_google_callback(code: str, state: str = ""):
 async def auth_me(user: dict = Depends(auth.require_user)):
     """Get current authenticated user."""
     return {"user_id": user["sub"], "email": user["email"], "name": user["name"]}
+
+
+@app.get("/auth/poll/{session_id}")
+async def auth_poll(session_id: str):
+    """
+    Poll for OAuth token.
+    
+    IDE opens browser with state=poll-{session_id}, then polls this endpoint
+    until the token is available (user completes OAuth in browser).
+    
+    Returns:
+        - {"status": "pending"} if auth not complete
+        - {"status": "success", "token": "...", "email": "...", "name": "..."} on success
+        - {"status": "expired"} if session expired or not found
+    """
+    if session_id not in _pending_auth:
+        return {"status": "pending"}
+    
+    entry = _pending_auth[session_id]
+    
+    # Check expiry
+    if entry["expires"] < time.time():
+        del _pending_auth[session_id]
+        return {"status": "expired"}
+    
+    # Token is ready - remove from store and return
+    del _pending_auth[session_id]
+    return {
+        "status": "success",
+        "token": entry["token"],
+        "email": entry["user_info"].get("email", ""),
+        "name": entry["user_info"].get("name", ""),
+    }
 
 
 # ── POST /chat ────────────────────────────────────────────────────
