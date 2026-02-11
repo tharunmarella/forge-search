@@ -299,6 +299,8 @@ async def enrich_context(state: AgentState) -> dict:
     workspace_id = state['workspace_id']
     attached_files = state.get('attached_files', {})
     
+    logger.info("[enrich_context] Starting enrichment for workspace=%s", workspace_id)
+    
     # Get the user's question from the last human message
     question = ""
     for msg in reversed(state['messages']):
@@ -307,10 +309,15 @@ async def enrich_context(state: AgentState) -> dict:
             break
     
     if not question:
+        logger.warning("[enrich_context] No question found in messages")
         return {"enriched_context": ""}
+    
+    logger.info("[enrich_context] Question: %s", question[:100])
     
     # Build pre-enriched context
     context = await build_pre_enrichment(workspace_id, question, attached_files)
+    
+    logger.info("[enrich_context] Built context with %d chars", len(context))
     
     return {"enriched_context": context}
 
@@ -318,6 +325,8 @@ async def enrich_context(state: AgentState) -> dict:
 async def call_model(state: AgentState) -> dict:
     """The 'Brain' node - LLM reasoning with full context."""
     enriched_context = state.get('enriched_context', '')
+    
+    logger.info("[call_model] enriched_context length=%d", len(enriched_context))
     
     # Build messages with system prompt and context
     messages_to_send = []
@@ -329,6 +338,9 @@ async def call_model(state: AgentState) -> dict:
     if enriched_context:
         context_msg = f"## Pre-gathered Context\n\n{enriched_context}\n\n---\n\nNow, answer the user's question using this context. If you need more information, use the available tools."
         messages_to_send.append(SystemMessage(content=context_msg))
+        logger.info("[call_model] Added context message, total messages: %d", len(messages_to_send))
+    else:
+        logger.warning("[call_model] No enriched context to add!")
     
     # Add conversation history
     messages_to_send.extend(state['messages'])
@@ -342,6 +354,9 @@ async def call_model(state: AgentState) -> dict:
     
     # Call the model
     response = await model_with_tools.ainvoke(messages_to_send)
+    
+    logger.info("[call_model] Got response, tool_calls=%s", 
+                [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
     return {"messages": [response]}
 
