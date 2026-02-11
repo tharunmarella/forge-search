@@ -835,18 +835,17 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     t0 = time.monotonic()
 
     conv_id = req.conversation_id or f"{req.workspace_id}-default"
-    is_continuation = bool(req.tool_results)
+    has_tool_results = bool(req.tool_results)
     
     # ── Reconstruct state from server-side store ──────────────────
     stored = _conversations.get(conv_id)
     
-    if is_continuation and stored:
-        # CONTINUATION: restore full history + enriched_context from server
+    if has_tool_results and stored:
+        # TOOL RESULT CONTINUATION: restore full history + append tool results
         messages = stored["messages"]  # Full history from prior turns
         enriched_context = stored.get("enriched_context", "")
         attached_files_dict = stored.get("attached_files", {})
         
-        # Append the new tool results to the existing history
         for res in req.tool_results:
             messages.append(ToolMessage(
                 content=res.output,
@@ -854,12 +853,24 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 status="success" if res.success else "error"
             ))
         
-        logger.info("[chat] CONTINUATION conv=%s, restored %d messages, enriched=%d chars", 
+        logger.info("[chat] TOOL CONTINUATION conv=%s, restored %d messages, enriched=%d chars", 
+                    conv_id, len(messages), len(enriched_context))
+    elif stored and req.question:
+        # NEW MESSAGE in existing conversation: restore history + append new question
+        # This preserves multi-turn memory across user messages
+        messages = stored["messages"]
+        enriched_context = stored.get("enriched_context", "")
+        attached_files_dict = stored.get("attached_files", {})
+        
+        messages.append(HumanMessage(content=req.question))
+        
+        logger.info("[chat] FOLLOW-UP conv=%s, restored %d messages + new question, enriched=%d chars", 
                     conv_id, len(messages), len(enriched_context))
     else:
-        # NEW CONVERSATION (or first turn)
+        # BRAND NEW CONVERSATION (first turn ever for this conv_id)
         messages = []
         enriched_context = ""
+        attached_files_dict = {}
         
         # Reconstruct from history if client sends it (backwards compat)
         if req.history:
@@ -893,7 +904,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         for af in req.attached_files:
             attached_files_dict_new[af.path] = af.content
     # Merge with stored attached files (new ones override)
-    if is_continuation and stored:
+    if stored and has_tool_results:
         attached_files_dict = {**attached_files_dict, **attached_files_dict_new}
     else:
         attached_files_dict = attached_files_dict_new
@@ -915,7 +926,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             "tags": [
                 f"workspace:{req.workspace_id}",
                 f"user:{user_email}",
-                "continuation" if is_continuation else "new-conversation",
+                "continuation" if has_tool_results else ("follow-up" if stored else "new-conversation"),
             ],
             "metadata": {
                 "conversation_id": conv_id,
@@ -923,7 +934,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "user_email": user_email,
                 "user_name": user_name,
                 "turn_number": turn_number,
-                "is_continuation": is_continuation,
+                "is_continuation": has_tool_results,
                 "question": (req.question or "")[:200],  # First 200 chars for searchability
                 "num_messages": len(messages),
                 "num_attached_files": len(attached_files_dict),
@@ -931,8 +942,8 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             },
         }
 
-        logger.info("[chat] Invoking agent for workspace=%s conv=%s with %d messages (continuation=%s, enriched=%d chars)", 
-                   req.workspace_id, conv_id, len(messages), is_continuation, len(enriched_context))
+        logger.info("[chat] Invoking agent for workspace=%s conv=%s with %d messages (tool_cont=%s, stored=%s, enriched=%d chars)", 
+                   req.workspace_id, conv_id, len(messages), has_tool_results, bool(stored), len(enriched_context))
         
         result = await agent.forge_agent.ainvoke(
             {

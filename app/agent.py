@@ -649,6 +649,79 @@ async def enrich_context(state: AgentState) -> dict:
     return {"enriched_context": context}
 
 
+# ── Context Window Management ─────────────────────────────────────
+
+# Rough char budget: 120K tokens ≈ 480K chars.  Reserve room for
+# system prompt (~4K), enriched context (~20K), and model output (~4K).
+MAX_HISTORY_CHARS = 200_000  # ~50K tokens for conversation history
+MAX_TOOL_MSG_CHARS = 30_000  # Truncate individual tool results
+
+
+def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Truncate oversized tool messages and trim old history if needed."""
+    result = []
+    total_chars = 0
+    
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and len(msg.content) > MAX_TOOL_MSG_CHARS:
+            # Truncate large tool results (file dumps, command output)
+            truncated = msg.content[:MAX_TOOL_MSG_CHARS] + (
+                f"\n\n... (truncated from {len(msg.content)} chars)"
+            )
+            msg = ToolMessage(
+                content=truncated,
+                tool_call_id=msg.tool_call_id,
+            )
+        
+        total_chars += len(msg.content)
+        result.append(msg)
+    
+    # If total history is still too large, keep first 2 + last N messages
+    if total_chars > MAX_HISTORY_CHARS:
+        # Always keep: first HumanMessage (the question) + last few messages
+        # Drop middle messages (old tool call/result pairs)
+        if len(result) > 6:
+            kept_start = result[:2]  # First human msg + first AI response
+            kept_end = result[-4:]    # Last 4 messages (most recent context)
+            dropped = len(result) - 6
+            summary = AIMessage(content=f"[{dropped} earlier messages omitted to fit context window]")
+            result = kept_start + [summary] + kept_end
+            logger.warning("[truncate] Dropped %d messages, kept %d", dropped, len(result))
+    
+    return result
+
+
+# ── Multi-Model Routing ───────────────────────────────────────────
+#
+# Strategy: use the best model for each phase of the agent loop.
+#
+#   REASONING model (GROQ_MODEL):
+#     First call with enriched context + user question.
+#     Needs strong reasoning to understand the codebase and plan.
+#     Default: moonshotai/kimi-k2-instruct-0905
+#
+#   TOOL model (GROQ_TOOL_MODEL):
+#     Subsequent calls that process tool results and decide next action.
+#     Needs fast responses + reliable function calling.
+#     Default: openai/gpt-oss-20b (3.6B active, native tool use)
+
+REASONING_MODEL = os.getenv("GROQ_MODEL", "moonshotai/kimi-k2-instruct-0905")
+TOOL_MODEL = os.getenv("GROQ_TOOL_MODEL", "openai/gpt-oss-20b")
+
+
+def _pick_model(messages: list[BaseMessage]) -> str:
+    """Pick model based on conversation phase.
+    
+    - First call (only HumanMessage, no ToolMessages yet) → REASONING_MODEL
+    - After tool results come back → TOOL_MODEL (faster iterations)
+    """
+    has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
+    
+    if has_tool_messages:
+        return TOOL_MODEL
+    return REASONING_MODEL
+
+
 @traceable(name="call_model_node", run_type="chain", tags=["llm"])
 async def call_model(state: AgentState) -> dict:
     """The 'Brain' node - LLM reasoning with full context."""
@@ -664,17 +737,24 @@ async def call_model(state: AgentState) -> dict:
     
     # Add enriched context as a system message if we have it
     if enriched_context:
-        context_msg = f"## Pre-gathered Context\n\n{enriched_context}\n\n---\n\nNow, answer the user's question using this context. If you need more information, use the available tools."
+        # Cap enriched context to avoid blowing up on its own
+        ctx = enriched_context[:80_000] if len(enriched_context) > 80_000 else enriched_context
+        context_msg = f"## Pre-gathered Context\n\n{ctx}\n\n---\n\nNow, answer the user's question using this context. If you need more information, use the available tools."
         messages_to_send.append(SystemMessage(content=context_msg))
         logger.info("[call_model] Added context message, total messages: %d", len(messages_to_send))
     else:
         logger.warning("[call_model] No enriched context to add!")
     
-    # Add conversation history
-    messages_to_send.extend(state['messages'])
+    # Add conversation history (with truncation)
+    history = _truncate_messages(state['messages'])
+    messages_to_send.extend(history)
     
-    # Initialize model
-    model_name = os.getenv("GROQ_MODEL", "moonshotai/kimi-k2-instruct-0905")
+    total_chars = sum(len(m.content) for m in messages_to_send)
+    
+    # Pick model based on conversation phase
+    model_name = _pick_model(state['messages'])
+    logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
+    
     model = ChatGroq(model=model_name, temperature=0.1)
     
     # Bind all tools
@@ -683,7 +763,8 @@ async def call_model(state: AgentState) -> dict:
     # Call the model
     response = await model_with_tools.ainvoke(messages_to_send)
     
-    logger.info("[call_model] Got response, tool_calls=%s", 
+    logger.info("[call_model] Got response from %s, tool_calls=%s", 
+                model_name,
                 [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
     return {"messages": [response]}
