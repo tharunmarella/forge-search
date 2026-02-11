@@ -23,11 +23,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file for local dev (no-op if missing)
+
+# ── LangSmith Tracing ─────────────────────────────────────────────
+# LangGraph/LangChain auto-traces when these env vars are set.
+# No code changes needed - just set the env vars!
+#
+# Required env vars:
+#   LANGSMITH_TRACING=true
+#   LANGSMITH_API_KEY=lsv2_pt_...
+#   LANGSMITH_PROJECT=forgeIDE  (optional, defaults to "default")
+#
+# All LangGraph agent runs, LLM calls, and tool executions will be traced.
 
 from fastapi import FastAPI, HTTPException, Depends
 
@@ -53,6 +65,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Log LangSmith status on import
+_langsmith_enabled = os.getenv("LANGSMITH_TRACING", "").lower() == "true"
+_langsmith_project = os.getenv("LANGSMITH_PROJECT", "default")
+if _langsmith_enabled:
+    logger.info(f"LangSmith tracing ENABLED for project: {_langsmith_project}")
+else:
+    logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable)")
 
 
 # ── Context-enriched embedding text ──────────────────────────────
