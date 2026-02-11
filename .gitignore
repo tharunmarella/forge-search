@@ -8,4 +8,4 @@ build/
 venv/
 .mypy_cache/
 .pytest_cache/
-data/
+data/docker-compose.yml

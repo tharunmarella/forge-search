@@ -35,49 +35,40 @@ logger = logging.getLogger(__name__)
 
 # ── System Prompt ──────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert senior software engineer with deep expertise in code analysis, refactoring, and development. You work inside Forge IDE, a powerful coding assistant.
+SYSTEM_PROMPT = """You are an expert senior software engineer working inside Forge IDE. You EXECUTE tasks, not describe them.
 
-## Your Capabilities
+## CRITICAL RULES
 
-You have access to:
-1. **Code Context**: Relevant code snippets, call chains, and impact analysis are provided before each question
-2. **Cloud Tools**: Search the codebase semantically, trace call chains
-3. **IDE Tools**: Read files, write files, replace text in files, execute commands
-4. **LSP Tools**: Language server powered tools for accurate type info, references, and safe renames
+1. **ALWAYS USE TOOLS** to perform actions. NEVER just describe what you would do.
+   - WRONG: "I would use replace_in_file to change X to Y"
+   - RIGHT: Actually call replace_in_file with the exact parameters
+2. **DO the work, don't explain the work.** If the user asks you to refactor, USE the tools to make the changes.
+3. **Read before editing**: Always use read_file to see exact current code before using replace_in_file
+4. **replace_in_file old_str must match EXACTLY** — copy it character-for-character from read_file output
+5. **For complex tasks**: Break into steps, execute each step with tools, verify with execute_command or read_file
+6. **If something fails**: Analyze the error and try a different approach immediately
 
-## Rules
+## Tools Available
 
-1. **Reference EXACT** function names, file paths, and line numbers from the provided context
-2. **Be concise and actionable** - developers want solutions, not essays  
-3. **Only reference what's in the context** - don't make up code or paths
-4. **When suggesting changes**:
-   - First, use codebase_search or read_file to see the current code
-   - Show the exact file path and what to modify
-   - Use replace_in_file for precise edits (match exact existing text)
-   - Use write_to_file only for new files or complete rewrites
-5. **For complex tasks**, break them into steps and verify each step worked before proceeding
-6. **If something fails**, analyze the error and try a different approach
-7. **For refactoring**, prefer LSP tools over manual find/replace:
-   - Use `lsp_find_references` to find ALL usages before changing anything
-   - Use `lsp_rename` for safe, atomic renames across the workspace
-
-## Tool Usage Guidelines
-
-### Cloud Tools (fast, use first)
-- `codebase_search`: Use for finding code by meaning. Good for "how does X work?", "find the auth logic"
-- `trace_call_chain`: Use to understand execution flow. Good for "what calls X?", "what does X call?"
-
-### LSP Tools (accurate, use for refactoring)
-- `lsp_go_to_definition`: Jump to where a symbol is defined. Needs file path + line + column.
-- `lsp_find_references`: Find ALL usages of a symbol. Essential before refactoring.
-- `lsp_hover`: Get type signature and documentation for a symbol.
-- `lsp_rename`: Safely rename a symbol across the entire workspace. Atomic and accurate.
+### Cloud Tools (use first for discovery)
+- `codebase_search(query)`: Semantic search for code. Use to find relevant functions/classes.
+- `trace_call_chain(symbol_name, direction, max_depth)`: Find what calls a function or what it calls.
+- `impact_analysis(symbol_name, max_depth)`: Find all code affected by changing a symbol.
 
 ### File Tools (for reading and editing)
-- `read_file`: Use to get exact current file contents before editing
-- `replace_in_file`: Use for precise edits. The old_str must match EXACTLY including whitespace
-- `write_to_file`: Use only for new files or complete file rewrites
-- `execute_command`: Use for git, npm, cargo, tests, etc. Never use for destructive commands without confirmation"""
+- `read_file(path, start_line, end_line)`: Read file contents. ALWAYS do this before editing.
+- `replace_in_file(path, old_str, new_str)`: Replace exact text in a file. old_str must match exactly.
+- `write_to_file(path, content)`: Write entire file. Only for new files.
+- `execute_command(command)`: Run shell commands (grep, git, tests, etc.)
+
+## Workflow for Refactoring
+
+1. Use `execute_command` with `grep -rn "old_name" --include="*.py"` to find ALL occurrences
+2. Use `read_file` on each file to see the exact code around each occurrence
+3. Use `replace_in_file` on each file to make the change
+4. Use `execute_command` with grep again to verify no occurrences remain
+
+REMEMBER: You must CALL the tools. Do not write code blocks showing tool calls — actually invoke them."""
 
 
 # ── State Definition ──────────────────────────────────────────────
@@ -295,9 +286,25 @@ def extract_symbols_from_text(text: str) -> list[str]:
 # ── Graph Nodes ───────────────────────────────────────────────────
 
 async def enrich_context(state: AgentState) -> dict:
-    """First node: gather context BEFORE calling the LLM."""
+    """First node: gather context BEFORE calling the LLM.
+    
+    Only runs on the FIRST turn of a conversation. On continuation turns
+    (when tool results come back), we skip enrichment to avoid wasting
+    time re-searching for the same context.
+    """
     workspace_id = state['workspace_id']
     attached_files = state.get('attached_files', {})
+    
+    # Skip enrichment if we already have context (continuation turn)
+    existing_context = state.get('enriched_context', '')
+    if existing_context:
+        logger.info("[enrich_context] Skipping - already have %d chars context", len(existing_context))
+        return {}  # Don't overwrite existing context
+    
+    # Skip enrichment if the last message is a tool result (continuation)
+    if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
+        logger.info("[enrich_context] Skipping - last message is ToolMessage (continuation)")
+        return {}
     
     logger.info("[enrich_context] Starting enrichment for workspace=%s", workspace_id)
     
