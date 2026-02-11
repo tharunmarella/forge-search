@@ -115,7 +115,19 @@ After making ALL edits, you MUST run a verification step using `execute_command`
 
 NEVER report "done" with errors still present. Your job is only complete when the code compiles cleanly.
 
-REMEMBER: You must CALL the tools. Do not write code blocks showing tool calls — actually invoke them."""
+REMEMBER: You must CALL the tools. Do not write code blocks showing tool calls — actually invoke them.
+
+## FORMATTING GUIDELINES
+
+When including diagrams in your response:
+- **Mermaid diagrams**: ALWAYS wrap in a fenced code block with the `mermaid` language tag:
+  ```mermaid
+  graph TD
+    A[Start] --> B[End]
+  ```
+  The IDE will render these as interactive diagrams.
+- **Code examples**: Use proper language tags (```python, ```typescript, etc.)
+- **File references**: Use markdown links like `[filename](path/to/file)`"""
 
 
 # ── State Definition ──────────────────────────────────────────────
