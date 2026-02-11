@@ -789,6 +789,30 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)[:200]}")
 
 
+# ── POST /debug/pre-enrichment ─────────────────────────────────────
+
+@app.post("/debug/pre-enrichment")
+async def debug_pre_enrichment(workspace_id: str, question: str):
+    """Debug endpoint to test pre-enrichment directly."""
+    from app import agent as agent_module
+    
+    try:
+        context = await agent_module.build_pre_enrichment(workspace_id, question, {})
+        return {
+            "workspace_id": workspace_id,
+            "question": question,
+            "context_length": len(context),
+            "context": context[:5000] if context else "",  # Truncate for readability
+            "has_content": len(context) > 50,
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "workspace_id": workspace_id,
+            "question": question,
+        }
+
+
 # ── GET /health ───────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
