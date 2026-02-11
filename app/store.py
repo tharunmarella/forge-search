@@ -44,7 +44,7 @@ def _cursor():
 
 # ── Schema ────────────────────────────────────────────────────────
 
-def _migrate_embedding_dimensions(cur):
+def _migrate_embedding_dimensions(conn, cur):
     """Migrate embedding column from 768 dims (Jina) to 1024 dims (Voyage)."""
     # Check current column dimensions
     cur.execute("""
@@ -58,10 +58,16 @@ def _migrate_embedding_dimensions(cur):
         current_dims = row[0] if isinstance(row, tuple) else row.get('atttypmod', 0)
         if current_dims > 0 and current_dims != VECTOR_DIMENSIONS:
             logger.info(f"Migrating embedding column from {current_dims} to {VECTOR_DIMENSIONS} dimensions")
-            # Clear embeddings and alter column type
-            cur.execute("UPDATE symbols SET embedding = NULL")
-            cur.execute(f"ALTER TABLE symbols ALTER COLUMN embedding TYPE vector({VECTOR_DIMENSIONS})")
-            logger.info("Embedding dimension migration complete - reindexing required")
+            try:
+                # Drop the column and recreate with new dimensions (faster than ALTER TYPE)
+                cur.execute("ALTER TABLE symbols DROP COLUMN IF EXISTS embedding")
+                cur.execute(f"ALTER TABLE symbols ADD COLUMN embedding vector({VECTOR_DIMENSIONS})")
+                conn.commit()
+                logger.info("Embedding dimension migration complete - reindexing required")
+            except Exception as e:
+                logger.error(f"Migration failed: {e}")
+                conn.rollback()
+                raise
 
 
 async def ensure_schema():
@@ -96,7 +102,7 @@ async def ensure_schema():
     """.format(dims=VECTOR_DIMENSIONS))
     
     # Migrate if needed (handles Jina 768 -> Voyage 1024 transition)
-    _migrate_embedding_dimensions(cur)
+    _migrate_embedding_dimensions(conn, cur)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS edges (
             id SERIAL PRIMARY KEY,
