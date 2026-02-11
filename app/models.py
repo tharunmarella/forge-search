@@ -176,6 +176,7 @@ class AttachedFile(BaseModel):
 
 class ChatRequest(BaseModel):
     workspace_id: str
+    conversation_id: str | None = None  # Unique ID per conversation (for state tracking)
     question: str | None = None
     # Support for multi-turn tool results from the IDE
     tool_results: list[ToolResultPayload] | None = None

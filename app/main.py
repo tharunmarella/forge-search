@@ -75,6 +75,38 @@ else:
     logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable)")
 
 
+# ── In-memory conversation state store ─────────────────────────────
+# Stores enriched_context and full message history per conversation_id.
+# This is critical: LangGraph ainvoke() doesn't persist state between
+# calls, so we must track conversation state server-side.
+
+from collections import OrderedDict
+
+class ConversationStore:
+    """Simple LRU cache for conversation state."""
+    def __init__(self, max_size: int = 200):
+        self._store: OrderedDict[str, dict] = OrderedDict()
+        self._max_size = max_size
+
+    def get(self, conv_id: str) -> dict | None:
+        if conv_id in self._store:
+            self._store.move_to_end(conv_id)
+            return self._store[conv_id]
+        return None
+
+    def set(self, conv_id: str, state: dict):
+        if conv_id in self._store:
+            self._store.move_to_end(conv_id)
+        self._store[conv_id] = state
+        while len(self._store) > self._max_size:
+            self._store.popitem(last=False)
+
+    def delete(self, conv_id: str):
+        self._store.pop(conv_id, None)
+
+_conversations = ConversationStore()
+
+
 # ── Context-enriched embedding text ──────────────────────────────
 
 def _build_enriched_text(
@@ -231,6 +263,21 @@ async def index_files(req: IndexRequest):
                 enriched_texts[uid] = _build_enriched_text(
                     defn, calls_map, called_by_map, parse_result.imports,
                 )
+
+            # FALLBACK: If tree-sitter found no definitions (e.g. TSX/JSX),
+            # embed the file as a whole so it's still searchable
+            if not enriched_texts and file_payload.content.strip():
+                file_uid = f"{file_payload.path}:__file__:0"
+                # Build a minimal enriched text from the raw file
+                truncated = file_payload.content[:5000]
+                ext = file_payload.path.rsplit(".", 1)[-1] if "." in file_payload.path else "unknown"
+                enriched_texts[file_uid] = (
+                    f"File: {file_payload.path}\n"
+                    f"Type: {ext}\n"
+                    f"---\n{truncated}"
+                )
+                logger.info("Fallback: embedding whole file %s (no symbols extracted)", 
+                           file_payload.path)
 
             # Generate embeddings from enriched text
             if enriched_texts:
@@ -512,6 +559,18 @@ async def _index_files_internal(workspace_id: str, files: list[dict]) -> dict:
                     defn, calls_map, called_by_map, parse_result.imports,
                 )
 
+            # FALLBACK: embed whole file if no symbols were extracted
+            if not enriched_texts and file_payload["content"].strip():
+                file_uid = f"{file_payload['path']}:__file__:0"
+                truncated = file_payload["content"][:5000]
+                ext = file_payload["path"].rsplit(".", 1)[-1] if "." in file_payload["path"] else "unknown"
+                enriched_texts[file_uid] = (
+                    f"File: {file_payload['path']}\n"
+                    f"Type: {ext}\n"
+                    f"---\n{truncated}"
+                )
+                logger.info("Fallback: embedding whole file %s", file_payload["path"])
+
             if enriched_texts:
                 texts_list = list(enriched_texts.values())
                 uids_list = list(enriched_texts.keys())
@@ -691,89 +750,125 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     """
     AI Chat — LangGraph-powered multi-turn coding agent.
     
-    1. Orchestrates reasoning via LangGraph.
-    2. Executes cloud tools (search, trace) locally on the server.
-    3. Requests IDE tools (read, write, execute) via callbacks.
+    Conversation state (enriched_context, full message history) is tracked
+    server-side per conversation_id. The client only needs to send back
+    tool_results on continuation turns — no need to echo history.
     """
     t0 = time.monotonic()
 
-    # 1. Reconstruct message history
-    messages = []
-    if req.history:
-        for m in req.history:
-            if m["type"] == "human":
-                messages.append(HumanMessage(content=m["content"]))
-            elif m["type"] == "ai":
-                # Handle AI messages with tool calls
-                tool_calls = m.get("tool_calls", [])
-                messages.append(AIMessage(content=m["content"], tool_calls=tool_calls))
-            elif m["type"] == "tool":
-                messages.append(ToolMessage(content=m["content"], tool_call_id=m["tool_call_id"]))
-
-    # 2. Add new user question if provided
-    if req.question:
-        messages.append(HumanMessage(content=req.question))
-
-    # 3. Add tool results from IDE if provided
-    if req.tool_results:
+    conv_id = req.conversation_id or f"{req.workspace_id}-default"
+    is_continuation = bool(req.tool_results)
+    
+    # ── Reconstruct state from server-side store ──────────────────
+    stored = _conversations.get(conv_id)
+    
+    if is_continuation and stored:
+        # CONTINUATION: restore full history + enriched_context from server
+        messages = stored["messages"]  # Full history from prior turns
+        enriched_context = stored.get("enriched_context", "")
+        attached_files_dict = stored.get("attached_files", {})
+        
+        # Append the new tool results to the existing history
         for res in req.tool_results:
             messages.append(ToolMessage(
                 content=res.output,
                 tool_call_id=res.call_id,
                 status="success" if res.success else "error"
             ))
+        
+        logger.info("[chat] CONTINUATION conv=%s, restored %d messages, enriched=%d chars", 
+                    conv_id, len(messages), len(enriched_context))
+    else:
+        # NEW CONVERSATION (or first turn)
+        messages = []
+        enriched_context = ""
+        
+        # Reconstruct from history if client sends it (backwards compat)
+        if req.history:
+            for m in req.history:
+                if m["type"] == "human":
+                    messages.append(HumanMessage(content=m["content"]))
+                elif m["type"] == "ai":
+                    tool_calls = m.get("tool_calls", [])
+                    messages.append(AIMessage(content=m["content"], tool_calls=tool_calls))
+                elif m["type"] == "tool":
+                    messages.append(ToolMessage(content=m["content"], tool_call_id=m["tool_call_id"]))
+        
+        # Add new user question
+        if req.question:
+            messages.append(HumanMessage(content=req.question))
+        
+        # Add tool results if present (shouldn't happen on first turn, but handle it)
+        if req.tool_results:
+            for res in req.tool_results:
+                messages.append(ToolMessage(
+                    content=res.output,
+                    tool_call_id=res.call_id,
+                    status="success" if res.success else "error"
+                ))
+        
+        logger.info("[chat] NEW conv=%s, %d messages", conv_id, len(messages))
 
-    # 4. Build attached files dict
-    attached_files_dict = {}
+    # Build attached files dict
+    attached_files_dict_new = {}
     if req.attached_files:
         for af in req.attached_files:
-            attached_files_dict[af.path] = af.content
+            attached_files_dict_new[af.path] = af.content
+    # Merge with stored attached files (new ones override)
+    if is_continuation and stored:
+        attached_files_dict = {**attached_files_dict, **attached_files_dict_new}
+    else:
+        attached_files_dict = attached_files_dict_new
 
-    # Determine if this is a continuation turn (tool results coming back)
-    # vs a fresh question. On continuations, we preserve enriched context.
-    is_continuation = bool(req.tool_results)
-    
     try:
-        # 5. Run the LangGraph agent
-        # We run until it hits a breakpoint (pause for IDE) or finishes
-        config = {"configurable": {"thread_id": req.workspace_id}}
-        logger.info("[chat] Invoking agent for workspace=%s with %d messages (continuation=%s)", 
-                   req.workspace_id, len(messages), is_continuation)
+        config = {"configurable": {"thread_id": conv_id}}
+        logger.info("[chat] Invoking agent for workspace=%s conv=%s with %d messages (continuation=%s, enriched=%d chars)", 
+                   req.workspace_id, conv_id, len(messages), is_continuation, len(enriched_context))
+        
         result = await agent.forge_agent.ainvoke(
             {
                 "messages": messages, 
                 "workspace_id": req.workspace_id,
                 "attached_files": attached_files_dict,
-                "enriched_context": "",  # Will be filled by enrich node (skipped on continuation)
+                "enriched_context": enriched_context,  # Preserved on continuation!
             },
             config=config
         )
         
-        enriched_ctx_len = len(result.get("enriched_context", ""))
-        logger.info("[chat] Agent returned, enriched_context len=%d, messages=%d", 
-                   enriched_ctx_len, len(result.get("messages", [])))
-        
+        enriched_ctx = result.get("enriched_context", "")
         final_messages = result["messages"]
         last_message = final_messages[-1]
         
-        # 5. Determine response status
+        logger.info("[chat] Agent returned, enriched_context len=%d, messages=%d", 
+                   len(enriched_ctx), len(final_messages))
+        
+        # ── Determine response status ─────────────────────────────
         status = "done"
         tool_calls = None
         answer = None
         
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            # Check if any tool calls are for the IDE
-            ide_tools = ["read_file", "write_to_file", "replace_in_file", "execute_command"]
-            if any(tc["name"] in ide_tools for tc in last_message.tool_calls):
+            # Check if any tool calls are for the IDE (including LSP tools)
+            ide_tool_names = {
+                "read_file", "write_to_file", "replace_in_file", "execute_command",
+                "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
+            }
+            if any(tc["name"] in ide_tool_names for tc in last_message.tool_calls):
                 status = "requires_action"
                 tool_calls = last_message.tool_calls
             else:
-                # This shouldn't happen with the current graph logic but for safety:
                 answer = last_message.content
         else:
             answer = last_message.content
 
-        # 6. Serialize history for the IDE
+        # ── Save conversation state server-side ───────────────────
+        _conversations.set(conv_id, {
+            "messages": final_messages,
+            "enriched_context": enriched_ctx,
+            "attached_files": attached_files_dict,
+        })
+
+        # Serialize history for the IDE (for display/debugging)
         serialized_history = []
         for m in final_messages:
             m_type = "human" if isinstance(m, HumanMessage) else "ai" if isinstance(m, AIMessage) else "tool"

@@ -11,10 +11,10 @@ The flow:
      - Call chain traces for mentioned symbols  
      - Impact analysis if editing
      - Attached file contents from IDE
-     - (Future) Context7 documentation
   3. Build a "perfect prompt" with all this context
   4. LLM just needs to reason + execute with full context
   5. For IDE tools (file ops), pause and return to IDE for execution
+  6. Agent can use lookup_documentation tool for library docs on-demand
 """
 
 from typing import Annotated, TypedDict, Literal
@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import httpx
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -30,6 +31,11 @@ from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 
 from . import store, embeddings, chat as chat_utils
+
+# Documentation API configuration
+CONTEXT7_API_URL = "https://mcp.context7.com/mcp"
+DEVDOCS_API_URL = "https://devdocs.io"
+CONTEXT7_API_KEY = os.getenv("CONTEXT7_API_KEY", "")
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,7 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 4. **replace_in_file old_str must match EXACTLY** — copy it character-for-character from read_file output
 5. **For complex tasks**: Break into steps, execute each step with tools, verify with execute_command or read_file
 6. **If something fails**: Analyze the error and try a different approach immediately
+7. **ALWAYS VERIFY YOUR WORK** before finishing (see Verification section below)
 
 ## Tools Available
 
@@ -54,6 +61,7 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 - `codebase_search(query)`: Semantic search for code. Use to find relevant functions/classes.
 - `trace_call_chain(symbol_name, direction, max_depth)`: Find what calls a function or what it calls.
 - `impact_analysis(symbol_name, max_depth)`: Find all code affected by changing a symbol.
+- `lookup_documentation(library, query)`: Look up official documentation for libraries/frameworks (e.g., "react", "fastapi"). Uses Context7 + DevDocs.io.
 
 ### File Tools (for reading and editing)
 - `read_file(path, start_line, end_line)`: Read file contents. ALWAYS do this before editing.
@@ -61,12 +69,50 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 - `write_to_file(path, content)`: Write entire file. Only for new files.
 - `execute_command(command)`: Run shell commands (grep, git, tests, etc.)
 
+### LSP Tools (for type checking and code intelligence)
+- `lsp_go_to_definition(path, line, column)`: Jump to where a symbol is defined.
+- `lsp_find_references(path, line, column)`: Find all usages of a symbol.
+- `lsp_hover(path, line, column)`: Get type info and docs for a symbol.
+- `lsp_rename(path, line, column, new_name)`: Safe rename across the workspace.
+
 ## Workflow for Refactoring
 
 1. Use `execute_command` with `grep -rn "old_name" --include="*.py"` to find ALL occurrences
 2. Use `read_file` on each file to see the exact code around each occurrence
 3. Use `replace_in_file` on each file to make the change
 4. Use `execute_command` with grep again to verify no occurrences remain
+5. **RUN VERIFICATION** (see below)
+
+## VERIFICATION — MANDATORY BEFORE FINISHING
+
+**You are NOT done until you verify your changes compile and pass checks.**
+
+After making ALL edits, you MUST run a verification step using `execute_command`. Pick the right check based on the project:
+
+| Project Type       | Verification Command                                    |
+|--------------------|---------------------------------------------------------|
+| Next.js            | `npm run build 2>&1 | tail -50` (catches "use client", SSR issues, imports) |
+| TypeScript (non-Next) | `npx tsc --noEmit 2>&1 | head -50`                 |
+| Python             | `python -m py_compile <file>` or `python -m mypy .`    |
+| Rust               | `cargo check 2>&1 | tail -30`                          |
+| Go                 | `go build ./... 2>&1 | tail -30`                       |
+| General            | `npm test` / `pytest` / `cargo test` (if tests exist)  |
+
+**IMPORTANT for Next.js**: `npx tsc --noEmit` does NOT catch Next.js-specific errors like missing `"use client"`. ALWAYS use `npm run build` for Next.js projects.
+
+**If the check FAILS:**
+1. Read the error output carefully
+2. Fix the issues (e.g. missing imports, wrong types, missing "use client" for React hooks in Next.js App Router)
+3. Re-run the verification
+4. Repeat until it passes
+
+**Common gotchas to check for:**
+- Next.js App Router: Components using React hooks (useState, useEffect, etc.) MUST have `"use client"` at the top
+- TypeScript: Missing type imports, wrong return types
+- Python: Missing imports, indentation errors
+- Rust: Borrow checker errors, missing trait implementations
+
+NEVER report "done" with errors still present. Your job is only complete when the code compiles cleanly.
 
 REMEMBER: You must CALL the tools. Do not write code blocks showing tool calls — actually invoke them."""
 
@@ -114,6 +160,22 @@ async def impact_analysis(symbol_name: str) -> str:
     """
     Blast radius analysis - find what's affected if you change this symbol.
     Returns all callers and dependent code.
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+@tool
+async def lookup_documentation(library: str, query: str) -> str:
+    """
+    Look up documentation for a library/framework.
+    Uses Context7 and DevDocs.io to find official documentation.
+    
+    Args:
+        library: The library/framework name (e.g., "react", "fastapi", "langchain", "pandas")
+        query: What you want to know (e.g., "how to use hooks", "async endpoints", "dataframe groupby")
+    
+    Returns:
+        Relevant documentation snippets from official sources.
     """
     return "PENDING_SERVER_EXECUTION"
 
@@ -190,7 +252,7 @@ def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
 
 
 # Tool lists
-SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis]
+SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation]
 IDE_TOOLS = [read_file, write_to_file, replace_in_file, execute_command]
 LSP_TOOLS = [lsp_go_to_definition, lsp_find_references, lsp_hover, lsp_rename]
 ALL_TOOLS = SERVER_TOOLS + IDE_TOOLS + LSP_TOOLS
@@ -199,7 +261,7 @@ IDE_TOOL_NAMES = {
     "read_file", "write_to_file", "replace_in_file", "execute_command",
     "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
 }
-SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis"}
+SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"}
 
 
 # ── Pre-Enrichment Logic ──────────────────────────────────────────
@@ -266,8 +328,8 @@ async def build_pre_enrichment(
         except Exception as e:
             logger.debug("Trace failed for %s: %s", sym, e)
     
-    # 5. (Future) Fetch Context7 documentation for libraries mentioned
-    # TODO: Integrate Context7 MCP for official docs
+    # Note: Documentation lookup is now available as a tool (lookup_documentation)
+    # The agent can call it on-demand instead of auto-fetching in pre-enrichment
     
     return "\n".join(parts).strip()
 
@@ -281,6 +343,258 @@ def extract_symbols_from_text(text: str) -> list[str]:
     # Combined and deduplicated
     symbols = list(dict.fromkeys(camel + snake))
     return symbols[:5]  # Limit
+
+
+# ── Documentation Lookup (Context7 + DevDocs.io) ──────────────────
+
+async def _fetch_documentation(library: str, query: str) -> str:
+    """
+    Fetch documentation from Context7 and DevDocs.io.
+    
+    Context7: MCP-based, provides curated library docs with semantic search
+    DevDocs.io: Free API for browsing official documentation
+    """
+    results = []
+    
+    # Try Context7 first (if API key is configured)
+    if CONTEXT7_API_KEY:
+        try:
+            c7_result = await _query_context7(library, query)
+            if c7_result:
+                results.append(f"## Context7 Documentation\n\n{c7_result}")
+        except Exception as e:
+            logger.warning("Context7 lookup failed: %s", e)
+    
+    # Try DevDocs.io as fallback/supplement
+    try:
+        devdocs_result = await _query_devdocs(library, query)
+        if devdocs_result:
+            results.append(f"## DevDocs.io Documentation\n\n{devdocs_result}")
+    except Exception as e:
+        logger.warning("DevDocs lookup failed: %s", e)
+    
+    if results:
+        return "\n\n---\n\n".join(results)
+    else:
+        return f"No documentation found for '{library}' with query '{query}'. Try a different library name or query."
+
+
+async def _query_context7(library: str, query: str) -> str:
+    """Query Context7 MCP API for library documentation."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Step 1: Resolve library ID
+        resolve_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "resolve-library-id",
+                "arguments": {"libraryName": library}
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        if CONTEXT7_API_KEY:
+            headers["Authorization"] = f"Bearer {CONTEXT7_API_KEY}"
+        
+        response = await client.post(CONTEXT7_API_URL, json=resolve_payload, headers=headers)
+        response.raise_for_status()
+        resolve_result = response.json()
+        
+        # Extract library ID from response
+        if "result" not in resolve_result or "content" not in resolve_result["result"]:
+            logger.debug("Context7: No library found for %s", library)
+            return ""
+        
+        content = resolve_result["result"]["content"]
+        if not content or not isinstance(content, list):
+            return ""
+        
+        # Parse the text content to find library ID
+        text_content = content[0].get("text", "") if content else ""
+        if not text_content or "No libraries found" in text_content:
+            return ""
+        
+        # Extract first library ID (format: /library-name/version)
+        lines = text_content.strip().split("\n")
+        library_id = None
+        for line in lines:
+            if line.startswith("- "):
+                # Extract ID from format: "- library-name: /library/version"
+                parts = line.split(": ")
+                if len(parts) >= 2:
+                    library_id = parts[1].strip()
+                    break
+        
+        if not library_id:
+            return ""
+        
+        logger.info("Context7: Resolved %s -> %s", library, library_id)
+        
+        # Step 2: Query documentation
+        query_payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "get-library-docs",
+                "arguments": {
+                    "context7CompatibleLibraryID": library_id,
+                    "topic": query
+                }
+            }
+        }
+        
+        response = await client.post(CONTEXT7_API_URL, json=query_payload, headers=headers)
+        response.raise_for_status()
+        docs_result = response.json()
+        
+        if "result" in docs_result and "content" in docs_result["result"]:
+            doc_content = docs_result["result"]["content"]
+            if doc_content and isinstance(doc_content, list):
+                return doc_content[0].get("text", "")[:8000]  # Limit size
+        
+        return ""
+
+
+async def _query_devdocs(library: str, query: str) -> str:
+    """Query DevDocs.io API for documentation."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Map common library names to DevDocs slugs (verified against docs.json)
+        # Note: Some libraries like pydantic, langchain are NOT available on DevDocs
+        slug_map = {
+            "react": "react",
+            "vue": "vue~3",
+            "angular": "angular",
+            "fastapi": "fastapi",
+            "flask": "flask",
+            "django": "django~5.2",
+            "express": "express",
+            "nextjs": "next.js",
+            "next": "next.js",
+            "typescript": "typescript",
+            "python": "python~3.12",
+            "rust": "rust",
+            "go": "go",
+            "nodejs": "node",
+            "node": "node",
+            "pandas": "pandas~2",
+            "numpy": "numpy~2",
+            "pytorch": "pytorch",
+            "tensorflow": "tensorflow~2",
+            "sqlalchemy": "sqlalchemy~2",
+            "tailwind": "tailwindcss",
+            "tailwindcss": "tailwindcss",
+            "docker": "docker",
+            "git": "git",
+            "redis": "redis",
+            "postgresql": "postgresql~16",
+            "postgres": "postgresql~16",
+            "mongodb": "mongoose",
+            "graphql": "graphql",
+            "webpack": "webpack~5",
+            "vite": "vite",
+            "jest": "jest",
+            "cypress": "cypress",
+            "axios": "axios",
+            "lodash": "lodash~4",
+            "moment": "moment",
+            "d3": "d3~7",
+            "sass": "sass",
+            "css": "css",
+            "html": "html",
+            "dom": "dom",
+            "javascript": "javascript",
+            "js": "javascript",
+        }
+        
+        slug = slug_map.get(library.lower(), library.lower())
+        
+        # Libraries not available on DevDocs - return early with helpful message
+        not_available = {"pydantic", "langchain", "langgraph", "openai", "anthropic", "groq", "huggingface", "transformers"}
+        if library.lower() in not_available:
+            return f"Note: {library} documentation is not available on DevDocs.io. The agent can still help based on its training knowledge."
+        
+        try:
+            # Get doc index from devdocs.io
+            index_url = f"https://devdocs.io/docs/{slug}/index.json"
+            response = await client.get(index_url)
+            
+            if response.status_code == 404:
+                logger.debug("DevDocs: No docs found for slug %s", slug)
+                return ""
+            
+            response.raise_for_status()
+            index = response.json()
+            
+            # Search entries for matching items
+            entries = index.get("entries", [])
+            query_lower = query.lower()
+            
+            # Find matching entries by name or path
+            matches = []
+            for entry in entries:
+                name = entry.get("name", "").lower()
+                path = entry.get("path", "").lower()
+                entry_type = entry.get("type", "").lower()
+                if query_lower in name or query_lower in path or query_lower in entry_type:
+                    matches.append(entry)
+                    if len(matches) >= 5:  # Collect more matches
+                        break
+            
+            if not matches:
+                # Try partial word match
+                query_words = query_lower.split()
+                for entry in entries:
+                    name = entry.get("name", "").lower()
+                    entry_type = entry.get("type", "").lower()
+                    if any(word in name or word in entry_type for word in query_words):
+                        matches.append(entry)
+                        if len(matches) >= 5:
+                            break
+            
+            if not matches:
+                return f"Found docs for {library} but no entries matching '{query}'. Available topics include: {', '.join(e['name'] for e in entries[:10])}"
+            
+            # Fetch content from the db.json (documents CDN)
+            db_url = f"https://documents.devdocs.io/{slug}/db.json"
+            db_response = await client.get(db_url)
+            
+            if db_response.status_code != 200:
+                logger.debug("DevDocs: Could not fetch db.json for %s", slug)
+                return f"Found matching topics for {library}: {', '.join(m['name'] for m in matches[:5])}"
+            
+            db = db_response.json()
+            
+            # Get content for matched entries
+            results = []
+            for match in matches[:3]:  # Limit to 3 full docs
+                path = match.get("path", "")
+                # db.json uses path without anchor (fragment)
+                base_path = path.split('#')[0] if '#' in path else path
+                
+                if base_path in db:
+                    html = db[base_path]
+                    # Convert HTML to readable text
+                    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+                    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+                    text = re.sub(r'<pre[^>]*>(.*?)</pre>', r'\n```\n\1\n```\n', text, flags=re.DOTALL)
+                    text = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', text, flags=re.DOTALL)
+                    text = re.sub(r'<h([1-6])[^>]*>(.*?)</h\1>', r'\n\n## \2\n\n', text, flags=re.DOTALL)
+                    text = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1\n', text, flags=re.DOTALL)
+                    text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text, flags=re.DOTALL)
+                    text = re.sub(r'<[^>]+>', '', text)
+                    text = re.sub(r'\n{3,}', '\n\n', text)
+                    text = re.sub(r' +', ' ', text).strip()
+                    
+                    if text:
+                        results.append(f"### {match['name']}\n\n{text[:4000]}")
+            
+            return "\n\n---\n\n".join(results) if results else ""
+            
+        except Exception as e:
+            logger.warning("DevDocs query failed: %s", e)
+            return ""
 
 
 # ── Graph Nodes ───────────────────────────────────────────────────
@@ -404,6 +718,11 @@ async def execute_server_tools(state: AgentState) -> dict:
                 symbol = args.get('symbol_name', '')
                 result = await store.impact_analysis(workspace_id, symbol, max_depth=3)
                 content = json.dumps(result, indent=2)
+            
+            elif tool_name == "lookup_documentation":
+                library = args.get('library', '')
+                query = args.get('query', '')
+                content = await _fetch_documentation(library, query)
                 
             else:
                 # Not a server tool, skip
