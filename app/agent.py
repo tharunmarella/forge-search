@@ -43,6 +43,7 @@ You have access to:
 1. **Code Context**: Relevant code snippets, call chains, and impact analysis are provided before each question
 2. **Cloud Tools**: Search the codebase semantically, trace call chains
 3. **IDE Tools**: Read files, write files, replace text in files, execute commands
+4. **LSP Tools**: Language server powered tools for accurate type info, references, and safe renames
 
 ## Rules
 
@@ -56,11 +57,23 @@ You have access to:
    - Use write_to_file only for new files or complete rewrites
 5. **For complex tasks**, break them into steps and verify each step worked before proceeding
 6. **If something fails**, analyze the error and try a different approach
+7. **For refactoring**, prefer LSP tools over manual find/replace:
+   - Use `lsp_find_references` to find ALL usages before changing anything
+   - Use `lsp_rename` for safe, atomic renames across the workspace
 
 ## Tool Usage Guidelines
 
+### Cloud Tools (fast, use first)
 - `codebase_search`: Use for finding code by meaning. Good for "how does X work?", "find the auth logic"
 - `trace_call_chain`: Use to understand execution flow. Good for "what calls X?", "what does X call?"
+
+### LSP Tools (accurate, use for refactoring)
+- `lsp_go_to_definition`: Jump to where a symbol is defined. Needs file path + line + column.
+- `lsp_find_references`: Find ALL usages of a symbol. Essential before refactoring.
+- `lsp_hover`: Get type signature and documentation for a symbol.
+- `lsp_rename`: Safely rename a symbol across the entire workspace. Atomic and accurate.
+
+### File Tools (for reading and editing)
 - `read_file`: Use to get exact current file contents before editing
 - `replace_in_file`: Use for precise edits. The old_str must match EXACTLY including whitespace
 - `write_to_file`: Use only for new files or complete file rewrites
@@ -142,12 +155,59 @@ def execute_command(command: str) -> str:
     return "PENDING_IDE_EXECUTION"
 
 
+# ── LSP Tools (IDE-side, powered by language servers) ───────────
+
+@tool
+def lsp_go_to_definition(path: str, line: int, column: int) -> str:
+    """
+    Get the definition location for a symbol at a specific position.
+    Uses the IDE's language server (rust-analyzer, pyright, etc.) for accurate results.
+    Returns the file path and line number where the symbol is defined.
+    """
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def lsp_find_references(path: str, line: int, column: int) -> str:
+    """
+    Find ALL references to a symbol at a specific position.
+    Uses the IDE's language server for accurate cross-file results.
+    Great for understanding usage patterns and safe refactoring.
+    Returns list of locations where the symbol is used.
+    """
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def lsp_hover(path: str, line: int, column: int) -> str:
+    """
+    Get type information and documentation for a symbol at a position.
+    Uses the IDE's language server for accurate type info.
+    Returns type signature, documentation, and other hover info.
+    """
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
+    """
+    Safely rename a symbol across the entire workspace.
+    Uses the IDE's language server to find all occurrences and rename them atomically.
+    This is the safest way to rename - better than find/replace.
+    """
+    return "PENDING_IDE_EXECUTION"
+
+
 # Tool lists
 SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis]
 IDE_TOOLS = [read_file, write_to_file, replace_in_file, execute_command]
-ALL_TOOLS = SERVER_TOOLS + IDE_TOOLS
+LSP_TOOLS = [lsp_go_to_definition, lsp_find_references, lsp_hover, lsp_rename]
+ALL_TOOLS = SERVER_TOOLS + IDE_TOOLS + LSP_TOOLS
 
-IDE_TOOL_NAMES = {"read_file", "write_to_file", "replace_in_file", "execute_command"}
+IDE_TOOL_NAMES = {
+    "read_file", "write_to_file", "replace_in_file", "execute_command",
+    "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
+}
 SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis"}
 
 
