@@ -237,19 +237,27 @@ async def build_pre_enrichment(
     
     # 2. Semantic search based on the question
     try:
+        logger.info("Pre-enrichment: searching for '%s' in workspace=%s", question[:100], workspace_id)
         query_emb = await embeddings.embed_query(question)
         search_results = await store.vector_search(workspace_id, query_emb, top_k=8)
         logger.info("Pre-enrichment: got %d search results for workspace=%s", len(search_results), workspace_id)
         
         if search_results:
             flat_results = [r["symbol"] for r in search_results]
+            # Log what we're passing to build_context
+            if flat_results:
+                logger.info("Pre-enrichment: first result keys=%s, name=%s", 
+                           list(flat_results[0].keys()), flat_results[0].get('name'))
             context_text = chat_utils.build_context_from_results(flat_results)
-            parts.append(context_text)
-            logger.info("Pre-enrichment: built context len=%d", len(context_text))
+            if context_text:
+                parts.append(context_text)
+                logger.info("Pre-enrichment: built context len=%d", len(context_text))
+            else:
+                logger.warning("Pre-enrichment: build_context_from_results returned empty")
         else:
             logger.warning("Pre-enrichment: no results for query in workspace %s", workspace_id)
     except Exception as e:
-        logger.warning("Pre-enrichment search failed: %s", e, exc_info=True)
+        logger.error("Pre-enrichment search failed: %s", e, exc_info=True)
     
     # 3. Extract symbol names from question for trace analysis
     # Simple heuristic: look for CamelCase or snake_case identifiers
