@@ -733,6 +733,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         # 5. Run the LangGraph agent
         # We run until it hits a breakpoint (pause for IDE) or finishes
         config = {"configurable": {"thread_id": req.workspace_id}}
+        logger.info("[chat] Invoking agent for workspace=%s with %d messages", req.workspace_id, len(messages))
         result = await agent.forge_agent.ainvoke(
             {
                 "messages": messages, 
@@ -742,6 +743,10 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             },
             config=config
         )
+        
+        enriched_ctx_len = len(result.get("enriched_context", ""))
+        logger.info("[chat] Agent returned, enriched_context len=%d, messages=%d", 
+                   enriched_ctx_len, len(result.get("messages", [])))
         
         final_messages = result["messages"]
         last_message = final_messages[-1]
