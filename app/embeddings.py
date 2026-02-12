@@ -50,8 +50,9 @@ def is_embeddable(text: str) -> bool:
     if not text or not text.strip():
         return False
     
-    # Very short content is not useful
-    if len(text.strip()) < 20:
+    # Very short content is not useful (but we use enriched context, so even
+    # short symbols should have metadata like [File], [Module], [Signature])
+    if len(text.strip()) < 10:
         return False
     
     # Detect minified code: if average line length > 500 chars, it's likely minified

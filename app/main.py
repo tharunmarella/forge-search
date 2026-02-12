@@ -30,6 +30,9 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file for local dev (no-op if missing)
 
+from fastapi.responses import StreamingResponse
+import json
+
 # ── LangSmith Tracing ─────────────────────────────────────────────
 # LangGraph/LangChain auto-traces when these env vars are set:
 #   LANGSMITH_TRACING=true
@@ -1065,6 +1068,227 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     except Exception as e:
         logger.error("Agent execution failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)[:200]}")
+
+
+# ── POST /chat/stream (SSE) ────────────────────────────────────────
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_user)):
+    """
+    AI Chat with Server-Sent Events (SSE) streaming.
+    
+    Provides real-time visibility into agent thinking:
+    - thinking: Agent reasoning steps
+    - tool_start/tool_end: Server-side tool execution
+    - text_delta: Incremental text output  
+    - requires_action: IDE needs to execute tools
+    - done: Completion
+    - error: Failure
+    """
+    
+    async def event_generator():
+        """Generate SSE events from agent execution."""
+        try:
+            t0 = time.monotonic()
+            conv_id = req.conversation_id or f"{req.workspace_id}-default"
+            has_tool_results = bool(req.tool_results)
+            
+            # ── Reconstruct state (same as regular /chat) ──
+            stored = _conversations.get(conv_id)
+            task_complexity = ""
+            plan_steps = []
+            current_step = 0
+            plan_complete = False
+
+            if has_tool_results and stored:
+                messages = stored["messages"]
+                enriched_context = stored.get("enriched_context", "")
+                attached_files_dict = stored.get("attached_files", {})
+                task_complexity = stored.get("task_complexity", "")
+                plan_steps = stored.get("plan_steps", [])
+                current_step = stored.get("current_step", 0)
+                plan_complete = stored.get("plan_complete", False)
+                
+                for res in req.tool_results:
+                    messages.append(ToolMessage(
+                        content=res.output,
+                        tool_call_id=res.call_id,
+                        status="success" if res.success else "error"
+                    ))
+            elif stored and req.question:
+                messages = stored["messages"]
+                enriched_context = stored.get("enriched_context", "")
+                attached_files_dict = stored.get("attached_files", {})
+                task_complexity = stored.get("task_complexity", "")
+                plan_steps = stored.get("plan_steps", [])
+                current_step = stored.get("current_step", 0)
+                plan_complete = stored.get("plan_complete", False)
+                messages.append(HumanMessage(content=req.question))
+            else:
+                messages = []
+                enriched_context = ""
+                attached_files_dict = {}
+                
+                if req.history:
+                    for m in req.history:
+                        if m["type"] == "human":
+                            messages.append(HumanMessage(content=m["content"]))
+                        elif m["type"] == "ai":
+                            tool_calls = m.get("tool_calls", [])
+                            messages.append(AIMessage(content=m["content"], tool_calls=tool_calls))
+                        elif m["type"] == "tool":
+                            messages.append(ToolMessage(content=m["content"], tool_call_id=m["tool_call_id"]))
+                
+                if req.question:
+                    messages.append(HumanMessage(content=req.question))
+                
+                if req.tool_results:
+                    for res in req.tool_results:
+                        messages.append(ToolMessage(
+                            content=res.output,
+                            tool_call_id=res.call_id,
+                            status="success" if res.success else "error"
+                        ))
+
+            # Build attached files dict
+            attached_files_dict_new = {}
+            if req.attached_files:
+                for af in req.attached_files:
+                    attached_files_dict_new[af.path] = af.content
+            if stored and has_tool_results:
+                attached_files_dict = {**attached_files_dict, **attached_files_dict_new}
+            else:
+                attached_files_dict = attached_files_dict_new
+
+            # ── Stream agent execution ──
+            turn_number = 1
+            if stored:
+                turn_number = sum(1 for m in messages if isinstance(m, HumanMessage))
+            
+            user_email = user.get("email", "anonymous") if user else "anonymous"
+            user_name = user.get("name", "") if user else ""
+
+            config = {
+                "configurable": {"thread_id": conv_id},
+                "run_name": f"forge-chat:{req.workspace_id}:turn-{turn_number}",
+                "tags": [
+                    f"workspace:{req.workspace_id}",
+                    f"user:{user_email}",
+                    "continuation" if has_tool_results else ("follow-up" if stored else "new-conversation"),
+                ],
+                "metadata": {
+                    "conversation_id": conv_id,
+                    "workspace_id": req.workspace_id,
+                    "user_email": user_email,
+                    "user_name": user_name,
+                    "turn_number": turn_number,
+                    "is_continuation": has_tool_results,
+                    "question": (req.question or "")[:200],
+                    "num_messages": len(messages),
+                    "num_attached_files": len(attached_files_dict),
+                    "enriched_context_chars": len(enriched_context),
+                },
+            }
+
+            # Stream events from agent
+            # Note: LangGraph doesn't have built-in SSE streaming, so we'll run the agent
+            # and emit progress events based on node execution
+            
+            # For now, emit a thinking event at start
+            yield f"event: thinking\ndata: {json.dumps({'step_type': 'start', 'message': 'Processing request...', 'detail': ''})}\n\n"
+            
+            result = await agent.forge_agent.ainvoke(
+                {
+                    "messages": messages,
+                    "workspace_id": req.workspace_id,
+                    "attached_files": attached_files_dict,
+                    "enriched_context": enriched_context,
+                    "task_complexity": task_complexity,
+                    "plan_steps": plan_steps,
+                    "current_step": current_step,
+                    "plan_complete": plan_complete,
+                },
+                config=config
+            )
+            
+            enriched_ctx = result.get("enriched_context", "")
+            final_messages = result["messages"]
+            last_message = final_messages[-1]
+            
+            result_plan_steps = result.get("plan_steps", [])
+            result_current_step = result.get("current_step", 0)
+            result_task_complexity = result.get("task_complexity", "")
+            result_plan_complete = result.get("plan_complete", False)
+            
+            # Emit plan if present
+            if result_plan_steps:
+                yield f"event: plan\ndata: {json.dumps({'steps': result_plan_steps})}\n\n"
+            
+            # Determine what to send back
+            if isinstance(last_message, AIMessage) and last_message.tool_calls:
+                ide_tool_names = {
+                    "read_file", "write_to_file", "replace_in_file", "execute_command",
+                    "grep", "list_files",
+                    "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
+                }
+                
+                # Check if any are IDE tools
+                ide_tool_calls = [tc for tc in last_message.tool_calls if tc["name"] in ide_tool_names]
+                
+                if ide_tool_calls:
+                    # IDE needs to execute these tools
+                    tool_calls_data = [
+                        {
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "args": tc["args"],
+                        }
+                        for tc in ide_tool_calls
+                    ]
+                    yield f"event: requires_action\ndata: {json.dumps({'tool_calls': tool_calls_data})}\n\n"
+                else:
+                    # Server-side tools (already executed by agent)
+                    if last_message.content:
+                        yield f"event: text_delta\ndata: {json.dumps({'text': last_message.content})}\n\n"
+            else:
+                # Plain text response
+                if last_message.content:
+                    content = await mermaid.render_mermaid_blocks(last_message.content)
+                    yield f"event: text_delta\ndata: {json.dumps({'text': content})}\n\n"
+            
+            # Save conversation state
+            _conversations.set(conv_id, {
+                "messages": final_messages,
+                "enriched_context": enriched_ctx,
+                "attached_files": attached_files_dict,
+                "task_complexity": result_task_complexity,
+                "plan_steps": result_plan_steps,
+                "current_step": result_current_step,
+                "plan_complete": result_plan_complete,
+            })
+            
+            # Emit done event
+            answer = None
+            if isinstance(last_message, AIMessage):
+                if not last_message.tool_calls or not any(tc["name"] in ide_tool_names for tc in last_message.tool_calls):
+                    answer = last_message.content
+            
+            elapsed = (time.monotonic() - t0) * 1000
+            yield f"event: done\ndata: {json.dumps({'answer': answer, 'total_time_ms': round(elapsed, 1)})}\n\n"
+            
+        except Exception as e:
+            logger.error("Streaming agent execution failed: %s", e, exc_info=True)
+            yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 # ── POST /debug/pre-enrichment ─────────────────────────────────────

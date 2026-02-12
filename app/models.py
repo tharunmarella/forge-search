@@ -69,6 +69,7 @@ class HealthResponse(BaseModel):
     status: str
     store_ok: bool
     version: str = "0.2.0"
+    features: dict[str, bool] = {"streaming": True}
 
 
 # ── Deep traversal models ────────────────────────────────────────
