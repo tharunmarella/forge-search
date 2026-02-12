@@ -60,12 +60,14 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 
 ### Search Tools (use in this priority order for finding code)
 1. `codebase_search(query)`: **USE FIRST.** Semantic search — find code by meaning. Fast, searches the pre-built index. Use for finding functions, classes, patterns, or anything by description.
-2. `trace_call_chain(symbol_name, direction)`: Find what calls a function or what it calls. Direction: 'upstream', 'downstream', or 'both' (default).
-3. `impact_analysis(symbol_name)`: Find all code affected by changing a symbol.
-4. `lookup_documentation(library, query)`: Look up official docs for libraries/frameworks.
+2. `grep(pattern, path, glob)`: Literal/regex text search using ripgrep. Use when you know the exact string (function name, error message, import). Fast, respects .gitignore.
+3. `trace_call_chain(symbol_name, direction)`: Find what calls a function or what it calls. Direction: 'upstream', 'downstream', or 'both' (default).
+4. `impact_analysis(symbol_name)`: Find all code affected by changing a symbol.
+5. `lookup_documentation(library, query)`: Look up official docs for libraries/frameworks.
 
 ### File Tools (for reading and editing)
 - `read_file(path)`: Read file contents. ALWAYS do this before editing.
+- `list_files(path, recursive)`: List files in a directory.
 - `replace_in_file(path, old_str, new_str)`: Replace exact text in a file. old_str must match exactly.
 - `write_to_file(path, content)`: Write entire file. Only for new files.
 - `execute_command(command)`: Run shell commands (git, builds, tests, etc.)
@@ -78,18 +80,20 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 
 ## SEARCH RULES — CRITICAL
 
-**ALWAYS use `codebase_search` for finding code.** It's semantic search that finds code by meaning.
+**NEVER use `execute_command` with `grep` or `find` for searching code.**
 - WRONG: `execute_command(command="grep -rn 'foo' .")`  ← SLOW, can escape workspace
-- RIGHT: `codebase_search(query="foo function")`        ← Semantic, finds related code
+- RIGHT: `grep(pattern="foo")`                          ← Uses ripgrep, fast, safe
+- BEST:  `codebase_search(query="foo function")`        ← Semantic, finds related code too
 
+Use `codebase_search` first for semantic/conceptual queries. Use `grep` when you need exact literal matches.
 The `execute_command` tool should ONLY be used for: git, builds, tests, package managers, linters.
 
 ## Workflow for Refactoring
 
-1. Use `codebase_search` to find ALL occurrences
+1. Use `codebase_search` or `grep` to find ALL occurrences
 2. Use `read_file` on each file to see the exact code around each occurrence
 3. Use `replace_in_file` on each file to make the change
-4. Use `codebase_search` again to verify no occurrences remain
+4. Use `grep` to verify no occurrences remain
 5. **RUN VERIFICATION** (see below)
 
 ## VERIFICATION — MANDATORY BEFORE FINISHING
@@ -290,6 +294,22 @@ def execute_command(command: str) -> str:
     return "PENDING_IDE_EXECUTION"
 
 
+@tool
+def grep(pattern: str, path: str = ".", glob: str = None, case_insensitive: bool = False) -> str:
+    """
+    Literal/regex text search using ripgrep. Fast, respects .gitignore.
+    Use when you know the exact string to find (function name, error message, import).
+    For semantic/conceptual search, use codebase_search instead.
+    """
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool  
+def list_files(path: str, recursive: bool = False) -> str:
+    """List files in a directory."""
+    return "PENDING_IDE_EXECUTION"
+
+
 # ── LSP Tools (IDE-side, powered by language servers) ───────────
 
 @tool
@@ -335,12 +355,13 @@ def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
 
 # Tool lists
 SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation]
-IDE_TOOLS = [read_file, write_to_file, replace_in_file, execute_command]
+IDE_TOOLS = [read_file, write_to_file, replace_in_file, execute_command, grep, list_files]
 LSP_TOOLS = [lsp_go_to_definition, lsp_find_references, lsp_hover, lsp_rename]
 ALL_TOOLS = SERVER_TOOLS + IDE_TOOLS + LSP_TOOLS
 
 IDE_TOOL_NAMES = {
     "read_file", "write_to_file", "replace_in_file", "execute_command",
+    "grep", "list_files",
     "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
 }
 SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"}
