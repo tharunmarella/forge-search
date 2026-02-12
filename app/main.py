@@ -13,10 +13,14 @@ Code Intelligence:
   POST /search   — Semantic code search
   POST /trace    — Deep call chain traversal
   POST /impact   — Blast radius analysis
-  POST /chat     — AI chat (search context + Groq Kimi-K2)
+  POST /chat     — AI chat (search context + any LLM via LiteLLM)
   POST /watch    — Intelligent file watcher
   POST /scan     — One-shot intelligent scan
   GET  /health   — Healthcheck
+
+LLM Model Management:
+  GET  /models       — List providers, models, current config
+  POST /models/set   — Switch reasoning/tool model at runtime
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import RedirectResponse
 
 from . import store, embeddings, watcher, auth, chat, agent, mermaid
+from . import llm as llm_provider
 from .models import (
     IndexRequest, IndexResponse,
     SearchRequest, SearchResponse, SearchResult, RelatedSymbol,
@@ -58,7 +63,8 @@ from .models import (
     TraceRequest, TraceResponse, TraceNode, TraceEdge,
     ImpactRequest, ImpactResponse, AffectedFile, AffectedSymbol,
     WatchRequest, WatchResponse,
-    ChatRequest, ChatResponse, ToolResultPayload, AttachedFile
+    ChatRequest, ChatResponse, ToolResultPayload, AttachedFile,
+    ProviderInfo, ActiveModelsResponse, SetModelRequest, SetModelResponse,
 )
 from .parser import parse_file, SymbolDef, SymbolRef, FileParseResult
 
@@ -218,6 +224,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Forge Search API...")
     await store.ensure_schema()
     await auth.ensure_user_table()
+    llm_provider.log_provider_status()
     logger.info("Store ready (auth enabled)")
     yield
     logger.info("Shutting down...")
@@ -1307,6 +1314,70 @@ async def debug_pre_enrichment(workspace_id: str, question: str):
             "workspace_id": workspace_id,
             "question": question,
         }
+
+
+# ── GET /models ───────────────────────────────────────────────────
+
+@app.get("/models", response_model=ActiveModelsResponse)
+async def get_models():
+    """
+    List available LLM providers, their models, and the current config.
+    
+    Providers with a configured API key show configured=true.
+    Switch models at runtime with POST /models/set.
+    """
+    active = llm_provider.get_active_models()
+    providers_raw = llm_provider.get_available_providers()
+    
+    providers = [
+        ProviderInfo(
+            provider=p["provider"],
+            name=p["name"],
+            env_key=p["env_key"],
+            configured=p["configured"],
+            models=p["models"],
+        )
+        for p in providers_raw
+    ]
+    
+    return ActiveModelsResponse(
+        reasoning_model=active["reasoning_model"],
+        tool_model=active["tool_model"],
+        providers=providers,
+    )
+
+
+@app.post("/models/set", response_model=SetModelResponse)
+async def set_models(req: SetModelRequest):
+    """
+    Switch the active reasoning and/or tool model at runtime.
+    
+    Model string format: "provider/model-name"
+    Examples:
+        "groq/moonshotai/kimi-k2-instruct-0905"
+        "gemini/gemini-2.0-flash"
+        "anthropic/claude-sonnet-4-20250514"
+        "fireworks_ai/accounts/fireworks/models/llama-v3p1-70b-instruct"
+        "openai/gpt-4o"
+    """
+    if req.reasoning_model:
+        llm_provider.set_reasoning_model(req.reasoning_model)
+    if req.tool_model:
+        llm_provider.set_tool_model(req.tool_model)
+    
+    config = llm_provider.get_config()
+    
+    changes = []
+    if req.reasoning_model:
+        changes.append(f"reasoning → {req.reasoning_model}")
+    if req.tool_model:
+        changes.append(f"tool → {req.tool_model}")
+    
+    return SetModelResponse(
+        reasoning_model=config.reasoning_model,
+        tool_model=config.tool_model,
+        message=f"Updated: {', '.join(changes)}" if changes else "No changes",
+    )
 
 
 # ── GET /health ───────────────────────────────────────────────────

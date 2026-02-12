@@ -202,10 +202,42 @@ class ChatResponse(BaseModel):
     # Updated history to send back to the IDE
     history: list[dict] | None = None
     status: str  # "done", "requires_action", "error"
-    model: str = "moonshotai/kimi-k2-instruct-0905"
+    model: str = ""
     tokens: int = 0
     total_time_ms: float = 0
     # ── Task decomposition ────────────────────────────────────
     task_complexity: str | None = None  # "simple" or "complex"
     plan_steps: list[PlanStepResponse] | None = None
     current_step: int | None = None
+
+
+# ── LLM Model management ─────────────────────────────────────────
+
+
+class ProviderInfo(BaseModel):
+    """A supported LLM provider."""
+    provider: str           # "groq", "gemini", "anthropic", etc.
+    name: str               # "Groq", "Google Gemini", "Anthropic (Claude)"
+    env_key: str            # "GROQ_API_KEY"
+    configured: bool        # True if API key is set
+    models: list[str]       # Available model strings
+
+
+class ActiveModelsResponse(BaseModel):
+    """Currently active model configuration."""
+    reasoning_model: str
+    tool_model: str
+    providers: list[ProviderInfo]
+
+
+class SetModelRequest(BaseModel):
+    """Request to change the active model(s)."""
+    reasoning_model: str | None = None
+    tool_model: str | None = None
+
+
+class SetModelResponse(BaseModel):
+    """Response after changing models."""
+    reasoning_model: str
+    tool_model: str
+    message: str

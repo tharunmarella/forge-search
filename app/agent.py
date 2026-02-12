@@ -27,11 +27,11 @@ import httpx
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langsmith import traceable
 
 from . import store, embeddings, chat as chat_utils
+from . import llm as llm_provider
 
 # Documentation API configuration
 CONTEXT7_API_URL = "https://mcp.context7.com/mcp"
@@ -984,7 +984,7 @@ async def plan_task(state: AgentState) -> dict:
             messages_to_send.append(msg)
     
     # Use the reasoning model (stronger) for planning — NO tools bound
-    model = ChatGroq(model=REASONING_MODEL, temperature=0.1)
+    model = llm_provider.get_reasoning_model(temperature=0.1)
     response = await model.ainvoke(messages_to_send)
     
     plan_text = response.content
@@ -1074,33 +1074,32 @@ def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 # ── Multi-Model Routing ───────────────────────────────────────────
 #
 # Strategy: use the best model for each phase of the agent loop.
+# Models are configured via app/llm.py (backed by LiteLLM).
 #
-#   REASONING model (GROQ_MODEL):
+#   REASONING model (LLM_REASONING_MODEL):
 #     First call with enriched context + user question.
 #     Needs strong reasoning to understand the codebase and plan.
-#     Default: moonshotai/kimi-k2-instruct-0905
 #
-#   TOOL model (GROQ_TOOL_MODEL):
+#   TOOL model (LLM_TOOL_MODEL):
 #     Subsequent calls that process tool results and decide next action.
 #     Needs fast responses + reliable function calling.
-#     Default: openai/gpt-oss-20b (3.6B active, native tool use)
+#
+# Works with ANY provider: Groq, Gemini, Claude, Fireworks, OpenAI, etc.
+# Just set the model string: "groq/kimi-k2", "gemini/gemini-2.0-flash", etc.
 
-REASONING_MODEL = os.getenv("GROQ_MODEL", "moonshotai/kimi-k2-instruct-0905")
-TOOL_MODEL = os.getenv("GROQ_TOOL_MODEL", "openai/gpt-oss-20b")
 
-
-def _pick_model(messages: list[BaseMessage], is_plan_execution: bool = False) -> str:
-    """Pick model based on conversation phase.
+def _pick_model_name(messages: list[BaseMessage], is_plan_execution: bool = False) -> str:
+    """Pick model string based on conversation phase.
     
-    - Planning / first call → REASONING_MODEL
-    - After tool results → TOOL_MODEL (faster iterations)
-    - Plan execution (has plan context) → REASONING_MODEL for first step, TOOL for rest
+    - Planning / first call → reasoning model
+    - After tool results → tool model (faster iterations)
     """
+    config = llm_provider.get_config()
     has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
     
     if has_tool_messages:
-        return TOOL_MODEL
-    return REASONING_MODEL
+        return config.tool_model
+    return config.reasoning_model
 
 
 @traceable(name="call_model_node", run_type="chain", tags=["llm"])
@@ -1150,11 +1149,11 @@ async def call_model(state: AgentState) -> dict:
     
     total_chars = sum(len(m.content) for m in messages_to_send)
     
-    # Pick model based on conversation phase
-    model_name = _pick_model(state['messages'], is_plan_execution=bool(plan_steps))
+    # Pick model based on conversation phase (works with any provider)
+    model_name = _pick_model_name(state['messages'], is_plan_execution=bool(plan_steps))
     logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
     
-    model = ChatGroq(model=model_name, temperature=0.1)
+    model = llm_provider.get_chat_model(model_name, temperature=0.1)
     
     # Bind all tools
     model_with_tools = model.bind_tools(ALL_TOOLS)

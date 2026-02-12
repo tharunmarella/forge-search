@@ -1,25 +1,22 @@
 """
-AI Chat — forge-search context + Groq Kimi-K2.
+AI Chat — forge-search context + LLM (any provider via LiteLLM).
 
 User asks a question → forge-search finds relevant code → 
-Kimi-K2 reasons about it → returns precise answer.
+LLM reasons about it → returns precise answer.
 
+Supports: Groq, Gemini, Claude, Fireworks, OpenAI, Mistral, etc.
 The user never sees API keys. forge-search handles everything.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 
-import httpx
+from . import llm as llm_provider
 
 logger = logging.getLogger(__name__)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "moonshotai/kimi-k2-instruct-0905")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SYSTEM_PROMPT = """You are a senior software engineer analyzing a codebase.
 You have been given relevant code snippets, call chains, and impact analysis from a code intelligence system.
@@ -37,9 +34,9 @@ async def chat_with_context(
     max_tokens: int = 1024,
     temperature: float = 0.1,
 ) -> dict:
-    """Send question + code context to Groq Kimi-K2."""
-    if not GROQ_API_KEY:
-        return {"response": "GROQ_API_KEY not configured", "tokens": 0, "time_ms": 0, "model": "none"}
+    """Send question + code context to the configured LLM (any provider)."""
+    config = llm_provider.get_config()
+    model_name = config.reasoning_model
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -48,38 +45,24 @@ async def chat_with_context(
 
     t0 = time.time()
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                GROQ_URL,
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
-            )
-            resp_status = resp.status_code
-            resp_text = resp.text
-            resp_data = resp.json() if resp_status == 200 else None
+        response = await llm_provider.completion(
+            messages=messages,
+            model=model_name,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
     except Exception as e:
-        logger.error("Groq API call failed: %s", e)
-        return {"response": f"Groq API error: {e}", "tokens": 0, "time_ms": 0, "model": GROQ_MODEL}
+        logger.error("LLM API call failed (%s): %s", model_name, e)
+        return {"response": f"LLM error ({model_name}): {e}", "tokens": 0, "time_ms": 0, "model": model_name}
 
-    if resp_status != 200:
-        return {"response": f"Groq error ({resp_status}): {resp_text[:300]}", "tokens": 0, "time_ms": 0, "model": GROQ_MODEL}
-
-    usage = resp_data.get("usage", {})
+    usage = response.get("usage", {}) or {}
     elapsed_ms = (time.time() - t0) * 1000
 
     return {
-        "response": resp_data["choices"][0]["message"]["content"],
+        "response": response["choices"][0]["message"]["content"],
         "tokens": usage.get("completion_tokens", 0),
         "time_ms": round(elapsed_ms, 1),
-        "model": GROQ_MODEL,
+        "model": model_name,
     }
 
 
