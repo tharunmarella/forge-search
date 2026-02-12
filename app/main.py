@@ -285,18 +285,24 @@ async def index_files(req: IndexRequest):
                 logger.info("Fallback: embedding whole file %s (no symbols extracted)", 
                            file_payload.path)
 
-            # Generate embeddings from enriched text
+            # Generate embeddings from enriched text (resilient — None for failures)
+            embedding_map = {}
             if enriched_texts:
                 texts_list = list(enriched_texts.values())
                 uids_list = list(enriched_texts.keys())
-                raw_embeddings = await embeddings.embed_batch(texts_list)
-                # Map uid -> embedding for graph storage
-                embedding_map = dict(zip(uids_list, raw_embeddings))
-                total_embeddings += len(embedding_map)
-            else:
-                embedding_map = {}
+                try:
+                    raw_embeddings = await embeddings.embed_batch(texts_list)
+                    # Map uid -> embedding, skipping None (failed texts)
+                    for uid, emb in zip(uids_list, raw_embeddings):
+                        if emb is not None:
+                            embedding_map[uid] = emb
+                    total_embeddings += len(embedding_map)
+                except Exception as emb_err:
+                    # Embedding completely failed — still store symbols without vectors
+                    logger.warning("Embedding failed for %s (storing symbols without vectors): %s",
+                                 file_payload.path, str(emb_err)[:100])
 
-            # Store in Neo4j (pass enriched texts for storage too)
+            # Store symbols (even without embeddings — they're still searchable by graph)
             stats = await store.index_file_result(
                 workspace_id, parse_result, embedding_map, enriched_texts
             )
@@ -577,14 +583,20 @@ async def _index_files_internal(workspace_id: str, files: list[dict]) -> dict:
                 )
                 logger.info("Fallback: embedding whole file %s", file_payload["path"])
 
+            # Generate embeddings (resilient — None for failures)
+            embedding_map = {}
             if enriched_texts:
                 texts_list = list(enriched_texts.values())
                 uids_list = list(enriched_texts.keys())
-                raw_embeddings = await embeddings.embed_batch(texts_list)
-                embedding_map = dict(zip(uids_list, raw_embeddings))
-                total_embeddings += len(embedding_map)
-            else:
-                embedding_map = {}
+                try:
+                    raw_embeddings = await embeddings.embed_batch(texts_list)
+                    for uid, emb in zip(uids_list, raw_embeddings):
+                        if emb is not None:
+                            embedding_map[uid] = emb
+                    total_embeddings += len(embedding_map)
+                except Exception as emb_err:
+                    logger.warning("Embedding failed for %s (storing without vectors): %s",
+                                 file_payload["path"], str(emb_err)[:100])
 
             stats = await store.index_file_result(
                 workspace_id, parse_result, embedding_map, enriched_texts

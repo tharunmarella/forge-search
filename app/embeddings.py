@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Sequence
 
@@ -38,6 +39,40 @@ def _truncate(text: str, max_len: int = MAX_TEXT_LENGTH) -> str:
     return text[:max_len] + "\n... [truncated]"
 
 
+def is_embeddable(text: str) -> bool:
+    """Check if text is suitable for embedding.
+    
+    Filters out content that will cause Voyage API 400 errors:
+    - Minified JS/CSS (very long lines, no structure)
+    - Binary-looking content
+    - Empty or whitespace-only
+    """
+    if not text or not text.strip():
+        return False
+    
+    # Very short content is not useful
+    if len(text.strip()) < 20:
+        return False
+    
+    # Detect minified code: if average line length > 500 chars, it's likely minified
+    lines = text.split('\n')
+    if lines:
+        avg_line_len = sum(len(l) for l in lines) / len(lines)
+        if avg_line_len > 500 and len(lines) < 10:
+            return False
+    
+    # Detect minified: very few newlines relative to total length
+    if len(text) > 1000 and text.count('\n') < len(text) / 1000:
+        return False
+    
+    # Detect binary/garbage content
+    non_printable = sum(1 for c in text[:1000] if ord(c) < 32 and c not in '\n\r\t')
+    if non_printable > 50:
+        return False
+    
+    return True
+
+
 # ── Voyage API call ─────────────────────────────────────────────────
 
 async def _call_voyage(texts: list[str], input_type: str = "document") -> list[list[float]]:
@@ -63,6 +98,17 @@ async def _call_voyage(texts: list[str], input_type: str = "document") -> list[l
                 "input_type": input_type,
             },
         )
+        
+        if resp.status_code == 400:
+            # Log the actual error from Voyage for debugging
+            body = resp.text
+            logger.warning("Voyage 400 error (batch of %d): %s", len(texts), body[:300])
+            raise httpx.HTTPStatusError(
+                f"Voyage 400: {body[:200]}",
+                request=resp.request,
+                response=resp,
+            )
+        
         resp.raise_for_status()
         data = resp.json()
         # Sort by index to preserve order
@@ -80,25 +126,72 @@ async def embed_query(text: str) -> list[float]:
 
 
 async def embed_batch(texts: Sequence[str]) -> list[list[float]]:
-    """Embed a batch of texts (for indexing). Splits into sub-batches for API limits."""
+    """Embed a batch of texts (for indexing).
+    
+    Resilient: if a batch fails (400 error from Voyage), falls back to
+    embedding texts individually so one bad text doesn't kill the whole batch.
+    Returns None for texts that fail to embed.
+    """
     if not texts:
         return []
 
-    truncated = [_truncate(t) for t in texts]
-    all_embeddings: list[list[float]] = []
-    total_batches = (len(truncated) + BATCH_SIZE - 1) // BATCH_SIZE
+    # Pre-filter: skip texts that are clearly not embeddable
+    filtered = []
+    index_map = []  # Maps filtered index → original index
+    for i, t in enumerate(texts):
+        if is_embeddable(t):
+            filtered.append(_truncate(t))
+            index_map.append(i)
+        else:
+            logger.debug("Skipping non-embeddable text %d (%d chars, %.0f avg line)", 
+                        i, len(t), sum(len(l) for l in t.split('\n')) / max(t.count('\n'), 1))
+    
+    if not filtered:
+        logger.warning("All %d texts filtered as non-embeddable", len(texts))
+        return [None] * len(texts)  # type: ignore
+    
+    logger.info("Embedding %d/%d texts (filtered %d non-embeddable)", 
+                len(filtered), len(texts), len(texts) - len(filtered))
+    
+    # Embed in batches with fallback
+    filtered_embeddings: list[list[float] | None] = [None] * len(filtered)
+    total_batches = (len(filtered) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_idx in range(total_batches):
         start = batch_idx * BATCH_SIZE
-        end = min(start + BATCH_SIZE, len(truncated))
-        batch = truncated[start:end]
+        end = min(start + BATCH_SIZE, len(filtered))
+        batch = filtered[start:end]
 
         logger.info("Embedding batch %d/%d (%d texts)", batch_idx + 1, total_batches, len(batch))
         t0 = time.monotonic()
 
-        batch_embeddings = await _call_voyage(batch, input_type="document")
+        try:
+            batch_embeddings = await _call_voyage(batch, input_type="document")
+            for j, emb in enumerate(batch_embeddings):
+                filtered_embeddings[start + j] = emb
+            logger.info("Batch %d/%d done in %.2fs", batch_idx + 1, total_batches, time.monotonic() - t0)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                # Batch failed — fall back to individual embedding
+                logger.warning("Batch %d failed (400), falling back to individual texts (%d items)", 
+                             batch_idx + 1, len(batch))
+                for j, text in enumerate(batch):
+                    try:
+                        individual = await _call_voyage([text], input_type="document")
+                        filtered_embeddings[start + j] = individual[0]
+                    except Exception as inner_e:
+                        logger.warning("Individual embed failed for text %d (%d chars): %s", 
+                                     start + j, len(text), str(inner_e)[:100])
+                        filtered_embeddings[start + j] = None
+            else:
+                raise  # Re-raise non-400 errors
 
-        logger.info("Batch %d/%d done in %.2fs", batch_idx + 1, total_batches, time.monotonic() - t0)
-        all_embeddings.extend(batch_embeddings)
-
-    return all_embeddings
+    # Map back to original indices
+    result: list[list[float] | None] = [None] * len(texts)  # type: ignore
+    for fi, oi in enumerate(index_map):
+        result[oi] = filtered_embeddings[fi]
+    
+    embedded_count = sum(1 for e in result if e is not None)
+    logger.info("Embedded %d/%d texts successfully", embedded_count, len(texts))
+    
+    return result  # type: ignore
