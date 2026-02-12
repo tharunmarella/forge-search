@@ -999,12 +999,8 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         answer = None
         
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            # Check if any tool calls are for the IDE (including LSP tools)
-            ide_tool_names = {
-                "read_file", "write_to_file", "replace_in_file", "execute_command",
-                "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
-            }
-            if any(tc["name"] in ide_tool_names for tc in last_message.tool_calls):
+            # Check if any tool calls are for the IDE
+            if any(tc["name"] in agent.IDE_TOOL_NAMES for tc in last_message.tool_calls):
                 status = "requires_action"
                 tool_calls = last_message.tool_calls
             else:
@@ -1226,14 +1222,8 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             
             # Determine what to send back
             if isinstance(last_message, AIMessage) and last_message.tool_calls:
-                ide_tool_names = {
-                    "read_file", "write_to_file", "replace_in_file", "execute_command",
-                    "grep", "list_files",
-                    "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
-                }
-                
                 # Check if any are IDE tools
-                ide_tool_calls = [tc for tc in last_message.tool_calls if tc["name"] in ide_tool_names]
+                ide_tool_calls = [tc for tc in last_message.tool_calls if tc["name"] in agent.IDE_TOOL_NAMES]
                 
                 if ide_tool_calls:
                     # IDE needs to execute these tools
@@ -1270,7 +1260,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             # Emit done event
             answer = None
             if isinstance(last_message, AIMessage):
-                if not last_message.tool_calls or not any(tc["name"] in ide_tool_names for tc in last_message.tool_calls):
+                if not last_message.tool_calls or not any(tc["name"] in agent.IDE_TOOL_NAMES for tc in last_message.tool_calls):
                     answer = last_message.content
             
             elapsed = (time.monotonic() - t0) * 1000
