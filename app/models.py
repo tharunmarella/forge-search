@@ -188,6 +188,13 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.1, ge=0, le=1)
 
 
+class PlanStepResponse(BaseModel):
+    """A single step in the agent's execution plan."""
+    number: int
+    description: str
+    status: str  # "pending", "in_progress", "done", "failed"
+
+
 class ChatResponse(BaseModel):
     answer: str | None = None
     tool_calls: list[dict] | None = None
@@ -197,3 +204,7 @@ class ChatResponse(BaseModel):
     model: str = "moonshotai/kimi-k2-instruct-0905"
     tokens: int = 0
     total_time_ms: float = 0
+    # ── Task decomposition ────────────────────────────────────
+    task_complexity: str | None = None  # "simple" or "complex"
+    plan_steps: list[PlanStepResponse] | None = None
+    current_step: int | None = None

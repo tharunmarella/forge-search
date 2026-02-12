@@ -1,4 +1,5 @@
 """Main IDE Simulator class."""
+from __future__ import annotations
 
 import time
 import uuid
@@ -7,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any
 
-from .models import AgentTask, TaskResult, ToolExecution, TurnLog
+from .models import AgentTask, TaskResult, ToolExecution, TurnLog, PlanStepResult
 from .tools import ToolExecutor
 from .hooks import SimulatorHooks, LoggingHooks
 
@@ -72,6 +73,11 @@ class IDESimulator:
         final_status = "error"
         error_msg: str | None = None
         
+        # Plan tracking
+        last_task_complexity: str | None = None
+        last_plan_steps: list[PlanStepResult] | None = None
+        last_current_step: int | None = None
+        
         # Initial request payload
         tool_results: list[dict] | None = None
         
@@ -110,6 +116,32 @@ class IDESimulator:
                 status = response.get("status", "error")
                 tool_calls = response.get("tool_calls", [])
                 answer = response.get("answer")
+                
+                # Extract plan info from response
+                resp_complexity = response.get("task_complexity")
+                resp_plan_steps = response.get("plan_steps")
+                resp_current_step = response.get("current_step")
+                
+                if resp_complexity:
+                    last_task_complexity = resp_complexity
+                if resp_plan_steps:
+                    last_plan_steps = [
+                        PlanStepResult(
+                            number=s["number"],
+                            description=s["description"],
+                            status=s["status"],
+                        )
+                        for s in resp_plan_steps
+                    ]
+                if resp_current_step is not None:
+                    last_current_step = resp_current_step
+                
+                # Log plan info
+                if resp_complexity and self.hooks and hasattr(self.hooks, 'verbose'):
+                    if current_turn == 1 and resp_plan_steps:
+                        print(f"[Plan] Task classified as '{resp_complexity}' with {len(resp_plan_steps)} steps:")
+                        for s in resp_plan_steps:
+                            print(f"  {s['number']}. {s['description']} [{s['status']}]")
                 
                 self.hooks.after_api_call(current_turn, status, tool_calls)
                 
@@ -201,6 +233,9 @@ class IDESimulator:
             build_check_passed=self.executor.build_check_passed,
             turns=turns,
             error=error_msg,
+            task_complexity=last_task_complexity,
+            plan_steps=last_plan_steps,
+            current_step=last_current_step,
         )
         
         self.hooks.after_task(result.success, final_answer)

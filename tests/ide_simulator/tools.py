@@ -1,4 +1,5 @@
 """Tool executors for the IDE Simulator."""
+from __future__ import annotations
 
 import os
 import subprocess

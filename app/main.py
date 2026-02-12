@@ -840,11 +840,22 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     # ── Reconstruct state from server-side store ──────────────────
     stored = _conversations.get(conv_id)
     
+    # ── Plan state defaults ──
+    task_complexity = ""
+    plan_steps = []
+    current_step = 0
+    plan_complete = False
+
     if has_tool_results and stored:
         # TOOL RESULT CONTINUATION: restore full history + append tool results
         messages = stored["messages"]  # Full history from prior turns
         enriched_context = stored.get("enriched_context", "")
         attached_files_dict = stored.get("attached_files", {})
+        # Restore plan state
+        task_complexity = stored.get("task_complexity", "")
+        plan_steps = stored.get("plan_steps", [])
+        current_step = stored.get("current_step", 0)
+        plan_complete = stored.get("plan_complete", False)
         
         for res in req.tool_results:
             messages.append(ToolMessage(
@@ -853,14 +864,19 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 status="success" if res.success else "error"
             ))
         
-        logger.info("[chat] TOOL CONTINUATION conv=%s, restored %d messages, enriched=%d chars", 
-                    conv_id, len(messages), len(enriched_context))
+        logger.info("[chat] TOOL CONTINUATION conv=%s, restored %d messages, enriched=%d chars, plan_steps=%d, step=%d", 
+                    conv_id, len(messages), len(enriched_context), len(plan_steps), current_step)
     elif stored and req.question:
         # NEW MESSAGE in existing conversation: restore history + append new question
         # This preserves multi-turn memory across user messages
         messages = stored["messages"]
         enriched_context = stored.get("enriched_context", "")
         attached_files_dict = stored.get("attached_files", {})
+        # Restore plan state
+        task_complexity = stored.get("task_complexity", "")
+        plan_steps = stored.get("plan_steps", [])
+        current_step = stored.get("current_step", 0)
+        plan_complete = stored.get("plan_complete", False)
         
         messages.append(HumanMessage(content=req.question))
         
@@ -951,6 +967,11 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "workspace_id": req.workspace_id,
                 "attached_files": attached_files_dict,
                 "enriched_context": enriched_context,  # Preserved on continuation!
+                # Plan state (preserved across tool-result continuations)
+                "task_complexity": task_complexity,
+                "plan_steps": plan_steps,
+                "current_step": current_step,
+                "plan_complete": plan_complete,
             },
             config=config
         )
@@ -959,8 +980,15 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         final_messages = result["messages"]
         last_message = final_messages[-1]
         
-        logger.info("[chat] Agent returned, enriched_context len=%d, messages=%d", 
-                   len(enriched_ctx), len(final_messages))
+        # Extract plan state from result
+        result_plan_steps = result.get("plan_steps", [])
+        result_current_step = result.get("current_step", 0)
+        result_task_complexity = result.get("task_complexity", "")
+        result_plan_complete = result.get("plan_complete", False)
+        
+        logger.info("[chat] Agent returned, enriched_context=%d, messages=%d, complexity=%s, plan_steps=%d, step=%d", 
+                   len(enriched_ctx), len(final_messages), 
+                   result_task_complexity, len(result_plan_steps), result_current_step)
         
         # ── Determine response status ─────────────────────────────
         status = "done"
@@ -986,6 +1014,11 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             "messages": final_messages,
             "enriched_context": enriched_ctx,
             "attached_files": attached_files_dict,
+            # Persist plan state across turns
+            "task_complexity": result_task_complexity,
+            "plan_steps": result_plan_steps,
+            "current_step": result_current_step,
+            "plan_complete": result_plan_complete,
         })
 
         # Serialize history for the IDE (for display/debugging)
@@ -1001,12 +1034,28 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
 
         elapsed = (time.monotonic() - t0) * 1000
         
+        # Build plan response
+        plan_step_responses = None
+        if result_plan_steps:
+            from .models import PlanStepResponse
+            plan_step_responses = [
+                PlanStepResponse(
+                    number=s["number"],
+                    description=s["description"],
+                    status=s["status"],
+                )
+                for s in result_plan_steps
+            ]
+        
         return ChatResponse(
             answer=answer,
             tool_calls=tool_calls,
             history=serialized_history,
             status=status,
-            total_time_ms=round(elapsed, 1)
+            total_time_ms=round(elapsed, 1),
+            task_complexity=result_task_complexity or None,
+            plan_steps=plan_step_responses,
+            current_step=result_current_step if result_plan_steps else None,
         )
 
     except Exception as e:

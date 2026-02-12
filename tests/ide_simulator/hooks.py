@@ -1,4 +1,5 @@
 """Hooks for customizing simulator behavior."""
+from __future__ import annotations
 
 from typing import Any, Callable
 from abc import ABC, abstractmethod

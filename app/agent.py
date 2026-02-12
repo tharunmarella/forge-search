@@ -129,8 +129,60 @@ When including diagrams in your response:
 - **Code examples**: Use proper language tags (```python, ```typescript, etc.)
 - **File references**: Use markdown links like `[filename](path/to/file)`"""
 
+# Supplementary prompt injected for complex tasks that require a plan
+PLANNING_PROMPT = """## PLANNING MODE — REQUIRED
+
+This is a complex task that requires careful planning before execution.
+
+**You MUST produce a structured plan BEFORE making any file changes.**
+
+Output your plan as a numbered list under a `## Plan` heading. Each step should be:
+- Concrete and actionable (not vague like "understand the code")
+- Scoped to a single logical unit of work
+- Ordered by dependency (do prerequisite steps first)
+
+Example format:
+
+## Plan
+1. Read auth/session.py to understand current session handling
+2. Create auth/jwt.py with JWT token generation and validation utilities
+3. Update auth/login.py to return JWT tokens instead of session cookies
+4. Update middleware/auth.py to validate JWT from Authorization header
+5. Remove session-related code from auth/session.py
+6. Update tests in tests/test_auth.py for the new JWT flow
+7. Run `pytest tests/test_auth.py` and fix any failures
+
+**Rules:**
+- Aim for 3-8 steps (more for large tasks, fewer for smaller ones)
+- Include a verification step at the end (run tests, type-check, build)
+- Do NOT start executing tools yet — just output the plan
+- After the plan, STOP and wait for confirmation to proceed
+
+Once you have a plan, you will execute it step by step."""
+
+# Prompt injected when executing with an active plan
+PLAN_EXECUTION_PROMPT = """## PLAN EXECUTION MODE
+
+You have a plan and you're executing it step by step.
+
+{plan_display}
+
+**Instructions:**
+- Focus ONLY on the current step. Do NOT jump ahead.
+- Use tools to complete the current step.
+- When the current step is done, state "Step {current_step} complete" clearly.
+- If a step fails, explain why and attempt to fix it before moving on.
+- After ALL steps are done, run the verification step and report the final result."""
+
 
 # ── State Definition ──────────────────────────────────────────────
+
+class PlanStep(TypedDict):
+    """A single step in the agent's execution plan."""
+    number: int
+    description: str
+    status: str  # "pending", "in_progress", "done", "failed"
+
 
 class AgentState(TypedDict):
     """The state of the agent graph."""
@@ -140,6 +192,15 @@ class AgentState(TypedDict):
     enriched_context: str
     # Attached files from IDE (live file contents)
     attached_files: dict[str, str]  # path -> content
+    # ── Task decomposition ────────────────────────────────────
+    # Complexity: "simple" (Q&A, explain) or "complex" (multi-file, refactor, feature)
+    task_complexity: str
+    # Structured plan for complex tasks (empty for simple)
+    plan_steps: list[PlanStep]
+    # 1-indexed step the agent is currently executing (0 = no plan)
+    current_step: int
+    # Whether the planning phase has completed
+    plan_complete: bool
 
 
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
@@ -357,6 +418,163 @@ def extract_symbols_from_text(text: str) -> list[str]:
     # Combined and deduplicated
     symbols = list(dict.fromkeys(camel + snake))
     return symbols[:5]  # Limit
+
+
+# ── Task Complexity Classification ────────────────────────────────
+
+# Keywords / patterns that signal a complex, multi-step task
+_COMPLEX_VERBS = {
+    "refactor", "restructure", "migrate", "rewrite", "redesign",
+    "implement", "build", "create", "add", "develop",
+    "convert", "port", "upgrade", "replace", "move",
+    "split", "extract", "merge", "combine", "integrate",
+    "optimize", "improve", "enhance", "fix all", "update all",
+}
+
+_COMPLEX_SIGNALS = {
+    "across", "multiple files", "multi-file", "all files",
+    "entire", "whole", "codebase-wide", "project-wide",
+    "step by step", "end to end", "new feature",
+    "authentication", "authorization", "database", "api",
+}
+
+
+def classify_task_complexity(question: str) -> str:
+    """
+    Classify whether a user's request is 'simple' or 'complex'.
+    
+    Simple: questions, explanations, single-file reads, quick lookups.
+    Complex: multi-file edits, refactors, new features, migrations.
+    
+    This determines whether we force a planning phase before execution.
+    """
+    q_lower = question.lower().strip()
+    
+    # ── Definitely simple ──
+    # Questions that ask for information, not action
+    if q_lower.startswith(("what ", "how does ", "explain ", "show me ", "where ",
+                           "why ", "which ", "describe ", "tell me ", "can you explain")):
+        # Unless they combine with complex signals
+        if not any(sig in q_lower for sig in ("and then", "and also", "after that")):
+            return "simple"
+    
+    # Very short requests are usually simple
+    if len(q_lower.split()) <= 5:
+        return "simple"
+    
+    # ── Check for complex signals ──
+    score = 0
+    
+    # Complex action verbs
+    for verb in _COMPLEX_VERBS:
+        if verb in q_lower:
+            score += 2
+            break
+    
+    # Multi-scope signals
+    for signal in _COMPLEX_SIGNALS:
+        if signal in q_lower:
+            score += 1
+    
+    # Multiple files/components mentioned
+    file_mentions = len(re.findall(r'\b\w+\.\w{1,4}\b', question))  # file.ext patterns
+    if file_mentions >= 2:
+        score += 1
+    
+    # Multiple action words (compound tasks)
+    action_count = sum(1 for v in _COMPLEX_VERBS if v in q_lower)
+    if action_count >= 2:
+        score += 1
+    
+    # "and" connecting clauses often means multi-step
+    if re.search(r'\band\b.*\b(then|also|after|next)\b', q_lower):
+        score += 1
+    
+    return "complex" if score >= 2 else "simple"
+
+
+# ── Plan Parsing ──────────────────────────────────────────────────
+
+def parse_plan_from_response(text: str) -> list[PlanStep]:
+    """
+    Parse a structured plan from the LLM's response.
+    
+    Expects the LLM to produce a numbered list, e.g.:
+    
+    ## Plan
+    1. Read the current auth module to understand the structure
+    2. Create JWT utility functions in auth/jwt.py
+    3. Update login endpoint to return JWT tokens
+    4. Update middleware to validate JWT instead of sessions
+    5. Run tests and fix any issues
+    
+    Returns a list of PlanStep dicts.
+    """
+    steps: list[PlanStep] = []
+    
+    # Look for numbered list items (1. xxx, 2. xxx, etc.)
+    pattern = r'^\s*(\d+)[.)]\s*(.+?)\s*$'
+    
+    in_plan_section = False
+    for line in text.split('\n'):
+        stripped = line.strip()
+        
+        # Detect plan section header
+        if re.match(r'^#{1,3}\s*(Plan|Task Plan|Execution Plan|Steps)', stripped, re.IGNORECASE):
+            in_plan_section = True
+            continue
+        
+        # Detect end of plan section (next heading or empty line after steps)
+        if in_plan_section and stripped.startswith('#') and not re.match(r'^#{1,3}\s*(Plan|Step)', stripped, re.IGNORECASE):
+            break
+        
+        # Parse numbered items
+        match = re.match(pattern, stripped)
+        if match:
+            in_plan_section = True  # Auto-detect plan even without header
+            number = int(match.group(1))
+            description = match.group(2).strip()
+            # Clean markdown formatting: **bold**, `code`, leading/trailing *
+            description = re.sub(r'\*\*(.+?)\*\*', r'\1', description)
+            description = re.sub(r'`(.+?)`', r'\1', description)
+            description = description.strip('* ')
+            
+            if description:
+                steps.append(PlanStep(
+                    number=number,
+                    description=description,
+                    status="pending"
+                ))
+    
+    # Re-number sequentially in case of gaps
+    for i, step in enumerate(steps):
+        step["number"] = i + 1
+    
+    return steps
+
+
+def format_plan_for_prompt(steps: list[PlanStep], current_step: int) -> str:
+    """Format the plan as a prompt section for the LLM to reference."""
+    if not steps:
+        return ""
+    
+    lines = ["## Your Execution Plan\n"]
+    for step in steps:
+        status_icon = {
+            "pending": "⬜",
+            "in_progress": "🔄",
+            "done": "✅",
+            "failed": "❌",
+        }.get(step["status"], "⬜")
+        
+        marker = " ← YOU ARE HERE" if step["number"] == current_step else ""
+        lines.append(f"{status_icon} {step['number']}. {step['description']}{marker}")
+    
+    lines.append("")
+    lines.append(f"**Current step: {current_step} of {len(steps)}**")
+    lines.append("Focus on completing the current step. Use tools to execute it, then move to the next.")
+    
+    return "\n".join(lines)
 
 
 # ── Documentation Lookup (Context7 + DevDocs.io) ──────────────────
@@ -616,6 +834,14 @@ async def _query_devdocs(library: str, query: str) -> str:
 
 # ── Graph Nodes ───────────────────────────────────────────────────
 
+def _get_last_question(state: AgentState) -> str:
+    """Extract the last human question from message history."""
+    for msg in reversed(state['messages']):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+    return ""
+
+
 @traceable(name="enrich_context_node", run_type="chain", tags=["enrichment"])
 async def enrich_context(state: AgentState) -> dict:
     """First node: gather context BEFORE calling the LLM.
@@ -640,13 +866,7 @@ async def enrich_context(state: AgentState) -> dict:
     
     logger.info("[enrich_context] Starting enrichment for workspace=%s", workspace_id)
     
-    # Get the user's question from the last human message
-    question = ""
-    for msg in reversed(state['messages']):
-        if isinstance(msg, HumanMessage):
-            question = msg.content
-            break
-    
+    question = _get_last_question(state)
     if not question:
         logger.warning("[enrich_context] No question found in messages")
         return {"enriched_context": ""}
@@ -659,6 +879,125 @@ async def enrich_context(state: AgentState) -> dict:
     logger.info("[enrich_context] Built context with %d chars", len(context))
     
     return {"enriched_context": context}
+
+
+@traceable(name="classify_task_node", run_type="chain", tags=["planning"])
+async def classify_task(state: AgentState) -> dict:
+    """Classify whether the task is simple or complex.
+    
+    Complex tasks get routed through a planning phase before execution.
+    Simple tasks go directly to the agent.
+    
+    Runs only on the first turn; on continuations (tool results coming
+    back) we preserve the existing classification.
+    """
+    # If already classified (continuation turn), keep it
+    if state.get('task_complexity'):
+        logger.info("[classify] Skipping - already classified as %s", state['task_complexity'])
+        return {}
+    
+    # If last message is a tool result, this is a continuation — skip
+    if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
+        return {}
+    
+    question = _get_last_question(state)
+    if not question:
+        return {"task_complexity": "simple", "plan_steps": [], "current_step": 0, "plan_complete": True}
+    
+    complexity = classify_task_complexity(question)
+    logger.info("[classify] Task complexity: %s (question: %s)", complexity, question[:80])
+    
+    if complexity == "simple":
+        return {
+            "task_complexity": "simple",
+            "plan_steps": [],
+            "current_step": 0,
+            "plan_complete": True,  # No plan needed
+        }
+    else:
+        return {
+            "task_complexity": "complex",
+            "plan_steps": [],       # Will be filled by plan_task node
+            "current_step": 0,
+            "plan_complete": False,
+        }
+
+
+@traceable(name="plan_task_node", run_type="chain", tags=["planning", "llm"])
+async def plan_task(state: AgentState) -> dict:
+    """Generate a structured plan for complex tasks.
+    
+    Calls the REASONING model with planning-specific instructions.
+    The LLM produces a numbered plan that gets parsed into PlanStep objects.
+    No tools are bound — the LLM must ONLY output a plan, not execute.
+    """
+    enriched_context = state.get('enriched_context', '')
+    question = _get_last_question(state)
+    
+    logger.info("[plan_task] Generating plan for: %s", question[:100])
+    
+    # Build planning prompt
+    messages_to_send = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=PLANNING_PROMPT),
+    ]
+    
+    # Add enriched context
+    if enriched_context:
+        ctx = enriched_context[:60_000]
+        messages_to_send.append(SystemMessage(
+            content=f"## Pre-gathered Context\n\n{ctx}\n\n---\n"
+        ))
+    
+    # Add conversation history (just the human messages, not tool noise)
+    for msg in state['messages']:
+        if isinstance(msg, HumanMessage):
+            messages_to_send.append(msg)
+    
+    # Use the reasoning model (stronger) for planning — NO tools bound
+    model = ChatGroq(model=REASONING_MODEL, temperature=0.1)
+    response = await model.ainvoke(messages_to_send)
+    
+    plan_text = response.content
+    logger.info("[plan_task] Raw plan response (%d chars): %s", len(plan_text), plan_text[:300])
+    
+    # Parse the structured plan
+    steps = parse_plan_from_response(plan_text)
+    
+    if steps:
+        logger.info("[plan_task] Parsed %d plan steps:", len(steps))
+        for s in steps:
+            logger.info("  %d. %s", s["number"], s["description"])
+        
+        # Mark step 1 as in_progress
+        steps[0]["status"] = "in_progress"
+        
+        # Build a short plan summary for the AI message (instead of raw LLM output)
+        plan_summary = "## Plan\n" + "\n".join(
+            f"{s['number']}. {s['description']}" for s in steps
+        )
+        
+        return {
+            "plan_steps": steps,
+            "current_step": 1,
+            "plan_complete": True,  # Planning phase done, ready to execute
+            "messages": [
+                # The plan as an AI message
+                AIMessage(content=plan_summary),
+                # A kick-start message so the LLM knows to START executing
+                HumanMessage(content="Plan approved. Now execute step 1 using the tools. Do NOT just describe what to do — actually call the tools."),
+            ],
+        }
+    else:
+        # Failed to parse a plan — fall through to direct execution
+        logger.warning("[plan_task] Could not parse plan steps, falling through to direct agent")
+        return {
+            "plan_steps": [],
+            "current_step": 0,
+            "plan_complete": True,
+            "task_complexity": "simple",  # Downgrade
+            "messages": [AIMessage(content=plan_text)],
+        }
 
 
 # ── Context Window Management ─────────────────────────────────────
@@ -721,11 +1060,12 @@ REASONING_MODEL = os.getenv("GROQ_MODEL", "moonshotai/kimi-k2-instruct-0905")
 TOOL_MODEL = os.getenv("GROQ_TOOL_MODEL", "openai/gpt-oss-20b")
 
 
-def _pick_model(messages: list[BaseMessage]) -> str:
+def _pick_model(messages: list[BaseMessage], is_plan_execution: bool = False) -> str:
     """Pick model based on conversation phase.
     
-    - First call (only HumanMessage, no ToolMessages yet) → REASONING_MODEL
-    - After tool results come back → TOOL_MODEL (faster iterations)
+    - Planning / first call → REASONING_MODEL
+    - After tool results → TOOL_MODEL (faster iterations)
+    - Plan execution (has plan context) → REASONING_MODEL for first step, TOOL for rest
     """
     has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
     
@@ -736,16 +1076,34 @@ def _pick_model(messages: list[BaseMessage]) -> str:
 
 @traceable(name="call_model_node", run_type="chain", tags=["llm"])
 async def call_model(state: AgentState) -> dict:
-    """The 'Brain' node - LLM reasoning with full context."""
-    enriched_context = state.get('enriched_context', '')
+    """The 'Brain' node - LLM reasoning with full context.
     
-    logger.info("[call_model] enriched_context length=%d", len(enriched_context))
+    Now plan-aware: if there's an active plan, it injects the plan display
+    and current step instructions into the system prompt.
+    """
+    enriched_context = state.get('enriched_context', '')
+    plan_steps = state.get('plan_steps', [])
+    current_step = state.get('current_step', 0)
+    
+    logger.info("[call_model] enriched_context=%d chars, plan_steps=%d, current_step=%d",
+                len(enriched_context), len(plan_steps), current_step)
     
     # Build messages with system prompt and context
     messages_to_send = []
     
     # System prompt
     messages_to_send.append(SystemMessage(content=SYSTEM_PROMPT))
+    
+    # ── Plan execution context ────────────────────────────────
+    if plan_steps and current_step > 0:
+        plan_display = format_plan_for_prompt(plan_steps, current_step)
+        exec_prompt = PLAN_EXECUTION_PROMPT.format(
+            plan_display=plan_display,
+            current_step=current_step,
+        )
+        messages_to_send.append(SystemMessage(content=exec_prompt))
+        logger.info("[call_model] Injected plan execution context (step %d/%d)", 
+                    current_step, len(plan_steps))
     
     # Add enriched context as a system message if we have it
     if enriched_context:
@@ -764,7 +1122,7 @@ async def call_model(state: AgentState) -> dict:
     total_chars = sum(len(m.content) for m in messages_to_send)
     
     # Pick model based on conversation phase
-    model_name = _pick_model(state['messages'])
+    model_name = _pick_model(state['messages'], is_plan_execution=bool(plan_steps))
     logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
     
     model = ChatGroq(model=model_name, temperature=0.1)
@@ -779,7 +1137,38 @@ async def call_model(state: AgentState) -> dict:
                 model_name,
                 [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
-    return {"messages": [response]}
+    # ── Plan step advancement ─────────────────────────────────
+    # If there's an active plan, check if the LLM signalled step completion
+    updates: dict = {"messages": [response]}
+    
+    if plan_steps and current_step > 0:
+        resp_text = (response.content or "").lower()
+        
+        # Detect step completion signals
+        step_done = (
+            f"step {current_step} complete" in resp_text
+            or f"step {current_step} done" in resp_text
+            or f"completed step {current_step}" in resp_text
+            or f"finished step {current_step}" in resp_text
+        )
+        
+        if step_done and current_step <= len(plan_steps):
+            # Mark current step done
+            new_steps = [dict(s) for s in plan_steps]  # Copy
+            new_steps[current_step - 1]["status"] = "done"
+            
+            next_step = current_step + 1
+            if next_step <= len(new_steps):
+                new_steps[next_step - 1]["status"] = "in_progress"
+                logger.info("[call_model] ✅ Step %d done, advancing to step %d", current_step, next_step)
+            else:
+                logger.info("[call_model] ✅ Step %d done — ALL STEPS COMPLETE", current_step)
+                next_step = 0  # Signal all done
+            
+            updates["plan_steps"] = new_steps
+            updates["current_step"] = next_step
+    
+    return updates
 
 
 @traceable(name="execute_server_tools", run_type="chain", tags=["server-tools"])
@@ -843,12 +1232,37 @@ async def execute_server_tools(state: AgentState) -> dict:
 
 # ── Router Logic ──────────────────────────────────────────────────
 
-def router(state: AgentState) -> Literal["server_tools", "pause", "end"]:
-    """Decides whether to run server tools, pause for IDE, or finish."""
-    last_message = state['messages'][-1]
+def classify_router(state: AgentState) -> Literal["plan", "agent"]:
+    """After classify: route complex tasks to plan, simple to agent."""
+    complexity = state.get('task_complexity', 'simple')
+    plan_complete = state.get('plan_complete', True)
     
-    # If no tool calls, we're done
+    if complexity == "complex" and not plan_complete:
+        logger.info("[classify_router] → plan (complex task, no plan yet)")
+        return "plan"
+    
+    logger.info("[classify_router] → agent (simple or plan already done)")
+    return "agent"
+
+
+def agent_router(state: AgentState) -> Literal["server_tools", "pause", "end", "continue_plan"]:
+    """After agent: route to server tools, pause for IDE, or finish.
+    
+    New: if a plan step was just completed and there are more steps,
+    route back to agent to continue with the next step.
+    """
+    last_message = state['messages'][-1]
+    plan_steps = state.get('plan_steps', [])
+    current_step = state.get('current_step', 0)
+    
+    # If no tool calls, check if we should continue the plan
     if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
+        # If there's an active plan with remaining steps, loop back
+        if plan_steps and current_step > 0:
+            remaining = [s for s in plan_steps if s['status'] in ('pending', 'in_progress')]
+            if remaining:
+                logger.info("[agent_router] → continue_plan (step %d, %d remaining)", current_step, len(remaining))
+                return "continue_plan"
         return "end"
     
     has_server_tools = False
@@ -861,7 +1275,6 @@ def router(state: AgentState) -> Literal["server_tools", "pause", "end"]:
             has_server_tools = True
     
     # Priority: if any IDE tools, pause for IDE callback
-    # (server tools should have been executed already in previous iterations)
     if has_ide_tools:
         return "pause"
     
@@ -871,49 +1284,86 @@ def router(state: AgentState) -> Literal["server_tools", "pause", "end"]:
     return "end"
 
 
-def should_enrich(state: AgentState) -> Literal["enrich", "skip"]:
-    """Only enrich on first message (not after tool results)."""
-    # If we already have enriched context, skip
-    if state.get('enriched_context'):
-        return "skip"
-    
-    # If the last message is a tool result, skip enrichment
-    if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
-        return "skip"
-    
-    return "enrich"
-
-
 # ── Graph Construction ────────────────────────────────────────────
+#
+# New flow with task decomposition:
+#
+#   enrich → classify ─┬─ (complex, no plan) → plan → agent ─┬→ server_tools → agent
+#                       │                                      ├→ pause (IDE tools)
+#                       └─ (simple or has plan) → agent ──┬────┴→ end
+#                                                         └→ continue_plan → agent
+#
+# The continue_plan node handles step transitions: when the agent
+# finishes a step (no tool calls) but there are more plan steps,
+# it injects a kick-start message and loops back to the agent.
+
+async def continue_plan(state: AgentState) -> dict:
+    """Inject a kick-start message to advance to the next plan step."""
+    current_step = state.get('current_step', 0)
+    plan_steps = state.get('plan_steps', [])
+    
+    if current_step > 0 and current_step <= len(plan_steps):
+        step_desc = plan_steps[current_step - 1]["description"]
+        logger.info("[continue_plan] Kicking off step %d: %s", current_step, step_desc)
+        return {
+            "messages": [
+                HumanMessage(content=f"Continue. Execute step {current_step}: {step_desc}. Use the tools now.")
+            ]
+        }
+    
+    return {}
+
 
 def create_agent():
-    """Build the LangGraph agent."""
+    """Build the LangGraph agent with task decomposition."""
     workflow = StateGraph(AgentState)
 
     # Nodes
     workflow.add_node("enrich", enrich_context)
+    workflow.add_node("classify", classify_task)
+    workflow.add_node("plan", plan_task)
     workflow.add_node("agent", call_model)
     workflow.add_node("server_tools", execute_server_tools)
+    workflow.add_node("continue_plan", continue_plan)
 
-    # Entry: check if we need enrichment
+    # ── Edges ─────────────────────────────────────────────────
+    
+    # Entry: always start with enrichment
     workflow.set_entry_point("enrich")
     
-    # After enrichment, always call agent
-    workflow.add_edge("enrich", "agent")
+    # After enrichment, classify the task
+    workflow.add_edge("enrich", "classify")
+    
+    # After classify, route based on complexity
+    workflow.add_conditional_edges(
+        "classify",
+        classify_router,
+        {
+            "plan": "plan",
+            "agent": "agent",
+        }
+    )
+    
+    # After planning, go to agent for execution
+    workflow.add_edge("plan", "agent")
     
     # After agent, route based on tool calls
     workflow.add_conditional_edges(
         "agent",
-        router,
+        agent_router,
         {
             "server_tools": "server_tools",
-            "pause": END,  # Return to API/IDE for tool execution
-            "end": END
+            "pause": END,           # Return to API/IDE for tool execution
+            "end": END,
+            "continue_plan": "continue_plan",  # Step done, more to go
         }
     )
     
     # After server tools, call agent again for next reasoning step
     workflow.add_edge("server_tools", "agent")
+    
+    # After continue_plan kick-start, go back to agent
+    workflow.add_edge("continue_plan", "agent")
 
     return workflow.compile()
 
