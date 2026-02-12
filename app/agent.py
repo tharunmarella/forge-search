@@ -59,11 +59,10 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 ## Tools Available
 
 ### Search Tools (use in this priority order for finding code)
-1. `codebase_search(query)`: **USE FIRST.** Semantic search — find code by meaning. Fast, searches the pre-built index.
-2. `grep(pattern, path, glob)`: Literal/regex text search using ripgrep. Fast, respects .gitignore, skips binaries. Use when you know the exact string.
-3. `trace_call_chain(symbol_name, direction, max_depth)`: Find what calls a function or what it calls.
-4. `impact_analysis(symbol_name, max_depth)`: Find all code affected by changing a symbol.
-5. `lookup_documentation(library, query)`: Look up official docs for libraries/frameworks.
+1. `codebase_search(query)`: **USE FIRST.** Semantic search — find code by meaning. Fast, searches the pre-built index. Use for finding functions, classes, patterns, or anything by description.
+2. `trace_call_chain(symbol_name, direction, max_depth)`: Find what calls a function or what it calls.
+3. `impact_analysis(symbol_name, max_depth)`: Find all code affected by changing a symbol.
+4. `lookup_documentation(library, query)`: Look up official docs for libraries/frameworks.
 
 ### File Tools (for reading and editing)
 - `read_file(path, start_line, end_line)`: Read file contents. ALWAYS do this before editing.
@@ -79,20 +78,18 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 
 ## SEARCH RULES — CRITICAL
 
-**NEVER use `execute_command` with `grep` or `find` for searching code.**
-- WRONG: `execute_command(command="grep -rn 'foo' .")`  ← SLOW, scans binaries, can escape workspace
-- RIGHT: `grep(pattern="foo")`                          ← Uses ripgrep, fast, safe
-- BEST:  `codebase_search(query="foo function")`        ← Semantic, finds related code too
+**ALWAYS use `codebase_search` for finding code.** It's semantic search that finds code by meaning.
+- WRONG: `execute_command(command="grep -rn 'foo' .")`  ← SLOW, can escape workspace
+- RIGHT: `codebase_search(query="foo function")`        ← Semantic, finds related code
 
-The `grep` tool uses ripgrep internally (respects .gitignore, skips binaries, max 100KB files).
 The `execute_command` tool should ONLY be used for: git, builds, tests, package managers, linters.
 
 ## Workflow for Refactoring
 
-1. Use `codebase_search` or `grep` to find ALL occurrences (NEVER `execute_command` with grep)
+1. Use `codebase_search` to find ALL occurrences
 2. Use `read_file` on each file to see the exact code around each occurrence
 3. Use `replace_in_file` on each file to make the change
-4. Use `grep` again to verify no occurrences remain
+4. Use `codebase_search` again to verify no occurrences remain
 5. **RUN VERIFICATION** (see below)
 
 ## VERIFICATION — MANDATORY BEFORE FINISHING
