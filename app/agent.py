@@ -60,12 +60,12 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 
 ### Search Tools (use in this priority order for finding code)
 1. `codebase_search(query)`: **USE FIRST.** Semantic search — find code by meaning. Fast, searches the pre-built index. Use for finding functions, classes, patterns, or anything by description.
-2. `trace_call_chain(symbol_name, direction, max_depth)`: Find what calls a function or what it calls.
-3. `impact_analysis(symbol_name, max_depth)`: Find all code affected by changing a symbol.
+2. `trace_call_chain(symbol_name, direction)`: Find what calls a function or what it calls. Direction: 'upstream', 'downstream', or 'both' (default).
+3. `impact_analysis(symbol_name)`: Find all code affected by changing a symbol.
 4. `lookup_documentation(library, query)`: Look up official docs for libraries/frameworks.
 
 ### File Tools (for reading and editing)
-- `read_file(path, start_line, end_line)`: Read file contents. ALWAYS do this before editing.
+- `read_file(path)`: Read file contents. ALWAYS do this before editing.
 - `replace_in_file(path, old_str, new_str)`: Replace exact text in a file. old_str must match exactly.
 - `write_to_file(path, content)`: Write entire file. Only for new files.
 - `execute_command(command)`: Run shell commands (git, builds, tests, etc.)
