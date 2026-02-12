@@ -46,7 +46,7 @@ from fastapi import FastAPI, HTTPException, Depends
 
 from fastapi.responses import RedirectResponse
 
-from . import store, embeddings, watcher, auth, chat, agent
+from . import store, embeddings, watcher, auth, chat, agent, mermaid
 from .models import (
     IndexRequest, IndexResponse,
     SearchRequest, SearchResponse, SearchResult, RelatedSymbol,
@@ -214,7 +214,7 @@ async def lifespan(app: FastAPI):
     """Startup/shutdown hooks."""
     logger.info("Starting Forge Search API...")
     await store.ensure_schema()
-    await auth.ensure_user_table()
+    auth.ensure_user_table(store._get_conn())
     logger.info("Store ready (auth enabled)")
     yield
     logger.info("Shutting down...")
@@ -715,7 +715,7 @@ async def auth_github_callback(code: str, state: str = ""):
     """GitHub OAuth callback — creates user, returns JWT."""
     logger.info("[auth] GitHub callback received, state=%r", state)
     user_info = await auth.github_exchange_code(code)
-    user_id = await auth.upsert_user(user_info)
+    user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
     
     # Polling-based auth: store token for IDE to poll
@@ -754,7 +754,7 @@ async def auth_google_callback(code: str, state: str = ""):
     """Google OAuth callback — creates user, returns JWT."""
     logger.info("[auth] Google callback received, state=%r", state)
     user_info = await auth.google_exchange_code(code)
-    user_id = await auth.upsert_user(user_info)
+    user_id = auth.upsert_user(store._get_conn(), user_info)
     token = auth.create_token(user_id, user_info["email"], user_info["name"])
     
     # Polling-based auth: store token for IDE to poll
@@ -1033,6 +1033,10 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             serialized_history.append(entry)
 
         elapsed = (time.monotonic() - t0) * 1000
+        
+        # Render mermaid diagrams to inline images (async, cached)
+        if answer:
+            answer = await mermaid.render_mermaid_blocks(answer)
         
         # Build plan response
         plan_step_responses = None
