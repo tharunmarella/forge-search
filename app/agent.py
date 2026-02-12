@@ -379,8 +379,8 @@ def kill_process(pid: int) -> str:
 
 
 @tool
-def wait_for_port(port: int, timeout: int = 30) -> str:
-    """Wait for a port to become available (e.g. waiting for dev server to start)."""
+def wait_for_port(port: int, timeout: int = 30, http_check: bool = False, path: str = "/") -> str:
+    """Wait for a port to become available. Set http_check=True to also verify HTTP response is healthy (recommended for web servers)."""
     return "PENDING_IDE_EXECUTION"
 
 
