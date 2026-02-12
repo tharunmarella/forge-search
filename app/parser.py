@@ -241,9 +241,11 @@ def parse_file(file_path: str, content: str) -> FileParseResult:
                 sig_line_idx = def_node.start_point[0]
                 signature = lines[sig_line_idx].strip() if sig_line_idx < len(lines) else ""
 
-                # Get full content (capped at 100 lines for embedding)
-                content_lines = lines[def_node.start_point[0]:min(def_node.end_point[0] + 1, def_node.start_point[0] + 100)]
-                symbol_content = "\n".join(content_lines)
+                # Get full content using byte offsets (correct for minified files)
+                # Capped at 10KB to keep embedding input reasonable
+                max_bytes = 10_000
+                end_byte = min(def_node.end_byte, def_node.start_byte + max_bytes)
+                symbol_content = source[def_node.start_byte:end_byte].decode("utf-8", errors="replace")
 
                 # Detect parent for methods (Rust impl blocks)
                 parent = _find_parent_name(def_node, source)

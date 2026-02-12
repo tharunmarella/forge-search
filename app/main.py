@@ -295,7 +295,8 @@ async def index_files(req: IndexRequest):
                 raw_embeddings = await embeddings.embed_batch(texts_list)
                 # Map uid -> embedding for graph storage
                 embedding_map = dict(zip(uids_list, raw_embeddings))
-                total_embeddings += len(embedding_map)
+                # Only count successful (non-None) embeddings
+                total_embeddings += sum(1 for v in embedding_map.values() if v is not None)
             else:
                 embedding_map = {}
 
@@ -585,7 +586,8 @@ async def _index_files_internal(workspace_id: str, files: list[dict]) -> dict:
                 uids_list = list(enriched_texts.keys())
                 raw_embeddings = await embeddings.embed_batch(texts_list)
                 embedding_map = dict(zip(uids_list, raw_embeddings))
-                total_embeddings += len(embedding_map)
+                # Only count successful (non-None) embeddings
+                total_embeddings += sum(1 for v in embedding_map.values() if v is not None)
             else:
                 embedding_map = {}
 
