@@ -68,13 +68,31 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 ### File Tools (for reading and editing)
 - `read_file(path)`: Read file contents. ALWAYS do this before editing.
 - `list_files(path, recursive)`: List files in a directory.
+- `glob(pattern, path)`: Find files matching a glob pattern (e.g. '**/*.py').
 - `replace_in_file(path, old_str, new_str)`: Replace exact text in a file. old_str must match exactly.
 - `write_to_file(path, content)`: Write entire file. Only for new files.
-- `execute_command(command)`: Run shell commands (git, builds, tests, etc.)
+- `delete_file(path)`: Delete a file.
+- `apply_patch(patch)`: Apply unified diff to modify multiple files at once.
 
-### LSP Tools (for type checking and code intelligence)
-- `lsp_go_to_definition(path, line, column)`: Jump to where a symbol is defined.
-- `lsp_find_references(path, line, column)`: Find all usages of a symbol.
+### Command & Process Tools
+- `execute_command(command)`: Run shell commands (git, builds, tests, etc.)
+- `execute_background(command, label)`: Start long-running processes (dev servers, watchers).
+- `read_process_output(pid, lines)`: Check logs/output from background processes.
+- `check_process_status(pid)`: Check if a background process is still running.
+- `kill_process(pid)`: Stop a background process.
+- `wait_for_port(port, timeout)`: Wait for a server to be ready on a port.
+- `check_port(port)`: Check if a port is in use.
+- `kill_port(port)`: Kill whatever is using a port.
+
+### Code Intelligence Tools
+- `list_code_definition_names(path)`: List all symbols (functions, classes) in a file.
+- `get_symbol_definition(symbol, path)`: Jump to where a symbol is defined.
+- `find_symbol_references(symbol, path)`: Find all usages of a symbol.
+- `diagnostics(path, fix)`: Get linter/compiler errors, optionally auto-fix.
+
+### LSP Tools (powered by language servers)
+- `lsp_go_to_definition(path, line, column)`: Jump to definition using LSP.
+- `lsp_find_references(path, line, column)`: Find all usages via LSP.
 - `lsp_hover(path, line, column)`: Get type info and docs for a symbol.
 - `lsp_rename(path, line, column, new_name)`: Safe rename across the workspace.
 
@@ -304,9 +322,97 @@ def grep(pattern: str, path: str = ".", glob: str = None, case_insensitive: bool
     return "PENDING_IDE_EXECUTION"
 
 
-@tool  
+@tool
 def list_files(path: str, recursive: bool = False) -> str:
     """List files in a directory."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def delete_file(path: str) -> str:
+    """Delete a file from the workspace."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def apply_patch(patch: str) -> str:
+    """Apply a unified diff patch to modify multiple files at once. The patch should be in standard unified diff format."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def glob(pattern: str, path: str = ".") -> str:
+    """Find files matching a glob pattern. E.g. '**/*.py' finds all Python files."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def diagnostics(path: str, fix: bool = False) -> str:
+    """Get linter/compiler errors for a file or directory. If fix=True, attempt auto-fix where supported."""
+    return "PENDING_IDE_EXECUTION"
+
+
+# ── Background Process Tools (IDE-side) ───────────────────────────
+
+@tool
+def execute_background(command: str, label: str = "") -> str:
+    """Start a long-running command in background (e.g. dev servers). Returns process ID for later management."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def read_process_output(pid: int, lines: int = 100) -> str:
+    """Read recent output from a background process. Useful for checking server logs."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def check_process_status(pid: int) -> str:
+    """Check if a background process is still running."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def kill_process(pid: int) -> str:
+    """Stop a background process by its PID."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def wait_for_port(port: int, timeout: int = 30) -> str:
+    """Wait for a port to become available (e.g. waiting for dev server to start)."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def check_port(port: int) -> str:
+    """Check if a port is currently in use."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def kill_port(port: int) -> str:
+    """Kill whatever process is using a port."""
+    return "PENDING_IDE_EXECUTION"
+
+
+# ── Code Intelligence Tools (IDE-side) ────────────────────────────
+
+@tool
+def list_code_definition_names(path: str) -> str:
+    """List all symbol definitions (functions, classes, etc.) in a file. Great for understanding file structure."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def get_symbol_definition(symbol: str, path: str = "") -> str:
+    """Get the definition location and source code for a symbol. Uses tree-sitter for fast local lookup."""
+    return "PENDING_IDE_EXECUTION"
+
+
+@tool
+def find_symbol_references(symbol: str, path: str = "") -> str:
+    """Find all usages/references to a symbol across the codebase."""
     return "PENDING_IDE_EXECUTION"
 
 
@@ -355,13 +461,27 @@ def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
 
 # Tool lists
 SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation]
-IDE_TOOLS = [read_file, write_to_file, replace_in_file, execute_command, grep, list_files]
+IDE_FILE_TOOLS = [read_file, write_to_file, replace_in_file, delete_file, apply_patch, list_files, glob]
+IDE_EXEC_TOOLS = [execute_command, execute_background, read_process_output, check_process_status, kill_process]
+IDE_PORT_TOOLS = [wait_for_port, check_port, kill_port]
+IDE_CODE_TOOLS = [list_code_definition_names, get_symbol_definition, find_symbol_references, diagnostics]
 LSP_TOOLS = [lsp_go_to_definition, lsp_find_references, lsp_hover, lsp_rename]
+
+IDE_TOOLS = IDE_FILE_TOOLS + IDE_EXEC_TOOLS + IDE_PORT_TOOLS + IDE_CODE_TOOLS + [grep]
 ALL_TOOLS = SERVER_TOOLS + IDE_TOOLS + LSP_TOOLS
 
 IDE_TOOL_NAMES = {
-    "read_file", "write_to_file", "replace_in_file", "execute_command",
-    "grep", "list_files",
+    # File operations
+    "read_file", "write_to_file", "replace_in_file", "delete_file", "apply_patch",
+    "list_files", "glob", "grep",
+    # Process management
+    "execute_command", "execute_background", "read_process_output",
+    "check_process_status", "kill_process",
+    # Port management
+    "wait_for_port", "check_port", "kill_port",
+    # Code intelligence
+    "list_code_definition_names", "get_symbol_definition", "find_symbol_references", "diagnostics",
+    # LSP
     "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
 }
 SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"}
