@@ -949,6 +949,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             ],
             "metadata": {
                 "conversation_id": conv_id,
+                "session_id": conv_id,  # LangSmith Threads grouping
                 "workspace_id": req.workspace_id,
                 "user_email": user_email,
                 "user_name": user_name,
@@ -1174,6 +1175,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 ],
                 "metadata": {
                     "conversation_id": conv_id,
+                    "session_id": conv_id,  # LangSmith Threads grouping
                     "workspace_id": req.workspace_id,
                     "user_email": user_email,
                     "user_name": user_name,
