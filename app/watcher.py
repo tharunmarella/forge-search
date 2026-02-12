@@ -205,7 +205,7 @@ async def scan_and_index(
                 # All added/removed/modified symbols need cascade
                 for name in changes["added_symbols"] + changes["removed_symbols"] + changes["modified_symbols"]:
                     # Find callers of this symbol
-                    ws = store_module._get_ws(workspace_id)
+                    ws = await store_module._get_ws(workspace_id)
                     callers = ws.called_by.get(name, set())
                     cascade_symbols.update(callers)
 
@@ -213,7 +213,7 @@ async def scan_and_index(
             stats["cascade_reembeds"] = len(cascade_symbols)
             logger.info("Cascade re-embedding %d caller symbols", len(cascade_symbols))
             # Find files containing these symbols and re-index them
-            ws = store_module._get_ws(workspace_id)
+            ws = await store_module._get_ws(workspace_id)
             cascade_files = set()
             for sym_name in cascade_symbols:
                 for uid, sym in ws.symbols.items():
@@ -327,7 +327,7 @@ def is_watching(workspace_id: str) -> bool:
 
 async def _get_old_parse(store_module, workspace_id: str, file_path: str) -> FileParseResult | None:
     """Reconstruct old parse from stored symbols (for change detection)."""
-    ws = store_module._get_ws(workspace_id)
+    ws = await store_module._get_ws(workspace_id)
     old_defs = []
     for uid, sym in ws.symbols.items():
         if sym["file_path"] == file_path:
