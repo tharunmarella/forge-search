@@ -238,40 +238,45 @@ def success_page(user_info: dict, token: str) -> HTMLResponse:
 
 # ── User DB operations ───────────────────────────────────────────
 
-def ensure_user_table(conn):
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            email TEXT UNIQUE,
-            name TEXT,
-            avatar TEXT DEFAULT '',
-            provider TEXT,
-            provider_id TEXT,
-            username TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT NOW(),
-            last_login TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
-    conn.commit()
+async def ensure_user_table():
+    """Create users table if it doesn't exist. Uses store's connection pool."""
+    from . import store
+    async with store._connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT UNIQUE,
+                    name TEXT,
+                    avatar TEXT DEFAULT '',
+                    provider TEXT,
+                    provider_id TEXT,
+                    username TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    last_login TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+            await conn.commit()
 
 
-def upsert_user(conn, user_info: dict) -> str:
-    """Create or update user, return user ID."""
+async def upsert_user(user_info: dict) -> str:
+    """Create or update user, return user ID. Uses store's connection pool."""
+    from . import store
     user_id = hashlib.sha256(
         f"{user_info['provider']}:{user_info['provider_id']}".encode()
     ).hexdigest()[:16]
 
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (id, email, name, avatar, provider, provider_id, username)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
-            name = %s, avatar = %s, last_login = NOW()
-        RETURNING id
-    """, (user_id, user_info["email"], user_info["name"], user_info["avatar"],
-          user_info["provider"], user_info["provider_id"], user_info["username"],
-          user_info["name"], user_info["avatar"]))
-    conn.commit()
+    async with store._connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                INSERT INTO users (id, email, name, avatar, provider, provider_id, username)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = %s, avatar = %s, last_login = NOW()
+                RETURNING id
+            """, (user_id, user_info["email"], user_info["name"], user_info["avatar"],
+                  user_info["provider"], user_info["provider_id"], user_info["username"],
+                  user_info["name"], user_info["avatar"]))
+            await conn.commit()
     return user_id
