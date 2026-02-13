@@ -1206,6 +1206,8 @@ async def enrich_context(state: AgentState) -> dict:
       lightweight supplementary search for the new step's context.
     - Follow-up question: check embedding similarity — re-enrich if topic shifted.
     """
+    import asyncio
+    
     workspace_id = state['workspace_id']
     attached_files = state.get('attached_files', {})
     existing_context = state.get('enriched_context', '')
@@ -1246,7 +1248,6 @@ async def enrich_context(state: AgentState) -> dict:
     
     # ── First turn: full enrichment + project profile ──
     if not existing_context:
-        import asyncio
         logger.info("[enrich_context] First turn — enriching for: %s", question[:100])
         
         # Build project profile and code enrichment in parallel
@@ -1269,10 +1270,28 @@ async def enrich_context(state: AgentState) -> dict:
             logger.info("[enrich_context] Built context with %d chars (profile cached)", len(context))
             return {"enriched_context": context, "enriched_question": question, "enriched_step": current_step}
     
+    # ── Quick message during plan execution: don't re-enrich, just continue ──
+    # Short messages like "hello", "ok", "yes", "continue" are likely just acknowledgments
+    if plan_steps and current_step > 0 and len(question.strip()) < 50:
+        logger.info("[enrich_context] Short message during plan execution (%s) — keeping existing context",
+                   question[:30])
+        return {}
+    
     # ── Follow-up question: check for topic shift ──
     if enriched_question and question != enriched_question:
         try:
-            old_emb, new_emb = await embeddings.embed_query(enriched_question), await embeddings.embed_query(question)
+            # Add timeout to embedding calls to prevent freezes
+            async def get_embeddings():
+                old_emb = await embeddings.embed_query(enriched_question)
+                new_emb = await embeddings.embed_query(question)
+                return old_emb, new_emb
+            
+            try:
+                old_emb, new_emb = await asyncio.wait_for(get_embeddings(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[enrich_context] Embedding timeout — keeping existing context")
+                return {}
+            
             similarity = _cosine_similarity(old_emb, new_emb)
             logger.info("[enrich_context] Topic similarity: %.3f (threshold=%.2f) | old=%s | new=%s",
                        similarity, TOPIC_SHIFT_THRESHOLD, enriched_question[:60], question[:60])
@@ -1712,6 +1731,24 @@ async def call_model(state: AgentState) -> dict:
                 "plan_steps": plan_steps,
                 "current_step": current_step,
             }
+    
+    # ── User message during plan execution: handle gracefully ────────────
+    # If the user sends a message while we're in the middle of a plan,
+    # inject guidance so the agent responds appropriately
+    if plan_steps and current_step > 0 and state['messages']:
+        last_msg = state['messages'][-1]
+        if isinstance(last_msg, HumanMessage):
+            user_input = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
+            logger.info("[call_model] User message during plan execution: %s", user_input[:100])
+            
+            # Check if this is a simple acknowledgment or a real question/command
+            simple_acks = {'ok', 'okay', 'yes', 'no', 'sure', 'hello', 'hi', 'hey', 'continue', 'proceed', 'go ahead', 'thanks', 'thank you', 'got it'}
+            if user_input.strip().lower() in simple_acks:
+                # Inject guidance to continue with the plan
+                state['messages'].append(SystemMessage(
+                    content=f"The user acknowledged. Continue executing the current plan step {current_step}."
+                ))
+                logger.info("[call_model] Injected continue guidance for acknowledgment")
     
     # Build messages with system prompt and context
     messages_to_send = []
