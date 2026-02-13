@@ -25,7 +25,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from . import embeddings
+from ..core import embeddings
 
 logger = logging.getLogger(__name__)
 

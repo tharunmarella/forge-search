@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .parser import parse_file, is_code_file, should_skip, FileParseResult
+from ..core.parser import parse_file, is_code_file, should_skip, FileParseResult
 
 logger = logging.getLogger(__name__)
 

@@ -25,14 +25,26 @@ import logging
 import os
 import re
 import httpx
+from datetime import datetime, timezone
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 
-from . import store, embeddings, chat as chat_utils
+from ..storage import store
+from . import embeddings, chat as chat_utils
 from . import llm as llm_provider
+
+# Intelligence System - All 3 Phases
+from ..intelligence.phase1 import workspace_memory as ws_memory
+from ..intelligence.phase2 import error_analyzer, adaptive_config
+from ..intelligence.phase3 import (
+    hierarchical_planner,
+    learning_checkpoints,
+    model_router as intelligent_model_router,
+    parallel_executor,
+)
 
 # Documentation API configuration
 CONTEXT7_API_URL = "https://mcp.context7.com/mcp"
@@ -40,6 +52,16 @@ DEVDOCS_API_URL = "https://devdocs.io"
 CONTEXT7_API_KEY = os.getenv("CONTEXT7_API_KEY", "")
 
 logger = logging.getLogger(__name__)
+
+# ── Configuration: Enable/Disable Intelligence Phases ──────────────
+ENABLE_PHASE_1 = os.getenv("ENABLE_PHASE_1", "true").lower() == "true"  # Persistent memory
+ENABLE_PHASE_2 = os.getenv("ENABLE_PHASE_2", "true").lower() == "true"  # LLM-powered intelligence
+ENABLE_PHASE_3 = os.getenv("ENABLE_PHASE_3", "true").lower() == "true"  # Long-term intelligence
+
+logger.info(
+    "[config] Intelligence phases: Phase1=%s, Phase2=%s, Phase3=%s",
+    ENABLE_PHASE_1, ENABLE_PHASE_2, ENABLE_PHASE_3
+)
 
 # ── System Prompt ──────────────────────────────────────────────────
 
@@ -199,6 +221,11 @@ class AgentState(TypedDict):
     plan_steps: list[PlanStep]
     # 1-indexed step the agent is currently executing (0 = no plan)
     current_step: int
+    # ── Persistent workspace memory (cross-trace learning) ── Phase 1
+    workspace_memory: ws_memory.WorkspaceMemory
+    # ── Learning checkpoints ── Phase 3
+    checkpoints: list[learning_checkpoints.Checkpoint]
+    last_checkpoint_time: str | None  # ISO timestamp
 
 
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
@@ -1544,8 +1571,37 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
 # Just set the model string: "groq/kimi-k2", "gemini/gemini-2.0-flash", etc.
 
 
+async def _pick_model_name_intelligent(state: AgentState) -> str:
+    """PHASE 3: Use LLM to intelligently select optimal model."""
+    config = llm_provider.get_config()
+    
+    available_models = {
+        "fast": config.tool_model,
+        "reasoning": config.reasoning_model,
+        "planning": llm_provider.get_planning_model_name() or config.reasoning_model
+    }
+    
+    # Get budget constraint from environment or default to balanced
+    budget = os.getenv("MODEL_ROUTING_BUDGET", "balanced")  # fast/balanced/quality
+    
+    try:
+        model = await intelligent_model_router.get_optimal_model_for_turn(
+            state,
+            available_models,
+            budget
+        )
+        return model
+    except Exception as e:
+        logger.error("[model_routing] Intelligent routing failed: %s, falling back", e)
+        # Fallback to reasoning model
+        return config.reasoning_model
+
+
 def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0, is_reflecting: bool = False) -> str:
     """Pick model string based on what the agent needs to do RIGHT NOW.
+    
+    NOTE: If ENABLE_PHASE_3, this uses intelligent LLM-based routing.
+    Otherwise, uses heuristic-based routing (legacy).
     
     Planning model (Claude, best quality):
       - First call when no plan exists (will likely create plan)
@@ -1632,9 +1688,61 @@ async def call_model(state: AgentState) -> dict:
     enriched_context = state.get('enriched_context', '')
     plan_steps = list(state.get('plan_steps', []))  # Make mutable copy
     current_step = state.get('current_step', 0)
+    workspace_id = state['workspace_id']
     
-    logger.info("[call_model] enriched_context=%d chars, plan_steps=%d, current_step=%d",
-                len(enriched_context), len(plan_steps), current_step)
+    # ── PHASE 1: Load workspace memory (cross-trace learning) ──────────────
+    memory = await ws_memory.load_workspace_memory(workspace_id)
+    
+    # ── PHASE 1: Check if we should ask for help ────────────────────────────
+    should_ask, help_message = await ws_memory.should_ask_for_help(workspace_id, state)
+    if should_ask:
+        logger.warning("[call_model] Should ask for help - exhausted approaches detected")
+        return {"messages": [AIMessage(content=help_message)]}
+    
+    logger.info("[call_model] enriched_context=%d chars, plan_steps=%d, current_step=%d, memory_failures=%d",
+                len(enriched_context), len(plan_steps), current_step, len(memory.get('failed_commands', {})))
+    
+    # ── PHASE 3: Check if we should create a learning checkpoint ────────────────
+    checkpoints = state.get('checkpoints', [])
+    last_checkpoint_time_str = state.get('last_checkpoint_time')
+    last_checkpoint_time = None
+    if last_checkpoint_time_str:
+        from datetime import datetime
+        last_checkpoint_time = datetime.fromisoformat(last_checkpoint_time_str)
+    
+    if ENABLE_PHASE_3 and await learning_checkpoints.should_create_checkpoint(state, last_checkpoint_time):
+        logger.info("[call_model] Creating learning checkpoint...")
+        
+        # Extract recent errors and successes
+        recent_errors = []
+        recent_successes = []
+        for msg in reversed(state['messages'][-20:]):
+            if isinstance(msg, ToolMessage) and msg.content:
+                content = msg.content[:300]
+                if any(sig in content.lower() for sig in ['error', 'failed', 'exception']):
+                    recent_errors.append(content)
+                elif any(sig in content.lower() for sig in ['success', 'completed', 'done']):
+                    recent_successes.append(content)
+        
+        try:
+            # Use fast model for checkpoint creation
+            config = llm_provider.get_config()
+            fast_model = llm_provider.get_chat_model(config.tool_model, temperature=0)
+            
+            checkpoint = await learning_checkpoints.create_checkpoint_with_llm(
+                state['messages'][-30:],
+                recent_errors[:5],
+                recent_successes[:5],
+                fast_model
+            )
+            
+            checkpoints.append(checkpoint)
+            last_checkpoint_time = datetime.now(timezone.utc)
+            
+            logger.info("[call_model] Checkpoint created: %d facts learned", 
+                       len(checkpoint['learned_facts']))
+        except Exception as e:
+            logger.error("[call_model] Checkpoint creation failed: %s", e)
     
     # ── AUTO-REPLAN: Force replan after 8+ turns stuck on same step ────────────
     if plan_steps and current_step > 0:
@@ -1855,6 +1963,13 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     else:
         logger.warning("[call_model] No enriched context to add!")
     
+    # ── PHASE 1: Inject failure summary (pre-emptive blocking) ──────────────
+    failure_summary = await ws_memory.get_failure_summary(workspace_id)
+    if failure_summary:
+        messages_to_send.append(SystemMessage(content=failure_summary))
+        logger.warning("[call_model] Injected failure summary (%d exhausted approaches)",
+                      len(memory.get('exhausted_approaches', [])))
+    
     # ── Self-reflection: detect if the agent is stuck ────────
     reflection = _detect_stuck_signals(state['messages'], plan_steps, current_step)
     if reflection:
@@ -1894,9 +2009,15 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     total_chars = sum(len(m.content) if isinstance(m.content, str) else len(str(m.content)) for m in messages_to_send)
     
     # Pick model based on what the agent needs to do right now
-    # Reflection forces reasoning model — the agent needs to think its way out
-    model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step, is_reflecting=bool(reflection))
-    logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
+    # PHASE 3: Use intelligent LLM-based routing if enabled
+    if ENABLE_PHASE_3:
+        model_name = await _pick_model_name_intelligent(state)
+        logger.info("[call_model] Using %s (Phase 3 intelligent routing) | %d messages, %d chars", 
+                   model_name, len(messages_to_send), total_chars)
+    else:
+        # Legacy heuristic-based routing
+        model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step, is_reflecting=bool(reflection))
+        logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
     
     model = llm_provider.get_chat_model(model_name, temperature=0.1)
     
@@ -1923,15 +2044,48 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
                 model_name,
                 [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
-    # ── Block repeated failing tool calls ──────────────────────
-    # If the model calls the same tool with same args that already failed 2+ times,
-    # block it and force the model to do something different.
+    # ── PHASE 1: Pre-emptive blocking with workspace memory ──────────────────
+    # Check workspace memory first (cross-trace failures), then in-conversation repeats
     if response.tool_calls:
         blocked = False
+        blocked_msg = None
+        
         for tc in response.tool_calls:
+            # Extract command for execute_command tool
+            command = None
+            if tc["name"] == "execute_command":
+                command = tc.get("args", {}).get("command", "")
+            elif tc["name"] == "execute_background":
+                command = tc.get("args", {}).get("command", "")
+            else:
+                # For other tools, use the tool name + key args
+                command = tc["name"] + ":" + json.dumps(tc.get("args", {}), sort_keys=True)[:100]
+            
+            # PHASE 1: Check if this is an exhausted approach
+            if command:
+                is_exhausted, record = await ws_memory.is_exhausted_approach(workspace_id, command)
+                
+                if is_exhausted and record:
+                    logger.error("[call_model] BLOCKED exhausted approach: %s (failed %d times across traces)",
+                               command[:60], record["attempts"])
+                    
+                    blocked_msg = AIMessage(
+                        content=f"🛑 **EXHAUSTED APPROACH BLOCKED**\n\n"
+                                f"Command: `{command[:100]}`\n"
+                                f"Failed: {record['attempts']} times across multiple attempts\n"
+                                f"Error: {record['error_signature'][:150]}\n\n"
+                                f"**This approach will NOT work. You MUST:**\n"
+                                f"1. Call `lookup_documentation` to find the correct solution\n"
+                                f"2. Ask the user for help with a specific question\n"
+                                f"3. Use `update_plan` to skip this step\n\n"
+                                f"**DO NOT** try variations of this command."
+                    )
+                    blocked = True
+                    break
+            
+            # Original in-conversation repeat detection
             tc_key = tc["name"] + ":" + json.dumps(tc.get("args", {}), sort_keys=True)[:200]
             
-            # Count how many times this exact call appears in recent history
             repeat_count = 0
             for msg in reversed(state['messages'][-30:]):
                 if isinstance(msg, AIMessage) and msg.tool_calls:
@@ -1942,9 +2096,9 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
             
             if repeat_count >= 2:
                 cmd_desc = tc.get("args", {}).get("command", tc["name"])[:60]
-                logger.warning("[call_model] BLOCKED repeated tool call: %s (called %d times before)", tc["name"], repeat_count)
+                logger.warning("[call_model] BLOCKED repeated tool call: %s (called %d times in conversation)", 
+                             tc["name"], repeat_count)
                 
-                # Replace the response with a firm instruction
                 blocked_msg = AIMessage(
                     content=f"⛔ **I was about to call `{tc['name']}` with the same arguments for the {repeat_count + 1}th time, which would fail again.**\n\n"
                             f"The command `{cmd_desc}` has failed {repeat_count} times already. I need to:\n"
@@ -1970,7 +2124,15 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
         )
         return {"messages": [fallback_msg]}
     
-    return {"messages": [response]}
+    # Build return dict with checkpoints if Phase 3 is enabled
+    result = {"messages": [response]}
+    
+    if ENABLE_PHASE_3 and checkpoints:
+        result["checkpoints"] = checkpoints
+        if last_checkpoint_time:
+            result["last_checkpoint_time"] = last_checkpoint_time.isoformat()
+    
+    return result
 
 
 async def execute_server_tools(state: AgentState) -> dict:
