@@ -59,7 +59,11 @@ SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tas
    - `execute_background(command, label)` to start the process
    - `wait_for_port(port, timeout, http_check=True)` to wait until it's ready
    - `read_process_output(pid)` to check logs if something goes wrong
-   Install-then-run commands should be split: `execute_command("npm install")` first, then `execute_background("npm run dev")`."""
+   Install-then-run commands should be split: `execute_command("npm install")` first, then `execute_background("npm run dev")`.
+9. **Docker auto-start:** If a Docker command fails with "Cannot connect to the Docker daemon":
+   - On macOS: `execute_command("open -a Docker")` then wait 10 seconds and retry
+   - On Linux: `execute_command("sudo systemctl start docker")` then retry
+   After starting Docker, wait for it to be ready before retrying the original command."""
 
 
 # ── Master Planning Prompt (used when Claude is called for planning) ──
