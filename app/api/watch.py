@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/", response_model=WatchResponse)
+@router.post("/watch", response_model=WatchResponse)
 async def watch_directory(req: WatchRequest):
     """
     Start intelligent watching of a codebase directory.
@@ -84,7 +84,7 @@ async def scan_directory(req: WatchRequest):
     )
 
 
-@router.delete("/{workspace_id}")
+@router.delete("/watch/{workspace_id}")
 async def stop_watch(workspace_id: str):
     """Stop watching a workspace."""
     stopped = watcher.stop_watching(workspace_id)
