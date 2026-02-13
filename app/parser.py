@@ -1,15 +1,18 @@
 """
 Tree-sitter based symbol extraction.
 
-Extracts definitions (functions, structs, classes, methods) and references
-(calls, type usages) from source files. This data feeds into the Neo4j graph.
+Uses the built-in tags.scm queries from tree-sitter grammar packages to extract
+definitions and references. This follows the standardized tree-sitter tagging
+convention used by GitHub code navigation.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import tree_sitter_rust
@@ -17,36 +20,80 @@ import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
 import tree_sitter_go
-from tree_sitter import Language, Parser
+from tree_sitter import Language, Parser, Query
 
 logger = logging.getLogger(__name__)
 
 # ── Language setup ────────────────────────────────────────────────
 
-LANGUAGES: dict[str, Language] = {}
+# Map file extensions to (language_func, package_module)
+LANGUAGE_CONFIG: dict[str, tuple] = {
+    "rs": (tree_sitter_rust.language, tree_sitter_rust),
+    "py": (tree_sitter_python.language, tree_sitter_python),
+    "js": (tree_sitter_javascript.language, tree_sitter_javascript),
+    "ts": (tree_sitter_typescript.language_typescript, tree_sitter_typescript),
+    "tsx": (tree_sitter_typescript.language_tsx, tree_sitter_typescript),
+    "go": (tree_sitter_go.language, tree_sitter_go),
+}
 
 
-def _init_languages():
-    global LANGUAGES
-    if LANGUAGES:
-        return
-    LANGUAGES = {
-        "rs": Language(tree_sitter_rust.language()),
-        "py": Language(tree_sitter_python.language()),
-        "js": Language(tree_sitter_javascript.language()),
-        "ts": Language(tree_sitter_typescript.language_typescript()),
-        "tsx": Language(tree_sitter_typescript.language_tsx()),
-        "go": Language(tree_sitter_go.language()),
-    }
+@lru_cache(maxsize=10)
+def _get_language(ext: str) -> Language | None:
+    """Get the tree-sitter Language for a file extension."""
+    config = LANGUAGE_CONFIG.get(ext)
+    if not config:
+        return None
+    lang_func, _ = config
+    return Language(lang_func())
+
+
+@lru_cache(maxsize=10)
+def _get_tags_query(ext: str) -> Query | None:
+    """Load the built-in tags.scm query for a language.
+    
+    These queries are maintained by tree-sitter and follow the standard
+    @definition.* and @reference.* capture naming convention.
+    
+    Note: TypeScript/TSX use the JavaScript tags.scm since the TS tags.scm
+    only covers TypeScript-specific constructs (.d.ts files), not regular
+    functions/classes/arrow functions.
+    """
+    config = LANGUAGE_CONFIG.get(ext)
+    if not config:
+        return None
+    
+    lang_func, pkg = config
+    lang = Language(lang_func())
+    
+    # For TS/TSX, use JavaScript tags (more comprehensive for actual code)
+    # The TypeScript tags.scm only covers .d.ts type definitions
+    if ext in ("ts", "tsx"):
+        tags_pkg = tree_sitter_javascript
+    else:
+        tags_pkg = pkg
+    
+    # Find the tags.scm file in the package
+    pkg_dir = os.path.dirname(tags_pkg.__file__)
+    tags_path = os.path.join(pkg_dir, "queries", "tags.scm")
+    
+    if not os.path.exists(tags_path):
+        logger.warning("No tags.scm found for %s at %s", ext, tags_path)
+        return None
+    
+    try:
+        query_text = Path(tags_path).read_text()
+        return lang.query(query_text)
+    except Exception as e:
+        logger.warning("Failed to load tags.scm for %s: %s", ext, e)
+        return None
 
 
 def get_parser(ext: str) -> Parser | None:
-    _init_languages()
-    lang = LANGUAGES.get(ext)
+    """Get a parser for the given file extension."""
+    lang = _get_language(ext)
     if lang is None:
         return None
-    p = Parser(lang)
-    return p
+    return Parser(lang)
 
 
 # ── Data models ───────────────────────────────────────────────────
@@ -83,134 +130,34 @@ class FileParseResult:
     imports: list[str] = field(default_factory=list)  # Imported module paths
 
 
-# ── Tree-sitter queries per language ──────────────────────────────
+# ── Kind extraction from capture names ────────────────────────────
+# Built-in tags.scm uses @definition.function, @definition.class, etc.
+# We extract the kind from the capture name suffix.
 
-# Rust definitions query
-RUST_DEF_QUERY = """
-(function_item name: (identifier) @name) @def
-(struct_item name: (type_identifier) @name) @def
-(enum_item name: (type_identifier) @name) @def
-(trait_item name: (type_identifier) @name) @def
-(impl_item type: (type_identifier) @name) @def
-(type_item name: (type_identifier) @name) @def
-(const_item name: (identifier) @name) @def
-(static_item name: (identifier) @name) @def
-(macro_definition name: (identifier) @name) @def
-"""
-
-# Rust references query - function calls and type usages
-RUST_REF_QUERY = """
-(call_expression function: (identifier) @name)
-(call_expression function: (scoped_identifier name: (identifier) @name))
-(call_expression function: (field_expression field: (field_identifier) @name))
-(type_identifier) @name
-(macro_invocation macro: (identifier) @name)
-"""
-
-# Python definitions
-PYTHON_DEF_QUERY = """
-(function_definition name: (identifier) @name) @def
-(class_definition name: (identifier) @name) @def
-"""
-
-PYTHON_REF_QUERY = """
-(call function: (identifier) @name)
-(call function: (attribute attribute: (identifier) @name))
-"""
-
-# JavaScript definitions (uses `identifier` for class names)
-JS_DEF_QUERY = """
-(function_declaration name: (identifier) @name) @def
-(class_declaration name: (identifier) @name) @def
-(method_definition name: (property_identifier) @name) @def
-(variable_declarator name: (identifier) @name value: (arrow_function)) @def
-(variable_declarator name: (identifier) @name value: (function_expression)) @def
-"""
-
-JS_REF_QUERY = """
-(call_expression function: (identifier) @name)
-(call_expression function: (member_expression property: (property_identifier) @name))
-"""
-
-# TypeScript/TSX definitions (uses `type_identifier` for class names)
-TS_DEF_QUERY = """
-(function_declaration name: (identifier) @name) @def
-(class_declaration name: (type_identifier) @name) @def
-(method_definition name: (property_identifier) @name) @def
-(variable_declarator name: (identifier) @name value: (arrow_function)) @def
-(variable_declarator name: (identifier) @name value: (function_expression)) @def
-"""
-
-TS_REF_QUERY = """
-(call_expression function: (identifier) @name)
-(call_expression function: (member_expression property: (property_identifier) @name))
-"""
-
-# Go definitions
-GO_DEF_QUERY = """
-(function_declaration name: (identifier) @name) @def
-(method_declaration name: (field_identifier) @name) @def
-(type_declaration (type_spec name: (type_identifier) @name)) @def
-"""
-
-GO_REF_QUERY = """
-(call_expression function: (identifier) @name)
-(call_expression function: (selector_expression field: (field_identifier) @name))
-(type_identifier) @name
-"""
-
-DEF_QUERIES: dict[str, str] = {
-    "rs": RUST_DEF_QUERY,
-    "py": PYTHON_DEF_QUERY,
-    "js": JS_DEF_QUERY,
-    "ts": TS_DEF_QUERY,
-    "tsx": TS_DEF_QUERY,  # TSX uses same queries as TS
-    "go": GO_DEF_QUERY,
-}
-
-REF_QUERIES: dict[str, str] = {
-    "rs": RUST_REF_QUERY,
-    "py": PYTHON_REF_QUERY,
-    "js": JS_REF_QUERY,
-    "ts": TS_REF_QUERY,
-    "tsx": TS_REF_QUERY,
-    "go": GO_REF_QUERY,
-}
-
-
-# ── Kind detection ────────────────────────────────────────────────
-
-NODE_KIND_MAP = {
-    # Rust
-    "function_item": "function",
-    "struct_item": "struct",
-    "enum_item": "enum",
-    "trait_item": "trait",
-    "impl_item": "impl",
-    "type_item": "type",
-    "const_item": "const",
-    "static_item": "static",
-    "macro_definition": "macro",
-    # Python
-    "function_definition": "function",
-    "class_definition": "class",
-    # JS/TS
-    "function_declaration": "function",
-    "class_declaration": "class",
-    "method_definition": "method",
-    "lexical_declaration": "function",
-    # Go
-    "function_declaration": "function",
-    "method_declaration": "method",
-    "type_declaration": "struct",
-    "type_spec": "struct",
-}
+def _extract_kind_from_capture(capture_name: str) -> str | None:
+    """Extract the kind (function, class, method, etc.) from a capture name.
+    
+    Built-in tags.scm uses naming like:
+    - @definition.function → "function"
+    - @definition.class → "class"
+    - @definition.method → "method"
+    - @reference.call → "call"
+    """
+    if capture_name.startswith("definition."):
+        return capture_name[len("definition."):]
+    elif capture_name.startswith("reference."):
+        return capture_name[len("reference."):]
+    return None
 
 
 # ── Main parser ───────────────────────────────────────────────────
 
 def parse_file(file_path: str, content: str) -> FileParseResult:
-    """Parse a source file and extract definitions + references."""
+    """Parse a source file and extract definitions + references.
+    
+    Uses the built-in tags.scm queries from tree-sitter grammar packages.
+    These are the same queries used by GitHub for code navigation.
+    """
     ext = Path(file_path).suffix.lstrip(".")
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -227,47 +174,63 @@ def parse_file(file_path: str, content: str) -> FileParseResult:
     tree = parser.parse(source)
     lines = content.split("\n")
 
-    # Extract definitions
-    def_query_str = DEF_QUERIES.get(ext)
-    if def_query_str:
-        _init_languages()
-        lang = LANGUAGES[ext]
-        try:
-            query = lang.query(def_query_str)
-            matches = query.matches(tree.root_node)
-            for _pattern_idx, match_dict in matches:
-                name_nodes = match_dict.get("name", [])
-                def_nodes = match_dict.get("def", [])
-                if not name_nodes or not def_nodes:
-                    continue
+    # Load the built-in tags.scm query for this language
+    tags_query = _get_tags_query(ext)
+    if tags_query is None:
+        logger.debug("No tags.scm available for %s", ext)
+        return result
 
-                name_node = name_nodes[0]
-                def_node = def_nodes[0]
-
-                name = name_node.text.decode("utf-8")
-                if len(name) < 2:
-                    continue
-
+    try:
+        matches = tags_query.matches(tree.root_node)
+        
+        for _pattern_idx, captures in matches:
+            # Find the @name capture (the identifier)
+            name_nodes = captures.get("name", [])
+            if not name_nodes:
+                continue
+            
+            name_node = name_nodes[0]
+            name = name_node.text.decode("utf-8")
+            if len(name) < 2:
+                continue
+            
+            # Find the definition or reference capture
+            # Built-in queries use @definition.* or @reference.*
+            def_node = None
+            kind = None
+            is_definition = False
+            is_reference = False
+            
+            for capture_name, nodes in captures.items():
+                if capture_name.startswith("definition."):
+                    def_node = nodes[0] if nodes else None
+                    kind = _extract_kind_from_capture(capture_name)
+                    is_definition = True
+                    break
+                elif capture_name.startswith("reference."):
+                    kind = _extract_kind_from_capture(capture_name)
+                    is_reference = True
+                    break
+            
+            if is_definition and def_node:
                 start_line = def_node.start_point[0] + 1
                 end_line = def_node.end_point[0] + 1
-                kind = NODE_KIND_MAP.get(def_node.type, "function")
-
+                
                 # Get signature (first line of definition)
                 sig_line_idx = def_node.start_point[0]
                 signature = lines[sig_line_idx].strip() if sig_line_idx < len(lines) else ""
-
-                # Get full content using byte offsets (correct for minified files)
-                # Capped at 10KB to keep embedding input reasonable
+                
+                # Get full content (capped at 10KB)
                 max_bytes = 10_000
                 end_byte = min(def_node.end_byte, def_node.start_byte + max_bytes)
                 symbol_content = source[def_node.start_byte:end_byte].decode("utf-8", errors="replace")
-
-                # Detect parent for methods (Rust impl blocks)
+                
+                # Detect parent for methods
                 parent = _find_parent_name(def_node, source)
-
+                
                 result.definitions.append(SymbolDef(
                     name=name,
-                    kind=kind,
+                    kind=kind or "function",
                     file_path=file_path,
                     start_line=start_line,
                     end_line=end_line,
@@ -275,40 +238,20 @@ def parse_file(file_path: str, content: str) -> FileParseResult:
                     content=symbol_content,
                     parent=parent,
                 ))
-        except Exception as e:
-            logger.warning("Definition query failed for %s: %s", file_path, e)
-
-    # Extract references
-    ref_query_str = REF_QUERIES.get(ext)
-    if ref_query_str:
-        _init_languages()
-        lang = LANGUAGES[ext]
-        try:
-            query = lang.query(ref_query_str)
-            matches = query.matches(tree.root_node)
-            for _pattern_idx, match_dict in matches:
-                name_nodes = match_dict.get("name", [])
-                if not name_nodes:
-                    continue
-
-                name_node = name_nodes[0]
-                name = name_node.text.decode("utf-8")
-                if len(name) < 2:
-                    continue
-
+            
+            elif is_reference:
                 line = name_node.start_point[0] + 1
-
-                # Find enclosing function
                 context = _find_enclosing_function(name_node, source)
-
+                
                 result.references.append(SymbolRef(
                     name=name,
                     file_path=file_path,
                     line=line,
                     context_name=context,
                 ))
-        except Exception as e:
-            logger.warning("Reference query failed for %s: %s", file_path, e)
+                
+    except Exception as e:
+        logger.warning("Tags query failed for %s: %s", file_path, e)
 
     # Extract imports (simplified)
     result.imports = _extract_imports(content, ext)
