@@ -1702,8 +1702,21 @@ async def call_model(state: AgentState) -> dict:
     # Bind all tools
     model_with_tools = model.bind_tools(ALL_TOOLS)
     
-    # Call the model
-    response = await model_with_tools.ainvoke(messages_to_send)
+    # Call the model (with fallback if planning model fails)
+    try:
+        response = await model_with_tools.ainvoke(messages_to_send)
+    except Exception as e:
+        # If planning model failed (e.g., no credits), fallback to reasoning model
+        config = llm_provider.get_config()
+        if model_name != config.reasoning_model:
+            logger.warning("[call_model] %s failed (%s), falling back to %s", 
+                          model_name, str(e)[:100], config.reasoning_model)
+            fallback_model = llm_provider.get_chat_model(config.reasoning_model, temperature=0.1)
+            model_with_tools = fallback_model.bind_tools(ALL_TOOLS)
+            response = await model_with_tools.ainvoke(messages_to_send)
+            model_name = config.reasoning_model  # Update for logging
+        else:
+            raise  # Re-raise if reasoning model itself failed
     
     logger.info("[call_model] Got response from %s, tool_calls=%s", 
                 model_name,
