@@ -654,7 +654,7 @@ async def _decompose_query(question: str, attached_files: dict[str, str] | None 
         logger.info("[decompose] %d queries, %d symbols from: %s", len(queries), len(symbols), question[:80])
         return queries, symbols
         
-    except Exception as e:
+        except Exception as e:
         logger.warning("[decompose] Failed (%s), falling back to raw question", e)
         return [question], []
 
@@ -1249,13 +1249,13 @@ async def enrich_context(state: AgentState) -> dict:
             enrich_coro = build_pre_enrichment(workspace_id, question, attached_files)
             profile, context = await asyncio.gather(profile_coro, enrich_coro)
             logger.info("[enrich_context] Built context=%d chars, profile=%d chars", len(context), len(profile))
-            return {
+        return {
                 "enriched_context": context,
                 "enriched_question": question,
                 "enriched_step": current_step,
                 "project_profile": profile,
-            }
-        else:
+        }
+    else:
             # Profile already exists (from Redis cache), just enrich
             context = await build_pre_enrichment(workspace_id, question, attached_files)
             logger.info("[enrich_context] Built context with %d chars (profile cached)", len(context))
@@ -1580,8 +1580,8 @@ def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = N
             logger.info("[model_routing] → planning model (reflection/replan scenario)")
             return planning_model
         logger.info("[model_routing] → reasoning (reflection mode)")
-        return config.reasoning_model
-    
+    return config.reasoning_model
+
     # Look at the last few messages to understand what just happened
     recent_tool_results = []
     for msg in reversed(messages):
@@ -1906,7 +1906,7 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     
     # Call the model (with fallback if planning model fails)
     try:
-        response = await model_with_tools.ainvoke(messages_to_send)
+    response = await model_with_tools.ainvoke(messages_to_send)
     except Exception as e:
         # If planning model failed (e.g., no credits), fallback to reasoning model
         config = llm_provider.get_config()

@@ -90,6 +90,20 @@ else:
     logger.info("MongoDB tracing disabled (set MONGODB_URL to enable)")
 
 
+async def _ensure_mongo_indexes():
+    """Create MongoDB indexes for efficient querying."""
+    if traces_collection is None:
+        return
+    try:
+        await traces_collection.create_index("thread_id")
+        await traces_collection.create_index("workspace_id")
+        await traces_collection.create_index("timestamp")
+        await traces_collection.create_index([("thread_id", 1), ("timestamp", 1)])
+        logger.info("MongoDB indexes created")
+    except Exception as e:
+        logger.warning(f"MongoDB index creation failed: {e}")
+
+
 # ── Conversation state store (Redis-backed) ───────────────────────
 # Stores enriched_context and full message history per conversation_id.
 # This is critical: LangGraph ainvoke() doesn't persist state between
@@ -366,6 +380,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Forge Search API...")
     await store.ensure_schema()
     await auth.ensure_user_table()
+    await _ensure_mongo_indexes()
     llm_provider.log_provider_status()
     logger.info("Store ready (auth enabled)")
     yield
@@ -1245,7 +1260,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 for s in result_plan_steps
             ]
         
-        # Log trace to MongoDB
+        # Log trace to MongoDB — capture full request, response, and message history
         await _log_trace_to_mongo(
             thread_id=conv_id,
             workspace_id=req.workspace_id,
@@ -1255,6 +1270,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "tool_results": req.tool_results,
                 "attached_files": len(attached_files_dict),
                 "attached_images": len(attached_images_list),
+                "is_continuation": has_tool_results,
             },
             response_data={
                 "answer": answer,
@@ -1262,6 +1278,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "plan_steps": [dict(s) for s in result_plan_steps] if result_plan_steps else None,
                 "current_step": result_current_step,
                 "message_count": len(final_messages),
+                "messages": serialized_history,  # Full message history for replay
             },
             execution_time_ms=elapsed,
             status=status,
