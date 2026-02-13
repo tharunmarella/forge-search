@@ -1784,6 +1784,18 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
                 model_name,
                 [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
+    # ── Detect empty response (no content AND no tool calls) ──
+    has_content = response.content and response.content.strip()
+    has_tools = response.tool_calls and len(response.tool_calls) > 0
+    
+    if not has_content and not has_tools:
+        logger.warning("[call_model] EMPTY RESPONSE from %s - no content or tool calls!", model_name)
+        # Return a fallback message so the conversation can continue
+        fallback_msg = AIMessage(
+            content="I encountered an issue processing this request. Let me try a different approach. Could you clarify what you'd like me to do, or I can check the current state of the files."
+        )
+        return {"messages": [fallback_msg]}
+    
     return {"messages": [response]}
 
 
