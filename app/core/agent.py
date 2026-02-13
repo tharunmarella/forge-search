@@ -2083,31 +2083,8 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
                     blocked = True
                     break
             
-            # Original in-conversation repeat detection
-            tc_key = tc["name"] + ":" + json.dumps(tc.get("args", {}), sort_keys=True)[:200]
-            
-            repeat_count = 0
-            for msg in reversed(state['messages'][-30:]):
-                if isinstance(msg, AIMessage) and msg.tool_calls:
-                    for prev_tc in msg.tool_calls:
-                        prev_key = prev_tc["name"] + ":" + json.dumps(prev_tc.get("args", {}), sort_keys=True)[:200]
-                        if prev_key == tc_key:
-                            repeat_count += 1
-            
-            if repeat_count >= 2:
-                cmd_desc = tc.get("args", {}).get("command", tc["name"])[:60]
-                logger.warning("[call_model] BLOCKED repeated tool call: %s (called %d times in conversation)", 
-                             tc["name"], repeat_count)
-                
-                blocked_msg = AIMessage(
-                    content=f"⛔ **I was about to call `{tc['name']}` with the same arguments for the {repeat_count + 1}th time, which would fail again.**\n\n"
-                            f"The command `{cmd_desc}` has failed {repeat_count} times already. I need to:\n"
-                            f"1. Read the actual error output from the previous failures\n"
-                            f"2. Fix the root cause (likely a code issue, not a command issue)\n"
-                            f"3. Only then retry the build/test"
-                )
-                blocked = True
-                break
+            # Loop detection removed to allow retries after fixes
+            pass
         
         if blocked:
             return {"messages": [blocked_msg]}
