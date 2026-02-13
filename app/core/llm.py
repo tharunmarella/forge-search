@@ -62,6 +62,8 @@ PROVIDERS: dict[str, dict] = {
             "gemini/gemini-2.0-flash-lite",
             "gemini/gemini-1.5-pro",
             "gemini/gemini-1.5-flash",
+            "gemini/gemini-3-pro-preview",
+            "gemini/gemini-3-flash-preview"
         ],
     },
     "anthropic": {
