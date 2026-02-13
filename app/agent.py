@@ -1650,25 +1650,37 @@ async def call_model(state: AgentState) -> dict:
     # ── AUTO-REPLAN: Force replan after 8+ turns stuck on same step ────────────
     if plan_steps and current_step > 0:
         turns_on_step = 0
-        auto_replan_count = 0  # How many times we've already auto-replanned
+        auto_replan_count = 0  # How many times we've auto-replanned THIS SPECIFIC step
         plan_tools = {'create_plan', 'update_plan', 'replan', 'add_plan_step', 'remove_plan_step'}
+        current_step_replan_id = f"auto_replan_{current_step}"  # Only count replans for THIS step
         
         for msg in reversed(state['messages']):
             if isinstance(msg, AIMessage) and msg.tool_calls:
                 if any(tc['name'] in plan_tools for tc in msg.tool_calls):
-                    # Count auto-replans to detect repeated replan cycles
-                    if any(tc.get('id', '').startswith('auto_replan_') for tc in msg.tool_calls):
+                    # Check if this is an auto-replan for the CURRENT step specifically
+                    is_current_step_replan = any(
+                        tc.get('id', '') == current_step_replan_id
+                        for tc in msg.tool_calls
+                    )
+                    if is_current_step_replan:
                         auto_replan_count += 1
-                        if auto_replan_count >= 2:
-                            break  # Stop counting - we've been through this cycle before
-                        continue  # Don't break, keep counting turns past auto-replans
-                    break  # Manual plan tool - stop counting
+                        continue  # Don't break, keep scanning for more replans of this step
+                    # Any other plan tool (manual replan, update_plan, create_plan, 
+                    # or auto_replan for a DIFFERENT step) = stop counting
+                    break
                 turns_on_step += 1
             elif isinstance(msg, AIMessage) and not msg.tool_calls:
                 turns_on_step += 1
+            elif isinstance(msg, HumanMessage):
+                # Don't count turns from before the user's last message
+                # (user interjections reset the context for this step)
+                pass  # Continue scanning — user "ok" messages shouldn't stop the scan
             
             if turns_on_step >= 20:
                 break
+        
+        logger.info("[call_model] Step %d: turns_on_step=%d, auto_replan_count=%d (for step %d only)", 
+                    current_step, turns_on_step, auto_replan_count, current_step)
         
         if turns_on_step >= 8 and current_step <= len(plan_steps):
             step_desc = plan_steps[current_step - 1].get("description", "?")
