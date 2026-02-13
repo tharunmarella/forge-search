@@ -85,11 +85,15 @@ else:
     logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable)")
 
 
-# ── In-memory conversation state store ─────────────────────────────
+# ── Conversation state store (Redis-backed) ───────────────────────
 # Stores enriched_context and full message history per conversation_id.
 # This is critical: LangGraph ainvoke() doesn't persist state between
 # calls, so we must track conversation state server-side.
+#
+# Uses Redis for persistence across server restarts. Falls back to
+# in-memory dict if Redis is unavailable.
 
+import redis
 from collections import OrderedDict
 
 # ── Pending auth tokens (for polling-based OAuth) ──────────────────
@@ -97,29 +101,126 @@ from collections import OrderedDict
 # stores the token here. IDE polls GET /auth/poll/{session_id}.
 _pending_auth: dict[str, dict] = {}  # session_id -> {token, user_info, expires}
 
+
+def _serialize_messages(messages: list) -> list[dict]:
+    """Serialize LangChain messages to JSON-safe dicts."""
+    result = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            result.append({"type": "human", "content": m.content})
+        elif isinstance(m, AIMessage):
+            entry = {"type": "ai", "content": m.content}
+            if m.tool_calls:
+                entry["tool_calls"] = m.tool_calls
+            result.append(entry)
+        elif isinstance(m, ToolMessage):
+            result.append({
+                "type": "tool",
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+            })
+    return result
+
+
+def _deserialize_messages(data: list[dict]) -> list:
+    """Deserialize JSON dicts back to LangChain messages."""
+    messages = []
+    for m in data:
+        if m["type"] == "human":
+            messages.append(HumanMessage(content=m["content"]))
+        elif m["type"] == "ai":
+            messages.append(AIMessage(
+                content=m["content"],
+                tool_calls=m.get("tool_calls", []),
+            ))
+        elif m["type"] == "tool":
+            messages.append(ToolMessage(
+                content=m["content"],
+                tool_call_id=m["tool_call_id"],
+            ))
+    return messages
+
+
 class ConversationStore:
-    """Simple LRU cache for conversation state."""
-    def __init__(self, max_size: int = 200):
-        self._store: OrderedDict[str, dict] = OrderedDict()
-        self._max_size = max_size
-
+    """Redis-backed conversation state store with in-memory fallback.
+    
+    Conversation state survives server restarts when Redis is available.
+    Each conversation expires after 24 hours of inactivity.
+    """
+    
+    CONV_TTL = 86400  # 24 hours
+    PREFIX = "conv:"
+    
+    def __init__(self, redis_url: str | None = None, max_memory_size: int = 200):
+        self._redis: redis.Redis | None = None
+        self._memory: OrderedDict[str, dict] = OrderedDict()
+        self._max_memory_size = max_memory_size
+        
+        if redis_url:
+            try:
+                self._redis = redis.from_url(redis_url, decode_responses=True)
+                self._redis.ping()
+                logger.info("ConversationStore: Redis connected at %s", redis_url[:40] + "...")
+            except Exception as e:
+                logger.warning("ConversationStore: Redis unavailable (%s), using in-memory fallback", e)
+                self._redis = None
+        else:
+            logger.info("ConversationStore: No REDIS_URL set, using in-memory store")
+    
     def get(self, conv_id: str) -> dict | None:
-        if conv_id in self._store:
-            self._store.move_to_end(conv_id)
-            return self._store[conv_id]
+        # Try Redis first
+        if self._redis:
+            try:
+                raw = self._redis.get(f"{self.PREFIX}{conv_id}")
+                if raw:
+                    data = json.loads(raw)
+                    # Deserialize messages back to LangChain objects
+                    data["messages"] = _deserialize_messages(data.get("messages", []))
+                    # Refresh TTL on access
+                    self._redis.expire(f"{self.PREFIX}{conv_id}", self.CONV_TTL)
+                    return data
+            except Exception as e:
+                logger.warning("Redis get failed for %s: %s", conv_id, e)
+        
+        # Fallback to memory
+        if conv_id in self._memory:
+            self._memory.move_to_end(conv_id)
+            return self._memory[conv_id]
         return None
-
+    
     def set(self, conv_id: str, state: dict):
-        if conv_id in self._store:
-            self._store.move_to_end(conv_id)
-        self._store[conv_id] = state
-        while len(self._store) > self._max_size:
-            self._store.popitem(last=False)
-
+        # Always write to memory (fast reads on same instance)
+        if conv_id in self._memory:
+            self._memory.move_to_end(conv_id)
+        self._memory[conv_id] = state
+        while len(self._memory) > self._max_memory_size:
+            self._memory.popitem(last=False)
+        
+        # Write to Redis for persistence
+        if self._redis:
+            try:
+                # Serialize messages to JSON-safe format
+                data = dict(state)
+                data["messages"] = _serialize_messages(data.get("messages", []))
+                self._redis.setex(
+                    f"{self.PREFIX}{conv_id}",
+                    self.CONV_TTL,
+                    json.dumps(data),
+                )
+            except Exception as e:
+                logger.warning("Redis set failed for %s: %s", conv_id, e)
+    
     def delete(self, conv_id: str):
-        self._store.pop(conv_id, None)
+        self._memory.pop(conv_id, None)
+        if self._redis:
+            try:
+                self._redis.delete(f"{self.PREFIX}{conv_id}")
+            except Exception:
+                pass
 
-_conversations = ConversationStore()
+
+_redis_url = os.getenv("REDIS_URL", "")
+_conversations = ConversationStore(redis_url=_redis_url if _redis_url else None)
 
 
 # ── Context-enriched embedding text ──────────────────────────────
@@ -856,12 +957,14 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     plan_steps = []
     current_step = 0
     enriched_question = ""
+    enriched_step = 0
 
     if has_tool_results and stored:
         # TOOL RESULT CONTINUATION: restore full history + append tool results
         messages = stored["messages"]  # Full history from prior turns
         enriched_context = stored.get("enriched_context", "")
         enriched_question = stored.get("enriched_question", "")
+        enriched_step = stored.get("enriched_step", 0)
         attached_files_dict = stored.get("attached_files", {})
         # Restore plan state
         plan_steps = stored.get("plan_steps", [])
@@ -882,6 +985,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         messages = stored["messages"]
         enriched_context = stored.get("enriched_context", "")
         enriched_question = stored.get("enriched_question", "")
+        enriched_step = stored.get("enriched_step", 0)
         attached_files_dict = stored.get("attached_files", {})
         # Restore plan state
         plan_steps = stored.get("plan_steps", [])
@@ -978,6 +1082,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "attached_files": attached_files_dict,
                 "enriched_context": enriched_context,  # Preserved on continuation!
                 "enriched_question": enriched_question,  # For topic shift detection
+                "enriched_step": enriched_step,  # For step-aware supplementary enrichment
                 # Plan state (preserved across tool-result continuations)
                 "plan_steps": plan_steps,
                 "current_step": current_step,
@@ -987,6 +1092,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         
         enriched_ctx = result.get("enriched_context", "")
         result_enriched_question = result.get("enriched_question", "")
+        result_enriched_step = result.get("enriched_step", 0)
         final_messages = result["messages"]
         last_message = final_messages[-1]
         
@@ -1018,6 +1124,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             "messages": final_messages,
             "enriched_context": enriched_ctx,
             "enriched_question": result_enriched_question,
+            "enriched_step": result_enriched_step,
             "attached_files": attached_files_dict,
             # Persist plan state across turns
             "plan_steps": result_plan_steps,
@@ -1097,11 +1204,13 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             plan_steps = []
             current_step = 0
             enriched_question = ""
+            enriched_step = 0
 
             if has_tool_results and stored:
                 messages = stored["messages"]
                 enriched_context = stored.get("enriched_context", "")
                 enriched_question = stored.get("enriched_question", "")
+                enriched_step = stored.get("enriched_step", 0)
                 attached_files_dict = stored.get("attached_files", {})
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
@@ -1116,6 +1225,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 messages = stored["messages"]
                 enriched_context = stored.get("enriched_context", "")
                 enriched_question = stored.get("enriched_question", "")
+                enriched_step = stored.get("enriched_step", 0)
                 attached_files_dict = stored.get("attached_files", {})
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
@@ -1201,6 +1311,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                     "attached_files": attached_files_dict,
                     "enriched_context": enriched_context,
                     "enriched_question": enriched_question,
+                    "enriched_step": enriched_step,
                     "plan_steps": plan_steps,
                     "current_step": current_step,
                 },
@@ -1209,6 +1320,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             
             enriched_ctx = result.get("enriched_context", "")
             result_enriched_question = result.get("enriched_question", "")
+            result_enriched_step = result.get("enriched_step", 0)
             final_messages = result["messages"]
             last_message = final_messages[-1]
             
@@ -1250,6 +1362,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 "messages": final_messages,
                 "enriched_context": enriched_ctx,
                 "enriched_question": result_enriched_question,
+                "enriched_step": result_enriched_step,
                 "attached_files": attached_files_dict,
                 "plan_steps": result_plan_steps,
                 "current_step": result_current_step,

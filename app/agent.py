@@ -44,210 +44,17 @@ logger = logging.getLogger(__name__)
 
 # ── System Prompt ──────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert senior software engineer working inside Forge IDE. You EXECUTE tasks, not describe them.
+SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tasks using tools — never just describe what you'd do.
 
-## CRITICAL RULES
+## Rules
 
-1. **ALWAYS USE TOOLS** to perform actions. NEVER just describe what you would do.
-   - WRONG: "I would use replace_in_file to change X to Y"
-   - RIGHT: Actually call replace_in_file with the exact parameters
-2. **DO the work, don't explain the work.** If the user asks you to refactor, USE the tools to make the changes.
-3. **Read before editing**: Always use read_file to see exact current code before using replace_in_file
-4. **replace_in_file old_str must match EXACTLY** — copy it character-for-character from read_file output
-5. **For complex tasks**: Break into steps, execute each step with tools, verify with execute_command or read_file
-6. **If something fails**: Analyze the error and try a different approach immediately
-   - If a library/tool command fails 2+ times with the same error → use `lookup_documentation` to check for API changes
-   - Don't retry the same failing command more than twice
-7. **ALWAYS VERIFY YOUR WORK** before finishing (see Verification section below)
-
-## Tools Available
-
-### Search & Documentation Tools
-1. `codebase_search(query)`: **USE FIRST for finding code.** Semantic search — find code by meaning. Fast, searches the pre-built index.
-2. `lookup_documentation(library, query)`: **USE for library/framework questions.** Look up official docs when:
-   - You encounter library-specific errors or unexpected behavior
-   - A library command fails (e.g., CLI tools, package managers)
-   - You need to know correct API usage or configuration
-   - Examples: `lookup_documentation("tailwindcss", "init configuration")`, `lookup_documentation("nextjs", "app router")` 
-3. `grep(pattern, path, glob)`: Literal/regex text search using ripgrep. Use when you know the exact string.
-4. `trace_call_chain(symbol_name, direction)`: Find what calls a function or what it calls.
-5. `impact_analysis(symbol_name)`: Find all code affected by changing a symbol.
-
-### File Tools (for reading and editing)
-- `read_file(path)`: Read file contents. ALWAYS do this before editing.
-- `list_files(path, recursive)`: List files in a directory.
-- `glob(pattern, path)`: Find files matching a glob pattern (e.g. '**/*.py').
-- `replace_in_file(path, old_str, new_str)`: Replace exact text in a file. old_str must match exactly.
-- `write_to_file(path, content)`: Write entire file. Only for new files.
-- `delete_file(path)`: Delete a file.
-- `apply_patch(patch)`: Apply unified diff to modify multiple files at once.
-
-### Command & Process Tools
-- `execute_command(command)`: Run shell commands (git, builds, tests, etc.)
-- `execute_background(command, label)`: Start long-running processes (dev servers, watchers).
-- `read_process_output(pid, lines)`: Check logs/output from background processes.
-- `check_process_status(pid)`: Check if a background process is still running.
-- `kill_process(pid)`: Stop a background process.
-- `wait_for_port(port, timeout)`: Wait for a server to be ready on a port.
-- `check_port(port)`: Check if a port is in use.
-- `kill_port(port)`: Kill whatever is using a port.
-
-### Code Intelligence Tools
-- `list_code_definition_names(path)`: List all symbols (functions, classes) in a file.
-- `get_symbol_definition(symbol, path)`: Jump to where a symbol is defined.
-- `find_symbol_references(symbol, path)`: Find all usages of a symbol.
-- `diagnostics(path, fix)`: Get linter/compiler errors, optionally auto-fix.
-
-### LSP Tools (powered by language servers)
-- `lsp_go_to_definition(path, line, column)`: Jump to definition using LSP.
-- `lsp_find_references(path, line, column)`: Find all usages via LSP.
-- `lsp_hover(path, line, column)`: Get type info and docs for a symbol.
-- `lsp_rename(path, line, column, new_name)`: Safe rename across the workspace.
-
-### Planning Tools
-- `create_plan(steps)`: Create an execution plan. The user sees it in the IDE with live status. **Use for tasks involving 3+ steps across multiple files** (refactoring, new features, migrations). Do NOT create plans for simple questions or single-file edits.
-- `update_plan(step_number, status)`: Mark a step as "done", "in_progress", or "failed". **Call this every time you finish a step** so the user can track progress.
-- `discard_plan()`: Remove the plan if your approach changes or the task is simpler than expected.
-
-**Planning rules:**
-- Create a plan BEFORE starting work on complex tasks
-- Keep plans to 3-8 concrete steps
-- Always include a verification step at the end
-- Call `update_plan` to mark each step done — the user watches your progress live
-- Do NOT create plans for: questions, explanations, single-file reads, quick edits
-
-## SEARCH RULES — CRITICAL
-
-**NEVER use `execute_command` with `grep` or `find` for searching code.**
-- WRONG: `execute_command(command="grep -rn 'foo' .")`  ← SLOW, can escape workspace
-- RIGHT: `grep(pattern="foo")`                          ← Uses ripgrep, fast, safe
-- BEST:  `codebase_search(query="foo function")`        ← Semantic, finds related code too
-
-Use `codebase_search` first for semantic/conceptual queries. Use `grep` when you need exact literal matches.
-The `execute_command` tool should ONLY be used for: git, builds, tests, package managers, linters.
-
-## AVOIDING RETRY LOOPS
-
-**If a command fails twice with the same error, STOP and investigate:**
-
-1. **Library/CLI tool errors** (e.g., `npx foo init` fails) → Use `lookup_documentation("foo", "init")`
-2. **Missing file/command** → Check if you need to install it first, or if the API changed
-3. **Configuration errors** → Search docs for correct config format or create the config manually
-
-**NEVER retry the same failing command 3+ times.** If reinstalling doesn't fix it, the problem is conceptual (wrong command, API changed, missing prerequisite).
-
-**Examples of bad patterns (retrying same failing command):**
-```
-# Frontend/Build Tools
-npx <tool> init  → fails
-npm install <tool>  → succeeds  
-npx <tool> init  → fails AGAIN  ❌ STOP - API changed or not available
-
-# Backend/CLI
-<command> --init  → fails
-pip/cargo install  → succeeds
-<command> --init  → fails AGAIN  ❌ STOP - command doesn't exist or needs different flags
-
-# Database/Services  
-<cli> setup  → fails
-apt/brew install  → succeeds
-<cli> setup  → fails AGAIN  ❌ STOP - needs config file or different approach
-```
-
-**Correct recovery patterns:**
-
-**Option 1 - Search documentation** (when you need to learn the API):
-```
-<command>  → fails twice
-lookup_documentation("<library>", "<topic>")  ✓ Learn the correct way
-```
-
-**Option 2 - Create config manually** (PREFERRED for config files):
-```
-<init-command>  → fails twice
-write_to_file("<config-file>", <standard-template>)  ✓ Skip the CLI, create directly
-```
-
-**Option 3 - Try alternative approach**:
-```
-<command-A>  → fails twice
-<command-B>  ✓ Different tool/method that achieves same goal
-```
-
-**When to use each:**
-- **Documentation**: Learning new APIs, understanding errors, feature discovery
-- **Manual creation**: Config files (build tools, linters, formatters), known templates
-- **Alternative**: When the original tool is deprecated/broken, use modern replacement
-
-## Workflow for Refactoring
-
-**For renaming a symbol** (preferred — safe, atomic):
-1. Use `lsp_rename(path, line, column, new_name)` — renames across the entire workspace in one step
-2. Run `diagnostics` on affected files to confirm
-
-**For structural changes** (moving code, changing signatures, rewriting logic):
-1. Use `codebase_search` or `grep` to find ALL occurrences
-2. Use `read_file` on each file to see the exact code
-3. Use `replace_in_file` on each file to make the change
-4. Use `find_symbol_references(symbol)` or `lsp_find_references` to verify all call sites are updated
-5. Use `grep` to verify no old occurrences remain
-6. **RUN VERIFICATION** (see below)
-
-## VERIFICATION — MANDATORY BEFORE FINISHING
-
-**You are NOT done until you verify your changes are correct. Use ALL available checks.**
-
-### Step 1: Code Intelligence Checks (USE THESE FIRST)
-
-After edits, use the IDE's built-in code intelligence to catch problems before running builds:
-
-- **`diagnostics(path)`** — Get linter/compiler errors for each file you edited. Fast, catches most issues immediately. If fix=True, auto-fixes simple problems.
-- **`find_symbol_references(symbol)`** — After renaming or moving a symbol, check that all call sites are updated. Any broken reference = runtime crash.
-- **`lsp_find_references(path, line, column)`** — Same but position-based, more accurate. Use for complex refactors.
-- **`lsp_hover(path, line, column)`** — Verify types are correct after edits. If hover shows `any` or `unknown`, something is wrong.
-
-**Refactoring verification pattern:**
-1. `diagnostics(path)` on every file you edited
-2. `find_symbol_references(symbol)` on every symbol you renamed, moved, or changed the signature of
-3. Fix any issues found
-4. Then run the build check below
-
-### Step 2: Build/Compile Check
-
-Run the project-level build to catch cross-file issues:
-
-| Project Type       | Verification Command                                    |
-|--------------------|---------------------------------------------------------|
-| Next.js            | `npm run build 2>&1 | tail -50` (catches "use client", SSR issues, imports) |
-| TypeScript (non-Next) | `npx tsc --noEmit 2>&1 | head -50`                 |
-| Python             | `python -m py_compile <file>` or `python -m mypy .`    |
-| Rust               | `cargo check 2>&1 | tail -30`                          |
-| Go                 | `go build ./... 2>&1 | tail -30`                       |
-| General            | `npm test` / `pytest` / `cargo test` (if tests exist)  |
-
-**IMPORTANT for Next.js**: `npx tsc --noEmit` does NOT catch Next.js-specific errors like missing `"use client"`. ALWAYS use `npm run build` for Next.js projects.
-
-**If any check FAILS:**
-1. Read the error output carefully
-2. Fix the issues (e.g. missing imports, wrong types, broken references)
-3. Re-run the checks
-4. Repeat until everything passes
-
-NEVER report "done" with errors still present. Your job is only complete when diagnostics are clean AND the build passes.
-
-REMEMBER: You must CALL the tools. Do not write code blocks showing tool calls — actually invoke them.
-
-## FORMATTING GUIDELINES
-
-When including diagrams in your response:
-- **Mermaid diagrams**: ALWAYS wrap in a fenced code block with the `mermaid` language tag:
-  ```mermaid
-  graph TD
-    A[Start] --> B[End]
-  ```
-  The IDE will render these as interactive diagrams.
-- **Code examples**: Use proper language tags (```python, ```typescript, etc.)
-- **File references**: Use markdown links like `[filename](path/to/file)`"""
+1. **Use tools.** Don't say "I would use X" — call X.
+2. **Read before editing.** Always `read_file` before `replace_in_file`. The `old_str` must match exactly.
+3. **Search smart.** Use `codebase_search` for meaning, `grep` for exact text. Never `execute_command` with grep/find.
+4. **Don't loop.** If a command fails twice, use `lookup_documentation` or try a different approach. Never retry 3+ times.
+5. **Rename safely.** Prefer `lsp_rename` over manual find/replace — it's atomic and cross-file.
+6. **Plan complex tasks.** Use `create_plan` for 3+ step tasks. Call `update_plan` after each step so the user sees progress live.
+7. **Verify your work.** After edits: `diagnostics` on changed files → `find_symbol_references` on changed symbols → build/test command. Not done until checks pass."""
 
 
 
@@ -268,6 +75,8 @@ class AgentState(TypedDict):
     enriched_context: str
     # The question we enriched for (used to detect topic shifts)
     enriched_question: str
+    # Which plan step we last enriched for (0 = no step-specific enrichment)
+    enriched_step: int
     # Attached files from IDE (live file contents)
     attached_files: dict[str, str]  # path -> content
     # ── Plan state (managed by create_plan/update_plan/discard_plan tools) ──
@@ -1068,38 +877,85 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+@traceable(name="step_enrichment", run_type="chain", tags=["enrichment"])
+async def _step_enrichment(workspace_id: str, step_description: str) -> str:
+    """Lightweight supplementary search based on a plan step description.
+    
+    Unlike full pre-enrichment (query decomposition + multi-query + call chains),
+    this is a single focused search — just enough to give the agent context
+    for the current step without the overhead.
+    """
+    try:
+        query_emb = await embeddings.embed_query(step_description)
+        results = await store.vector_search(workspace_id, query_emb, top_k=5)
+        
+        if results:
+            flat_results = [r["symbol"] for r in results]
+            context_text = chat_utils.build_context_from_results(flat_results)
+            if context_text:
+                logger.info("[step_enrichment] Found %d results for step: %s", len(flat_results), step_description[:60])
+                return f"\n\n## Context for Current Step\n\n{context_text}"
+        
+        return ""
+    except Exception as e:
+        logger.warning("[step_enrichment] Failed for step '%s': %s", step_description[:60], e)
+        return ""
+
+
 @traceable(name="enrich_context_node", run_type="chain", tags=["enrichment"])
 async def enrich_context(state: AgentState) -> dict:
     """First node: gather context BEFORE calling the LLM.
     
     Behavior:
-    - First turn: always enrich.
-    - Tool result continuation (mid-task): always skip.
-    - Follow-up question: compare embedding similarity with the question
-      we originally enriched for. If the topic shifted significantly,
-      re-enrich with the new question so the agent has fresh context.
+    - First turn: full enrichment (query decomposition + multi-query search).
+    - Tool result continuation: check if plan step changed — if so, do a
+      lightweight supplementary search for the new step's context.
+    - Follow-up question: check embedding similarity — re-enrich if topic shifted.
     """
     workspace_id = state['workspace_id']
     attached_files = state.get('attached_files', {})
     existing_context = state.get('enriched_context', '')
     enriched_question = state.get('enriched_question', '')
+    enriched_step = state.get('enriched_step', 0)
+    plan_steps = state.get('plan_steps', [])
+    current_step = state.get('current_step', 0)
     
-    # ── Tool result continuation: ALWAYS skip (agent is mid-task) ──
+    # ── Tool result continuation: check for plan step change ──
     if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
-        logger.info("[enrich_context] Skipping - ToolMessage continuation")
+        # If plan step advanced since last enrichment, supplement the context
+        if (plan_steps and current_step > 0 
+                and current_step != enriched_step 
+                and current_step <= len(plan_steps)):
+            step_desc = plan_steps[current_step - 1]["description"]
+            logger.info("[enrich_context] Plan step changed (%d → %d): %s — supplementing context",
+                       enriched_step, current_step, step_desc[:80])
+            
+            supplement = await _step_enrichment(workspace_id, step_desc)
+            if supplement:
+                # Append to existing context (don't replace — original context is still useful)
+                updated_context = existing_context + supplement
+                # Cap total context to avoid bloat across many steps
+                if len(updated_context) > 100_000:
+                    updated_context = updated_context[:100_000]
+                return {"enriched_context": updated_context, "enriched_step": current_step}
+            else:
+                # No new results, just mark the step as enriched
+                return {"enriched_step": current_step}
+        
+        logger.info("[enrich_context] Skipping - ToolMessage continuation (same step)")
         return {}
     
     question = _get_last_question(state)
     if not question:
         logger.warning("[enrich_context] No question found in messages")
-        return {"enriched_context": "", "enriched_question": ""}
+        return {"enriched_context": "", "enriched_question": "", "enriched_step": 0}
     
-    # ── First turn: always enrich ──
+    # ── First turn: full enrichment ──
     if not existing_context:
         logger.info("[enrich_context] First turn — enriching for: %s", question[:100])
         context = await build_pre_enrichment(workspace_id, question, attached_files)
         logger.info("[enrich_context] Built context with %d chars", len(context))
-        return {"enriched_context": context, "enriched_question": question}
+        return {"enriched_context": context, "enriched_question": question, "enriched_step": current_step}
     
     # ── Follow-up question: check for topic shift ──
     if enriched_question and question != enriched_question:
@@ -1114,7 +970,7 @@ async def enrich_context(state: AgentState) -> dict:
                            similarity, TOPIC_SHIFT_THRESHOLD)
                 context = await build_pre_enrichment(workspace_id, question, attached_files)
                 logger.info("[enrich_context] Re-enriched with %d chars", len(context))
-                return {"enriched_context": context, "enriched_question": question}
+                return {"enriched_context": context, "enriched_question": question, "enriched_step": 0}
             else:
                 logger.info("[enrich_context] Same topic (%.3f) — keeping existing context", similarity)
         except Exception as e:
@@ -1237,6 +1093,94 @@ async def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     return result
 
 
+# ── Self-Reflection (Stuck Detection) ─────────────────────────────
+
+REFLECT_PROMPT = """## STOP AND REFLECT
+
+You appear to be stuck. Before continuing, step back and think:
+
+1. **What have you tried so far?** Look at the recent tool results above.
+2. **Why isn't it working?** Identify the root cause, not just the symptoms.
+3. **What should you do differently?** Consider:
+   - Is the approach fundamentally wrong? (e.g., wrong file, wrong API, wrong assumption)
+   - Are you missing a dependency or setup step?
+   - Should you use `lookup_documentation` to check the correct API?
+   - Should you `discard_plan` and try a completely different approach?
+   - Should you ask the user for clarification?
+
+**Do NOT retry the same failing approach.** Change strategy."""
+
+
+def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep], current_step: int) -> str | None:
+    """Scan recent conversation history for signs the agent is stuck.
+    
+    Returns a reflection prompt string if stuck, None otherwise.
+    
+    Detects:
+    - Repeated errors (2+ consecutive tool failures)
+    - Same tool called with same args (loop)
+    - Plan step stuck for too many turns (3+ AI messages on same step)
+    """
+    if len(messages) < 4:
+        return None  # Too early to judge
+    
+    # ── Collect recent AI messages and tool results ──
+    recent_ai_calls: list[dict] = []  # [{name, args_key}]
+    consecutive_errors = 0
+    turns_on_current_step = 0
+    
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            content_lower = (msg.content or "").lower()
+            has_error = any(sig in content_lower for sig in (
+                "error", "failed", "traceback", "exception",
+                "command failed", "no such file", "permission denied",
+            ))
+            if has_error:
+                consecutive_errors += 1
+            else:
+                consecutive_errors = 0  # Reset on success
+                
+        elif isinstance(msg, AIMessage):
+            turns_on_current_step += 1
+            
+            # Track tool calls for loop detection
+            for tc in (msg.tool_calls or []):
+                # Create a hashable key from tool name + sorted args
+                args_key = tc["name"] + ":" + json.dumps(tc.get("args", {}), sort_keys=True)[:200]
+                recent_ai_calls.append({"name": tc["name"], "args_key": args_key})
+            
+            # Only look back ~8 turns
+            if turns_on_current_step > 8:
+                break
+        
+        elif isinstance(msg, HumanMessage):
+            break  # Stop at the last user message
+    
+    # ── Check: 2+ consecutive errors ──
+    if consecutive_errors >= 2:
+        logger.warning("[reflect] STUCK: %d consecutive tool errors", consecutive_errors)
+        return REFLECT_PROMPT + f"\n\n**Detected: {consecutive_errors} consecutive tool errors.** The current approach is failing repeatedly."
+    
+    # ── Check: same tool+args called twice (loop) ──
+    if len(recent_ai_calls) >= 2:
+        seen_calls = set()
+        for call in recent_ai_calls:
+            if call["args_key"] in seen_calls:
+                logger.warning("[reflect] STUCK: duplicate tool call detected: %s", call["name"])
+                return REFLECT_PROMPT + f"\n\n**Detected: you called `{call['name']}` with the same arguments twice.** This is a loop. Try a different approach."
+            seen_calls.add(call["args_key"])
+    
+    # ── Check: plan step stuck for 4+ AI turns ──
+    if plan_steps and current_step > 0 and turns_on_current_step >= 4:
+        step_desc = plan_steps[current_step - 1]["description"] if current_step <= len(plan_steps) else "?"
+        logger.warning("[reflect] STUCK: step %d ('%s') has been in progress for %d turns", 
+                      current_step, step_desc, turns_on_current_step)
+        return REFLECT_PROMPT + f"\n\n**Detected: step {current_step} ('{step_desc}') has been in progress for {turns_on_current_step} turns.** Either break it into smaller steps, mark it failed, or try a different approach."
+    
+    return None
+
+
 # ── Multi-Model Routing ───────────────────────────────────────────
 #
 # Strategy: use the best model for each phase of the agent loop.
@@ -1254,7 +1198,7 @@ async def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 # Just set the model string: "groq/kimi-k2", "gemini/gemini-2.0-flash", etc.
 
 
-def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0) -> str:
+def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0, is_reflecting: bool = False) -> str:
     """Pick model string based on what the agent needs to do RIGHT NOW.
     
     Reasoning model (stronger, slower) for moments that need deep thinking:
@@ -1268,6 +1212,11 @@ def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = N
       - Continuing plan execution on routine steps
     """
     config = llm_provider.get_config()
+    
+    # Reflection mode: always use reasoning (agent is stuck, needs to think)
+    if is_reflecting:
+        logger.info("[model_routing] → reasoning (reflection mode)")
+        return config.reasoning_model
     
     # No tool messages at all → first call, always use reasoning
     has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
@@ -1354,6 +1303,12 @@ async def call_model(state: AgentState) -> dict:
     else:
         logger.warning("[call_model] No enriched context to add!")
     
+    # ── Self-reflection: detect if the agent is stuck ────────
+    reflection = _detect_stuck_signals(state['messages'], plan_steps, current_step)
+    if reflection:
+        messages_to_send.append(SystemMessage(content=reflection))
+        logger.info("[call_model] Injected reflection prompt (agent appears stuck)")
+    
     # Add conversation history (with truncation)
     history = await _truncate_messages(state['messages'])
     messages_to_send.extend(history)
@@ -1361,7 +1316,8 @@ async def call_model(state: AgentState) -> dict:
     total_chars = sum(len(m.content) for m in messages_to_send)
     
     # Pick model based on what the agent needs to do right now
-    model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step)
+    # Reflection forces reasoning model — the agent needs to think its way out
+    model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step, is_reflecting=bool(reflection))
     logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
     
     model = llm_provider.get_chat_model(model_name, temperature=0.1)
