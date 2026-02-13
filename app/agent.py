@@ -1605,11 +1605,44 @@ async def call_model(state: AgentState) -> dict:
     and current step instructions into the system prompt.
     """
     enriched_context = state.get('enriched_context', '')
-    plan_steps = state.get('plan_steps', [])
+    plan_steps = list(state.get('plan_steps', []))  # Make mutable copy
     current_step = state.get('current_step', 0)
     
     logger.info("[call_model] enriched_context=%d chars, plan_steps=%d, current_step=%d",
                 len(enriched_context), len(plan_steps), current_step)
+    
+    # ── AUTO-SKIP: Force skip step after 8+ turns stuck ────────────
+    if plan_steps and current_step > 0:
+        turns_on_step = 0
+        for msg in reversed(state['messages']):
+            if isinstance(msg, AIMessage) and not msg.tool_calls:
+                # Text response - count it
+                turns_on_step += 1
+            elif isinstance(msg, AIMessage) and msg.tool_calls:
+                turns_on_step += 1
+                # Check if any tool is update_plan to advance step - that breaks the count
+                if any(tc['name'] == 'update_plan' for tc in msg.tool_calls):
+                    break
+            if turns_on_step >= 20:  # Don't scan too far back
+                break
+        
+        if turns_on_step >= 8 and current_step <= len(plan_steps):
+            step_desc = plan_steps[current_step - 1].get("description", "?")
+            logger.warning("[call_model] AUTO-SKIP: step %d stuck for %d turns, forcing skip", 
+                          current_step, turns_on_step)
+            
+            # Mark step as failed and advance
+            plan_steps[current_step - 1]["status"] = "failed"
+            current_step += 1
+            
+            # Return early with a synthetic AI message explaining the skip
+            skip_msg = f"⚠️ **Auto-skipped step {current_step - 1}** ('{step_desc}') after {turns_on_step} attempts without progress. Moving to the next step. The skipped step may need manual intervention later."
+            
+            return {
+                "messages": [AIMessage(content=skip_msg)],
+                "plan_steps": plan_steps,
+                "current_step": current_step,
+            }
     
     # Build messages with system prompt and context
     messages_to_send = []
