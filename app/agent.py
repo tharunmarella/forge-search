@@ -30,7 +30,6 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
-from langsmith import traceable
 
 from . import store, embeddings, chat as chat_utils
 from . import llm as llm_provider
@@ -614,7 +613,6 @@ def _extract_file_hints(attached_files: dict[str, str] | None) -> str:
     return "\n".join(hints)
 
 
-@traceable(name="decompose_query", run_type="chain", tags=["enrichment", "llm"])
 async def _decompose_query(question: str, attached_files: dict[str, str] | None = None) -> tuple[list[str], list[str]]:
     """Use the tool model to decompose a user question into focused search queries + symbols.
     
@@ -721,7 +719,6 @@ Format as a concise profile. Keep it under 400 words. Start warnings with "WARNI
 Respond with ONLY the profile text, no JSON wrapping."""
 
 
-@traceable(name="build_project_profile", run_type="chain", tags=["profile"])
 async def build_project_profile(attached_files: dict[str, str] | None = None) -> str:
     """Build a project profile from config files.
     
@@ -783,7 +780,6 @@ async def build_project_profile(attached_files: dict[str, str] | None = None) ->
 
 # ── Pre-Enrichment Logic ──────────────────────────────────────────
 
-@traceable(name="pre_enrichment", run_type="chain", tags=["enrichment"])
 async def build_pre_enrichment(
     workspace_id: str,
     question: str,
@@ -893,7 +889,6 @@ def format_plan_for_prompt(steps: list[PlanStep], current_step: int) -> str:
 
 # ── Documentation Lookup (Context7 + DevDocs.io) ──────────────────
 
-@traceable(name="fetch_documentation", run_type="tool", tags=["documentation"])
 async def _fetch_documentation(library: str, query: str) -> str:
     """
     Fetch documentation from Context7 and DevDocs.io.
@@ -926,7 +921,6 @@ async def _fetch_documentation(library: str, query: str) -> str:
         return f"No documentation found for '{library}' with query '{query}'. Try a different library name or query."
 
 
-@traceable(name="query_context7", run_type="retriever", tags=["documentation", "context7"])
 async def _query_context7(library: str, query: str) -> str:
     """Query Context7 MCP API for library documentation."""
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1005,7 +999,6 @@ async def _query_context7(library: str, query: str) -> str:
         return ""
 
 
-@traceable(name="query_devdocs", run_type="retriever", tags=["documentation", "devdocs"])
 async def _query_devdocs(library: str, query: str) -> str:
     """Query DevDocs.io API for documentation."""
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1171,7 +1164,6 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-@traceable(name="step_enrichment", run_type="chain", tags=["enrichment"])
 async def _step_enrichment(workspace_id: str, step_description: str) -> str:
     """Lightweight supplementary search based on a plan step description.
     
@@ -1196,7 +1188,6 @@ async def _step_enrichment(workspace_id: str, step_description: str) -> str:
         return ""
 
 
-@traceable(name="enrich_context_node", run_type="chain", tags=["enrichment"])
 async def enrich_context(state: AgentState) -> dict:
     """First node: gather context BEFORE calling the LLM.
     
@@ -1633,7 +1624,6 @@ def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = N
     return config.tool_model
 
 
-@traceable(name="call_model_node", run_type="chain", tags=["llm"])
 async def call_model(state: AgentState) -> dict:
     """The 'Brain' node - LLM reasoning with full context.
     
@@ -1984,7 +1974,6 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     return {"messages": [response]}
 
 
-@traceable(name="execute_server_tools", run_type="chain", tags=["server-tools"])
 async def execute_server_tools(state: AgentState) -> dict:
     """Execute tools that run on the server (search, trace, impact, plan management)."""
     workspace_id = state['workspace_id']

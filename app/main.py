@@ -26,6 +26,7 @@ LLM Model Management:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import os
 import time
@@ -37,16 +38,9 @@ load_dotenv()  # Load .env file for local dev (no-op if missing)
 from fastapi.responses import StreamingResponse
 import json
 
-# ── LangSmith Tracing ─────────────────────────────────────────────
-# LangGraph/LangChain auto-traces when these env vars are set:
-#   LANGSMITH_TRACING=true
-#   LANGSMITH_API_KEY=lsv2_pt_...
-#   LANGSMITH_PROJECT=forgeIDE  (optional, defaults to "default")
-#
-# We enhance the auto-tracing with:
-#   - run_name per conversation turn (e.g., "forge-chat:turn-1")
-#   - metadata (workspace, user, conversation_id, turn number)
-#   - tags (workspace, continuation/new, user)
+# ── MongoDB Tracing ──────────────────────────────────────────────
+# All traces (requests, responses, execution details) are logged to MongoDB
+# for analytics, debugging, and replay.
 #   - @traceable on sub-functions (pre-enrichment, doc lookup, server tools)
 
 from fastapi import FastAPI, HTTPException, Depends
@@ -76,35 +70,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Observability: LangSmith + Langfuse ──────────────────────────
-# LangSmith
-_langsmith_enabled = os.getenv("LANGSMITH_TRACING", "").lower() == "true"
-_langsmith_project = os.getenv("LANGSMITH_PROJECT", "default")
-if _langsmith_enabled:
-    logger.info(f"LangSmith tracing ENABLED for project: {_langsmith_project}")
-else:
-    logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable)")
+# ── MongoDB Trace Store ───────────────────────────────────────────
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# Langfuse (runs alongside LangSmith)
-_langfuse_enabled = all([
-    os.getenv("LANGFUSE_PUBLIC_KEY"),
-    os.getenv("LANGFUSE_SECRET_KEY"),
-])
-if _langfuse_enabled:
+_mongo_url = os.getenv("MONGODB_URL", "")
+if _mongo_url:
     try:
-        from langfuse import Langfuse
-        from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
-        langfuse_client = Langfuse()
-        langfuse_handler = LangfuseCallbackHandler()
-        logger.info(f"Langfuse tracing ENABLED (base_url: {os.getenv('LANGFUSE_BASE_URL', 'default')})")
+        mongo_client = AsyncIOMotorClient(_mongo_url)
+        mongo_db = mongo_client["forge_traces"]
+        traces_collection = mongo_db["traces"]
+        logger.info(f"MongoDB tracing ENABLED (database: forge_traces)")
     except Exception as e:
-        logger.warning(f"Langfuse init failed: {e}")
-        langfuse_client = None
-        langfuse_handler = None
+        logger.error(f"MongoDB init failed: {e}")
+        mongo_client = None
+        traces_collection = None
 else:
-    langfuse_client = None
-    langfuse_handler = None
-    logger.info("Langfuse tracing disabled (set LANGFUSE_PUBLIC_KEY/SECRET_KEY to enable)")
+    mongo_client = None
+    traces_collection = None
+    logger.info("MongoDB tracing disabled (set MONGODB_URL to enable)")
 
 
 # ── Conversation state store (Redis-backed) ───────────────────────
@@ -122,6 +105,38 @@ from collections import OrderedDict
 # When IDE initiates OAuth with state=poll-{session_id}, the callback
 # stores the token here. IDE polls GET /auth/poll/{session_id}.
 _pending_auth: dict[str, dict] = {}  # session_id -> {token, user_info, expires}
+
+
+async def _log_trace_to_mongo(
+    thread_id: str,
+    workspace_id: str,
+    user_email: str,
+    request_data: dict,
+    response_data: dict,
+    execution_time_ms: float,
+    status: str,
+    error: str = None,
+):
+    """Log a complete trace (request + response) to MongoDB."""
+    if traces_collection is None:
+        return
+    
+    try:
+        trace_doc = {
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+            "user_email": user_email,
+            "timestamp": datetime.datetime.utcnow(),
+            "request": request_data,
+            "response": response_data,
+            "execution_time_ms": execution_time_ms,
+            "status": status,
+            "error": error,
+        }
+        await traces_collection.insert_one(trace_doc)
+        logger.info(f"[mongo_trace] Logged trace for thread={thread_id}, time={execution_time_ms:.1f}ms, status={status}")
+    except Exception as e:
+        logger.error(f"[mongo_trace] Failed to log trace: {e}")
 
 
 def _serialize_messages(messages: list) -> list[dict]:
@@ -1112,14 +1127,6 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         logger.info("[chat] Invoking agent for workspace=%s conv=%s with %d messages (tool_cont=%s, stored=%s, enriched=%d chars)", 
                    req.workspace_id, conv_id, len(messages), has_tool_results, bool(stored), len(enriched_context))
         
-        # Prepare config with callbacks
-        config = {}
-        if langfuse_handler:
-            config["callbacks"] = [langfuse_handler]
-            logger.info("[chat] Langfuse callback added to config")
-        else:
-            logger.warning("[chat] Langfuse handler is None, not adding callback")
-        
         result = await agent.forge_agent.ainvoke(
             {
                 "messages": messages, 
@@ -1238,10 +1245,27 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 for s in result_plan_steps
             ]
         
-        # Flush Langfuse traces (they're batched/async by default)
-        if langfuse_client:
-            langfuse_client.flush()
-            logger.info("[chat] Flushed Langfuse traces")
+        # Log trace to MongoDB
+        await _log_trace_to_mongo(
+            thread_id=conv_id,
+            workspace_id=req.workspace_id,
+            user_email=user.get("email", "unknown"),
+            request_data={
+                "question": req.question,
+                "tool_results": req.tool_results,
+                "attached_files": len(attached_files_dict),
+                "attached_images": len(attached_images_list),
+            },
+            response_data={
+                "answer": answer,
+                "tool_calls": tool_calls,
+                "plan_steps": [dict(s) for s in result_plan_steps] if result_plan_steps else None,
+                "current_step": result_current_step,
+                "message_count": len(final_messages),
+            },
+            execution_time_ms=elapsed,
+            status=status,
+        )
         
         return ChatResponse(
             answer=answer,
@@ -1254,9 +1278,21 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         )
 
     except Exception as e:
-        # Flush Langfuse even on error
-        if langfuse_client:
-            langfuse_client.flush()
+        # Log error trace to MongoDB
+        error_msg = str(e)[:500]
+        await _log_trace_to_mongo(
+            thread_id=conv_id,
+            workspace_id=req.workspace_id,
+            user_email=user.get("email", "unknown"),
+            request_data={
+                "question": req.question,
+                "tool_results": req.tool_results,
+            },
+            response_data={},
+            execution_time_ms=(time.monotonic() - t0) * 1000,
+            status="error",
+            error=error_msg,
+        )
         logger.error("Agent execution failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)[:200]}")
 
@@ -1392,14 +1428,6 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             # For now, emit a thinking event at start
             yield f"event: thinking\ndata: {json.dumps({'step_type': 'start', 'message': 'Processing request...', 'detail': ''})}\n\n"
             
-            # Prepare config with callbacks
-            config = {}
-            if langfuse_handler:
-                config["callbacks"] = [langfuse_handler]
-                logger.info("[chat/stream] Langfuse callback added to config")
-            else:
-                logger.warning("[chat/stream] Langfuse handler is None, not adding callback")
-            
             result = await agent.forge_agent.ainvoke(
                 {
                     "messages": messages,
@@ -1482,17 +1510,39 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             
             elapsed = (time.monotonic() - t0) * 1000
             
-            # Flush Langfuse traces before completing
-            if langfuse_client:
-                langfuse_client.flush()
-                logger.info("[chat/stream] Flushed Langfuse traces")
+            # Log trace to MongoDB
+            await _log_trace_to_mongo(
+                thread_id=conv_id,
+                workspace_id=req.workspace_id,
+                user_email="stream-user",  # SSE endpoint doesn't have user auth in this flow
+                request_data={
+                    "question": req.question,
+                    "tool_results": req.tool_results,
+                },
+                response_data={
+                    "answer": answer,
+                    "plan_steps": [dict(s) for s in result_plan_steps] if result_plan_steps else None,
+                    "current_step": result_current_step,
+                },
+                execution_time_ms=elapsed,
+                status="done",
+            )
             
             yield f"event: done\ndata: {json.dumps({'answer': answer, 'total_time_ms': round(elapsed, 1)})}\n\n"
             
         except Exception as e:
-            # Flush Langfuse even on error
-            if langfuse_client:
-                langfuse_client.flush()
+            # Log error trace to MongoDB
+            error_msg = str(e)[:500]
+            await _log_trace_to_mongo(
+                thread_id=conv_id,
+                workspace_id=req.workspace_id,
+                user_email="stream-user",
+                request_data={"question": req.question},
+                response_data={},
+                execution_time_ms=(time.monotonic() - t0) * 1000,
+                status="error",
+                error=error_msg,
+            )
             logger.error("Streaming agent execution failed: %s", e, exc_info=True)
             yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
     
