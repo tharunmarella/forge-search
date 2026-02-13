@@ -205,8 +205,7 @@ class ChatResponse(BaseModel):
     model: str = ""
     tokens: int = 0
     total_time_ms: float = 0
-    # ── Task decomposition ────────────────────────────────────
-    task_complexity: str | None = None  # "simple" or "complex"
+    # ── Plan state (managed by create_plan/update_plan tools) ──
     plan_steps: list[PlanStepResponse] | None = None
     current_step: int | None = None
 

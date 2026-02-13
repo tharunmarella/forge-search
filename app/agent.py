@@ -12,9 +12,11 @@ The flow:
      - Impact analysis if editing
      - Attached file contents from IDE
   3. Build a "perfect prompt" with all this context
-  4. LLM just needs to reason + execute with full context
-  5. For IDE tools (file ops), pause and return to IDE for execution
-  6. Agent can use lookup_documentation tool for library docs on-demand
+  4. LLM reasons + executes with full context and tools
+  5. For complex tasks, agent uses create_plan/update_plan tools
+     to manage a structured plan (shown live in the IDE)
+  6. For IDE tools (file ops), pause and return to IDE for execution
+  7. Agent can use lookup_documentation tool for library docs on-demand
 """
 
 from typing import Annotated, TypedDict, Literal
@@ -102,6 +104,18 @@ SYSTEM_PROMPT = """You are an expert senior software engineer working inside For
 - `lsp_hover(path, line, column)`: Get type info and docs for a symbol.
 - `lsp_rename(path, line, column, new_name)`: Safe rename across the workspace.
 
+### Planning Tools
+- `create_plan(steps)`: Create an execution plan. The user sees it in the IDE with live status. **Use for tasks involving 3+ steps across multiple files** (refactoring, new features, migrations). Do NOT create plans for simple questions or single-file edits.
+- `update_plan(step_number, status)`: Mark a step as "done", "in_progress", or "failed". **Call this every time you finish a step** so the user can track progress.
+- `discard_plan()`: Remove the plan if your approach changes or the task is simpler than expected.
+
+**Planning rules:**
+- Create a plan BEFORE starting work on complex tasks
+- Keep plans to 3-8 concrete steps
+- Always include a verification step at the end
+- Call `update_plan` to mark each step done — the user watches your progress live
+- Do NOT create plans for: questions, explanations, single-file reads, quick edits
+
 ## SEARCH RULES — CRITICAL
 
 **NEVER use `execute_command` with `grep` or `find` for searching code.**
@@ -167,17 +181,40 @@ write_to_file("<config-file>", <standard-template>)  ✓ Skip the CLI, create di
 
 ## Workflow for Refactoring
 
+**For renaming a symbol** (preferred — safe, atomic):
+1. Use `lsp_rename(path, line, column, new_name)` — renames across the entire workspace in one step
+2. Run `diagnostics` on affected files to confirm
+
+**For structural changes** (moving code, changing signatures, rewriting logic):
 1. Use `codebase_search` or `grep` to find ALL occurrences
-2. Use `read_file` on each file to see the exact code around each occurrence
+2. Use `read_file` on each file to see the exact code
 3. Use `replace_in_file` on each file to make the change
-4. Use `grep` to verify no occurrences remain
-5. **RUN VERIFICATION** (see below)
+4. Use `find_symbol_references(symbol)` or `lsp_find_references` to verify all call sites are updated
+5. Use `grep` to verify no old occurrences remain
+6. **RUN VERIFICATION** (see below)
 
 ## VERIFICATION — MANDATORY BEFORE FINISHING
 
-**You are NOT done until you verify your changes compile and pass checks.**
+**You are NOT done until you verify your changes are correct. Use ALL available checks.**
 
-After making ALL edits, you MUST run a verification step using `execute_command`. Pick the right check based on the project:
+### Step 1: Code Intelligence Checks (USE THESE FIRST)
+
+After edits, use the IDE's built-in code intelligence to catch problems before running builds:
+
+- **`diagnostics(path)`** — Get linter/compiler errors for each file you edited. Fast, catches most issues immediately. If fix=True, auto-fixes simple problems.
+- **`find_symbol_references(symbol)`** — After renaming or moving a symbol, check that all call sites are updated. Any broken reference = runtime crash.
+- **`lsp_find_references(path, line, column)`** — Same but position-based, more accurate. Use for complex refactors.
+- **`lsp_hover(path, line, column)`** — Verify types are correct after edits. If hover shows `any` or `unknown`, something is wrong.
+
+**Refactoring verification pattern:**
+1. `diagnostics(path)` on every file you edited
+2. `find_symbol_references(symbol)` on every symbol you renamed, moved, or changed the signature of
+3. Fix any issues found
+4. Then run the build check below
+
+### Step 2: Build/Compile Check
+
+Run the project-level build to catch cross-file issues:
 
 | Project Type       | Verification Command                                    |
 |--------------------|---------------------------------------------------------|
@@ -190,19 +227,13 @@ After making ALL edits, you MUST run a verification step using `execute_command`
 
 **IMPORTANT for Next.js**: `npx tsc --noEmit` does NOT catch Next.js-specific errors like missing `"use client"`. ALWAYS use `npm run build` for Next.js projects.
 
-**If the check FAILS:**
+**If any check FAILS:**
 1. Read the error output carefully
-2. Fix the issues (e.g. missing imports, wrong types, missing "use client" for React hooks in Next.js App Router)
-3. Re-run the verification
-4. Repeat until it passes
+2. Fix the issues (e.g. missing imports, wrong types, broken references)
+3. Re-run the checks
+4. Repeat until everything passes
 
-**Common gotchas to check for:**
-- Next.js App Router: Components using React hooks (useState, useEffect, etc.) MUST have `"use client"` at the top
-- TypeScript: Missing type imports, wrong return types
-- Python: Missing imports, indentation errors
-- Rust: Borrow checker errors, missing trait implementations
-
-NEVER report "done" with errors still present. Your job is only complete when the code compiles cleanly.
+NEVER report "done" with errors still present. Your job is only complete when diagnostics are clean AND the build passes.
 
 REMEMBER: You must CALL the tools. Do not write code blocks showing tool calls — actually invoke them.
 
@@ -218,50 +249,6 @@ When including diagrams in your response:
 - **Code examples**: Use proper language tags (```python, ```typescript, etc.)
 - **File references**: Use markdown links like `[filename](path/to/file)`"""
 
-# Supplementary prompt injected for complex tasks that require a plan
-PLANNING_PROMPT = """## PLANNING MODE — REQUIRED
-
-This is a complex task that requires careful planning before execution.
-
-**You MUST produce a structured plan BEFORE making any file changes.**
-
-Output your plan as a numbered list under a `## Plan` heading. Each step should be:
-- Concrete and actionable (not vague like "understand the code")
-- Scoped to a single logical unit of work
-- Ordered by dependency (do prerequisite steps first)
-
-Example format:
-
-## Plan
-1. Read auth/session.py to understand current session handling
-2. Create auth/jwt.py with JWT token generation and validation utilities
-3. Update auth/login.py to return JWT tokens instead of session cookies
-4. Update middleware/auth.py to validate JWT from Authorization header
-5. Remove session-related code from auth/session.py
-6. Update tests in tests/test_auth.py for the new JWT flow
-7. Run `pytest tests/test_auth.py` and fix any failures
-
-**Rules:**
-- Aim for 3-8 steps (more for large tasks, fewer for smaller ones)
-- Include a verification step at the end (run tests, type-check, build)
-- Do NOT start executing tools yet — just output the plan
-- After the plan, STOP and wait for confirmation to proceed
-
-Once you have a plan, you will execute it step by step."""
-
-# Prompt injected when executing with an active plan
-PLAN_EXECUTION_PROMPT = """## PLAN EXECUTION MODE
-
-You have a plan and you're executing it step by step.
-
-{plan_display}
-
-**Instructions:**
-- Focus ONLY on the current step. Do NOT jump ahead.
-- Use tools to complete the current step.
-- When the current step is done, state "Step {current_step} complete" clearly.
-- If a step fails, explain why and attempt to fix it before moving on.
-- After ALL steps are done, run the verification step and report the final result."""
 
 
 # ── State Definition ──────────────────────────────────────────────
@@ -279,17 +266,14 @@ class AgentState(TypedDict):
     workspace_id: str
     # Pre-enriched context (set by first node)
     enriched_context: str
+    # The question we enriched for (used to detect topic shifts)
+    enriched_question: str
     # Attached files from IDE (live file contents)
     attached_files: dict[str, str]  # path -> content
-    # ── Task decomposition ────────────────────────────────────
-    # Complexity: "simple" (Q&A, explain) or "complex" (multi-file, refactor, feature)
-    task_complexity: str
-    # Structured plan for complex tasks (empty for simple)
+    # ── Plan state (managed by create_plan/update_plan/discard_plan tools) ──
     plan_steps: list[PlanStep]
     # 1-indexed step the agent is currently executing (0 = no plan)
     current_step: int
-    # Whether the planning phase has completed
-    plan_complete: bool
 
 
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
@@ -339,6 +323,57 @@ async def lookup_documentation(library: str, query: str) -> str:
     
     Returns:
         Relevant documentation snippets from official sources.
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+# ── Plan Management Tools (Cloud-side) ────────────────────────────
+# These let the agent create and manage its own execution plan.
+# The IDE shows the plan with live status updates (checkmarks, etc.).
+
+@tool
+async def create_plan(steps: list[str]) -> str:
+    """
+    Create an execution plan for a complex task.
+    Use this BEFORE starting work on tasks that involve multiple files,
+    refactoring, new features, or anything requiring 3+ coordinated steps.
+    
+    Args:
+        steps: List of step descriptions in execution order.
+               Each step should be a concrete, actionable item.
+    
+    Example:
+        create_plan([
+            "Read auth/session.py to understand current session handling",
+            "Create auth/jwt.py with JWT token generation and validation",
+            "Update auth/login.py to return JWT tokens",
+            "Update middleware to validate JWT from Authorization header",
+            "Run tests and fix any failures"
+        ])
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+@tool
+async def update_plan(step_number: int, status: str, new_description: str = "") -> str:
+    """
+    Update a plan step's status or description.
+    Call this as you complete each step so the user can see your progress.
+    
+    Args:
+        step_number: Which step to update (1-indexed).
+        status: New status — one of: "done", "in_progress", "failed", "pending".
+        new_description: Optional new description (leave empty to keep current).
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+@tool
+async def discard_plan() -> str:
+    """
+    Discard the current plan entirely.
+    Use when the approach needs to change fundamentally, or the task
+    turned out to be simpler than expected and doesn't need a plan.
     """
     return "PENDING_SERVER_EXECUTION"
 
@@ -519,7 +554,8 @@ def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
 
 
 # Tool lists
-SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation]
+PLAN_TOOLS = [create_plan, update_plan, discard_plan]
+SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation] + PLAN_TOOLS
 IDE_FILE_TOOLS = [read_file, write_to_file, replace_in_file, delete_file, apply_patch, list_files, glob]
 IDE_EXEC_TOOLS = [execute_command, execute_background, read_process_output, check_process_status, kill_process]
 IDE_PORT_TOOLS = [wait_for_port, check_port, kill_port]
@@ -543,7 +579,103 @@ IDE_TOOL_NAMES = {
     # LSP
     "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
 }
-SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"}
+PLAN_TOOL_NAMES = {"create_plan", "update_plan", "discard_plan"}
+SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"} | PLAN_TOOL_NAMES
+
+
+# ── Query Decomposition ───────────────────────────────────────────
+
+DECOMPOSE_PROMPT = """You are a code search query optimizer. Given a user's question about a codebase, extract:
+
+1. **search_queries**: 2-4 short, focused search queries optimized for finding relevant code in a semantic code index. Each query should target a different aspect (e.g., one for the module, one for the feature, one for the pattern). Think "what would the function signatures and class names look like?" not "what is the user asking?".
+
+2. **symbols**: 0-3 exact code symbol names (function names, class names, variable names) mentioned or implied. Only real identifiers, not English words.
+
+If the user's open files are provided, use the imports, function names, and class names you see there to make your queries and symbols more precise. Prefer real symbol names from the files over guesses.
+
+Respond with ONLY valid JSON:
+{"search_queries": ["query1", "query2", ...], "symbols": ["SymbolName", "func_name", ...]}
+
+Examples:
+- "refactor auth to use JWT" → {"search_queries": ["authentication login session handler", "JWT token verification", "user auth middleware"], "symbols": []}
+- "fix the bug in UserService.get_profile" → {"search_queries": ["UserService get_profile method", "user profile data fetch"], "symbols": ["UserService", "get_profile"]}
+- "how does the payment flow work?" → {"search_queries": ["payment processing checkout", "payment gateway integration", "order payment status"], "symbols": []}
+- "update the create_order function to validate inventory" → {"search_queries": ["create_order function implementation", "inventory validation stock check"], "symbols": ["create_order"]}"""
+
+
+def _extract_file_hints(attached_files: dict[str, str] | None) -> str:
+    """Extract useful hints from attached files to improve query decomposition.
+    
+    Pulls out: import statements, function/class definitions, and file paths.
+    This tells the decomposer what symbols actually exist in the codebase.
+    """
+    if not attached_files:
+        return ""
+    
+    hints = []
+    for path, content in list(attached_files.items())[:3]:  # Limit to 3 files
+        file_hints = [f"File: {path}"]
+        
+        for line in content.split("\n")[:100]:  # Scan first 100 lines
+            stripped = line.strip()
+            # Imports (Python, JS/TS, Rust, Go)
+            if stripped.startswith(("import ", "from ", "use ", "require(", "const ", "export ")):
+                file_hints.append(f"  {stripped[:120]}")
+            # Function/class/struct definitions
+            elif stripped.startswith(("def ", "class ", "async def ", "fn ", "func ", "function ", "struct ", "interface ", "type ")):
+                file_hints.append(f"  {stripped[:120]}")
+        
+        if len(file_hints) > 1:  # More than just the filename
+            hints.append("\n".join(file_hints[:15]))  # Cap per file
+    
+    return "\n".join(hints)
+
+
+@traceable(name="decompose_query", run_type="chain", tags=["enrichment", "llm"])
+async def _decompose_query(question: str, attached_files: dict[str, str] | None = None) -> tuple[list[str], list[str]]:
+    """Use the tool model to decompose a user question into focused search queries + symbols.
+    
+    If attached files are provided, extracts imports/definitions from them
+    so the LLM knows what symbols actually exist in the codebase.
+    
+    Returns (search_queries, symbols). Falls back to the raw question on failure.
+    """
+    model = llm_provider.get_tool_model(temperature=0.0)
+    
+    # Build the user message with file context if available
+    user_content = question
+    file_hints = _extract_file_hints(attached_files)
+    if file_hints:
+        user_content = f"{question}\n\n--- User's open files (for reference) ---\n{file_hints}"
+    
+    try:
+        response = await model.ainvoke([
+            SystemMessage(content=DECOMPOSE_PROMPT),
+            HumanMessage(content=user_content),
+        ])
+        
+        text = response.content.strip()
+        # Handle models that wrap JSON in markdown code blocks
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        
+        result = json.loads(text)
+        queries = result.get("search_queries", [question])
+        symbols = result.get("symbols", [])
+        
+        # Validate
+        queries = [q for q in queries if isinstance(q, str) and q.strip()][:4]
+        symbols = [s for s in symbols if isinstance(s, str) and s.strip()][:3]
+        
+        if not queries:
+            queries = [question]
+        
+        logger.info("[decompose] %d queries, %d symbols from: %s", len(queries), len(symbols), question[:80])
+        return queries, symbols
+        
+    except Exception as e:
+        logger.warning("[decompose] Failed (%s), falling back to raw question", e)
+        return [question], []
 
 
 # ── Pre-Enrichment Logic ──────────────────────────────────────────
@@ -559,48 +691,62 @@ async def build_pre_enrichment(
     
     This is how we make a small model match Claude Opus - by doing the hard work
     of finding the right context upfront.
+    
+    Uses query decomposition to turn a user instruction into multiple focused
+    search queries, getting much better recall from the code index.
     """
+    import asyncio
     parts = []
     
     # 1. Attached files from IDE (live file contents)
     if attached_files:
         parts.append("## Live Files (from IDE)\n")
         for path, content in list(attached_files.items())[:5]:  # Limit to 5 files
-            # Truncate very long files
             truncated = content[:8000] + "\n... (truncated)" if len(content) > 8000 else content
             parts.append(f"### `{path}`\n```\n{truncated}\n```\n")
         parts.append("")
     
-    # 2. Semantic search based on the question
-    try:
-        logger.info("Pre-enrichment: searching for '%s' in workspace=%s", question[:100], workspace_id)
-        query_emb = await embeddings.embed_query(question)
-        search_results = await store.vector_search(workspace_id, query_emb, top_k=8)
-        logger.info("Pre-enrichment: got %d search results for workspace=%s", len(search_results), workspace_id)
-        
-        if search_results:
-            flat_results = [r["symbol"] for r in search_results]
-            # Log what we're passing to build_context
-            if flat_results:
-                logger.info("Pre-enrichment: first result keys=%s, name=%s", 
-                           list(flat_results[0].keys()), flat_results[0].get('name'))
-            context_text = chat_utils.build_context_from_results(flat_results)
-            if context_text:
-                parts.append(context_text)
-                logger.info("Pre-enrichment: built context len=%d", len(context_text))
-            else:
-                logger.warning("Pre-enrichment: build_context_from_results returned empty")
-        else:
-            logger.warning("Pre-enrichment: no results for query in workspace %s", workspace_id)
-    except Exception as e:
-        logger.error("Pre-enrichment search failed: %s", e, exc_info=True)
+    # 2. Decompose question into focused search queries + symbols
+    #    Pass attached files so the LLM can reference real symbol names
+    search_queries, symbols = await _decompose_query(question, attached_files)
+    logger.info("Pre-enrichment: %d queries=%s, %d symbols=%s", 
+                len(search_queries), search_queries, len(symbols), symbols)
     
-    # 3. Extract symbol names from question for trace analysis
-    # Simple heuristic: look for CamelCase or snake_case identifiers
-    symbols = extract_symbols_from_text(question)
+    # 3. Run all search queries in parallel for speed
+    async def _search(query: str) -> list[dict]:
+        try:
+            query_emb = await embeddings.embed_query(query)
+            results = await store.vector_search(workspace_id, query_emb, top_k=5)
+            return results
+        except Exception as e:
+            logger.error("Search failed for query '%s': %s", query, e)
+            return []
     
-    # 4. Trace call chains for mentioned symbols (limited)
-    for sym in symbols[:2]:  # Max 2 symbols to avoid token explosion
+    all_search_results = await asyncio.gather(*[_search(q) for q in search_queries])
+    
+    # 4. Deduplicate results across queries (by symbol name/path)
+    seen = set()
+    unique_results = []
+    for results in all_search_results:
+        for r in results:
+            sym = r.get("symbol", {})
+            # Deduplicate by (name, file_path) to avoid showing the same code twice
+            key = (sym.get("name", ""), sym.get("file_path", ""))
+            if key not in seen:
+                seen.add(key)
+                unique_results.append(sym)
+    
+    logger.info("Pre-enrichment: %d unique results from %d queries", len(unique_results), len(search_queries))
+    
+    if unique_results:
+        # Cap at 12 results to avoid token explosion
+        context_text = chat_utils.build_context_from_results(unique_results[:12])
+        if context_text:
+            parts.append(context_text)
+            logger.info("Pre-enrichment: built context len=%d", len(context_text))
+    
+    # 5. Trace call chains for extracted symbols
+    for sym in symbols[:2]:
         try:
             trace = await store.trace_call_chain(workspace_id, sym, direction="both", max_depth=2)
             if trace.get("nodes"):
@@ -611,155 +757,12 @@ async def build_pre_enrichment(
         except Exception as e:
             logger.debug("Trace failed for %s: %s", sym, e)
     
-    # Note: Documentation lookup is now available as a tool (lookup_documentation)
-    # The agent can call it on-demand instead of auto-fetching in pre-enrichment
-    
     return "\n".join(parts).strip()
 
 
-def extract_symbols_from_text(text: str) -> list[str]:
-    """Extract potential symbol names from natural language text."""
-    # CamelCase: FooBar, MyClass
-    camel = re.findall(r'\b([A-Z][a-zA-Z0-9]+)\b', text)
-    # snake_case: foo_bar, my_function  
-    snake = re.findall(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b', text)
-    # Combined and deduplicated
-    symbols = list(dict.fromkeys(camel + snake))
-    return symbols[:5]  # Limit
 
 
-# ── Task Complexity Classification ────────────────────────────────
-
-# Keywords / patterns that signal a complex, multi-step task
-_COMPLEX_VERBS = {
-    "refactor", "restructure", "migrate", "rewrite", "redesign",
-    "implement", "build", "create", "add", "develop",
-    "convert", "port", "upgrade", "replace", "move",
-    "split", "extract", "merge", "combine", "integrate",
-    "optimize", "improve", "enhance", "fix all", "update all",
-}
-
-_COMPLEX_SIGNALS = {
-    "across", "multiple files", "multi-file", "all files",
-    "entire", "whole", "codebase-wide", "project-wide",
-    "step by step", "end to end", "new feature",
-    "authentication", "authorization", "database", "api",
-}
-
-
-def classify_task_complexity(question: str) -> str:
-    """
-    Classify whether a user's request is 'simple' or 'complex'.
-    
-    Simple: questions, explanations, single-file reads, quick lookups.
-    Complex: multi-file edits, refactors, new features, migrations.
-    
-    This determines whether we force a planning phase before execution.
-    """
-    q_lower = question.lower().strip()
-    
-    # ── Definitely simple ──
-    # Questions that ask for information, not action
-    if q_lower.startswith(("what ", "how does ", "explain ", "show me ", "where ",
-                           "why ", "which ", "describe ", "tell me ", "can you explain")):
-        # Unless they combine with complex signals
-        if not any(sig in q_lower for sig in ("and then", "and also", "after that")):
-            return "simple"
-    
-    # Very short requests are usually simple
-    if len(q_lower.split()) <= 5:
-        return "simple"
-    
-    # ── Check for complex signals ──
-    score = 0
-    
-    # Complex action verbs
-    for verb in _COMPLEX_VERBS:
-        if verb in q_lower:
-            score += 2
-            break
-    
-    # Multi-scope signals
-    for signal in _COMPLEX_SIGNALS:
-        if signal in q_lower:
-            score += 1
-    
-    # Multiple files/components mentioned
-    file_mentions = len(re.findall(r'\b\w+\.\w{1,4}\b', question))  # file.ext patterns
-    if file_mentions >= 2:
-        score += 1
-    
-    # Multiple action words (compound tasks)
-    action_count = sum(1 for v in _COMPLEX_VERBS if v in q_lower)
-    if action_count >= 2:
-        score += 1
-    
-    # "and" connecting clauses often means multi-step
-    if re.search(r'\band\b.*\b(then|also|after|next)\b', q_lower):
-        score += 1
-    
-    return "complex" if score >= 2 else "simple"
-
-
-# ── Plan Parsing ──────────────────────────────────────────────────
-
-def parse_plan_from_response(text: str) -> list[PlanStep]:
-    """
-    Parse a structured plan from the LLM's response.
-    
-    Expects the LLM to produce a numbered list, e.g.:
-    
-    ## Plan
-    1. Read the current auth module to understand the structure
-    2. Create JWT utility functions in auth/jwt.py
-    3. Update login endpoint to return JWT tokens
-    4. Update middleware to validate JWT instead of sessions
-    5. Run tests and fix any issues
-    
-    Returns a list of PlanStep dicts.
-    """
-    steps: list[PlanStep] = []
-    
-    # Look for numbered list items (1. xxx, 2. xxx, etc.)
-    pattern = r'^\s*(\d+)[.)]\s*(.+?)\s*$'
-    
-    in_plan_section = False
-    for line in text.split('\n'):
-        stripped = line.strip()
-        
-        # Detect plan section header
-        if re.match(r'^#{1,3}\s*(Plan|Task Plan|Execution Plan|Steps)', stripped, re.IGNORECASE):
-            in_plan_section = True
-            continue
-        
-        # Detect end of plan section (next heading or empty line after steps)
-        if in_plan_section and stripped.startswith('#') and not re.match(r'^#{1,3}\s*(Plan|Step)', stripped, re.IGNORECASE):
-            break
-        
-        # Parse numbered items
-        match = re.match(pattern, stripped)
-        if match:
-            in_plan_section = True  # Auto-detect plan even without header
-            number = int(match.group(1))
-            description = match.group(2).strip()
-            # Clean markdown formatting: **bold**, `code`, leading/trailing *
-            description = re.sub(r'\*\*(.+?)\*\*', r'\1', description)
-            description = re.sub(r'`(.+?)`', r'\1', description)
-            description = description.strip('* ')
-            
-            if description:
-                steps.append(PlanStep(
-                    number=number,
-                    description=description,
-                    status="pending"
-                ))
-    
-    # Re-number sequentially in case of gaps
-    for i, step in enumerate(steps):
-        step["number"] = i + 1
-    
-    return steps
-
+# ── Plan Display ──────────────────────────────────────────────────
 
 def format_plan_for_prompt(steps: list[PlanStep], current_step: int) -> str:
     """Format the plan as a prompt section for the LLM to reference."""
@@ -1050,162 +1053,74 @@ def _get_last_question(state: AgentState) -> str:
     return ""
 
 
+# Cosine similarity threshold: below this, the topic has shifted enough to re-enrich.
+# 0.65 means ~50% topical overlap — tolerant of rephrasing, triggers on real pivots.
+TOPIC_SHIFT_THRESHOLD = 0.65
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 @traceable(name="enrich_context_node", run_type="chain", tags=["enrichment"])
 async def enrich_context(state: AgentState) -> dict:
     """First node: gather context BEFORE calling the LLM.
     
-    Only runs on the FIRST turn of a conversation. On continuation turns
-    (when tool results come back), we skip enrichment to avoid wasting
-    time re-searching for the same context.
+    Behavior:
+    - First turn: always enrich.
+    - Tool result continuation (mid-task): always skip.
+    - Follow-up question: compare embedding similarity with the question
+      we originally enriched for. If the topic shifted significantly,
+      re-enrich with the new question so the agent has fresh context.
     """
     workspace_id = state['workspace_id']
     attached_files = state.get('attached_files', {})
-    
-    # Skip enrichment if we already have context (continuation turn)
     existing_context = state.get('enriched_context', '')
-    if existing_context:
-        logger.info("[enrich_context] Skipping - already have %d chars context", len(existing_context))
-        return {}  # Don't overwrite existing context
+    enriched_question = state.get('enriched_question', '')
     
-    # Skip enrichment if the last message is a tool result (continuation)
+    # ── Tool result continuation: ALWAYS skip (agent is mid-task) ──
     if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
-        logger.info("[enrich_context] Skipping - last message is ToolMessage (continuation)")
+        logger.info("[enrich_context] Skipping - ToolMessage continuation")
         return {}
-    
-    logger.info("[enrich_context] Starting enrichment for workspace=%s", workspace_id)
     
     question = _get_last_question(state)
     if not question:
         logger.warning("[enrich_context] No question found in messages")
-        return {"enriched_context": ""}
+        return {"enriched_context": "", "enriched_question": ""}
     
-    logger.info("[enrich_context] Question: %s", question[:100])
+    # ── First turn: always enrich ──
+    if not existing_context:
+        logger.info("[enrich_context] First turn — enriching for: %s", question[:100])
+        context = await build_pre_enrichment(workspace_id, question, attached_files)
+        logger.info("[enrich_context] Built context with %d chars", len(context))
+        return {"enriched_context": context, "enriched_question": question}
     
-    # Build pre-enriched context
-    context = await build_pre_enrichment(workspace_id, question, attached_files)
+    # ── Follow-up question: check for topic shift ──
+    if enriched_question and question != enriched_question:
+        try:
+            old_emb, new_emb = await embeddings.embed_query(enriched_question), await embeddings.embed_query(question)
+            similarity = _cosine_similarity(old_emb, new_emb)
+            logger.info("[enrich_context] Topic similarity: %.3f (threshold=%.2f) | old=%s | new=%s",
+                       similarity, TOPIC_SHIFT_THRESHOLD, enriched_question[:60], question[:60])
+            
+            if similarity < TOPIC_SHIFT_THRESHOLD:
+                logger.info("[enrich_context] Topic shift detected (%.3f < %.2f) — re-enriching",
+                           similarity, TOPIC_SHIFT_THRESHOLD)
+                context = await build_pre_enrichment(workspace_id, question, attached_files)
+                logger.info("[enrich_context] Re-enriched with %d chars", len(context))
+                return {"enriched_context": context, "enriched_question": question}
+            else:
+                logger.info("[enrich_context] Same topic (%.3f) — keeping existing context", similarity)
+        except Exception as e:
+            logger.warning("[enrich_context] Topic shift check failed (%s), keeping existing context", e)
     
-    logger.info("[enrich_context] Built context with %d chars", len(context))
-    
-    return {"enriched_context": context}
-
-
-@traceable(name="classify_task_node", run_type="chain", tags=["planning"])
-async def classify_task(state: AgentState) -> dict:
-    """Classify whether the task is simple or complex.
-    
-    Complex tasks get routed through a planning phase before execution.
-    Simple tasks go directly to the agent.
-    
-    Runs only on the first turn; on continuations (tool results coming
-    back) we preserve the existing classification.
-    """
-    # If already classified (continuation turn), keep it
-    if state.get('task_complexity'):
-        logger.info("[classify] Skipping - already classified as %s", state['task_complexity'])
-        return {}
-    
-    # If last message is a tool result, this is a continuation — skip
-    if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
-        return {}
-    
-    question = _get_last_question(state)
-    if not question:
-        return {"task_complexity": "simple", "plan_steps": [], "current_step": 0, "plan_complete": True}
-    
-    complexity = classify_task_complexity(question)
-    logger.info("[classify] Task complexity: %s (question: %s)", complexity, question[:80])
-    
-    if complexity == "simple":
-        return {
-            "task_complexity": "simple",
-            "plan_steps": [],
-            "current_step": 0,
-            "plan_complete": True,  # No plan needed
-        }
-    else:
-        return {
-            "task_complexity": "complex",
-            "plan_steps": [],       # Will be filled by plan_task node
-            "current_step": 0,
-            "plan_complete": False,
-        }
-
-
-@traceable(name="plan_task_node", run_type="chain", tags=["planning", "llm"])
-async def plan_task(state: AgentState) -> dict:
-    """Generate a structured plan for complex tasks.
-    
-    Calls the REASONING model with planning-specific instructions.
-    The LLM produces a numbered plan that gets parsed into PlanStep objects.
-    No tools are bound — the LLM must ONLY output a plan, not execute.
-    """
-    enriched_context = state.get('enriched_context', '')
-    question = _get_last_question(state)
-    
-    logger.info("[plan_task] Generating plan for: %s", question[:100])
-    
-    # Build planning prompt
-    messages_to_send = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        SystemMessage(content=PLANNING_PROMPT),
-    ]
-    
-    # Add enriched context
-    if enriched_context:
-        ctx = enriched_context[:60_000]
-        messages_to_send.append(SystemMessage(
-            content=f"## Pre-gathered Context\n\n{ctx}\n\n---\n"
-        ))
-    
-    # Add conversation history (just the human messages, not tool noise)
-    for msg in state['messages']:
-        if isinstance(msg, HumanMessage):
-            messages_to_send.append(msg)
-    
-    # Use the reasoning model (stronger) for planning — NO tools bound
-    model = llm_provider.get_reasoning_model(temperature=0.1)
-    response = await model.ainvoke(messages_to_send)
-    
-    plan_text = response.content
-    logger.info("[plan_task] Raw plan response (%d chars): %s", len(plan_text), plan_text[:300])
-    
-    # Parse the structured plan
-    steps = parse_plan_from_response(plan_text)
-    
-    if steps:
-        logger.info("[plan_task] Parsed %d plan steps:", len(steps))
-        for s in steps:
-            logger.info("  %d. %s", s["number"], s["description"])
-        
-        # Mark step 1 as in_progress
-        steps[0]["status"] = "in_progress"
-        
-        # Build a short plan summary for the AI message (instead of raw LLM output)
-        plan_summary = "## Plan\n" + "\n".join(
-            f"{s['number']}. {s['description']}" for s in steps
-        )
-        
-        return {
-            "plan_steps": steps,
-            "current_step": 1,
-            "plan_complete": True,  # Planning phase done, ready to execute
-            "messages": [
-                # The plan as an AI message
-                AIMessage(content=plan_summary),
-                # A kick-start message so the LLM knows to START executing
-                HumanMessage(content="Plan approved. Now execute step 1 using the tools. Do NOT just describe what to do — actually call the tools."),
-            ],
-        }
-    else:
-        # Failed to parse a plan — fall through to direct execution
-        logger.warning("[plan_task] Could not parse plan steps, falling through to direct agent")
-        return {
-            "plan_steps": [],
-            "current_step": 0,
-            "plan_complete": True,
-            "task_complexity": "simple",  # Downgrade
-            "messages": [AIMessage(content=plan_text)],
-        }
+    return {}
 
 
 # ── Context Window Management ─────────────────────────────────────
@@ -1215,9 +1130,78 @@ async def plan_task(state: AgentState) -> dict:
 MAX_HISTORY_CHARS = 200_000  # ~50K tokens for conversation history
 MAX_TOOL_MSG_CHARS = 30_000  # Truncate individual tool results
 
+SUMMARIZE_PROMPT = """Summarize this conversation segment concisely. Focus on:
+- What files were read or edited (exact paths)
+- What changes were made and why
+- Key decisions or findings
+- Any errors encountered and how they were resolved
+- Current state of the task
 
-def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Truncate oversized tool messages and trim old history if needed."""
+Be brief (under 500 words). Use bullet points. Include exact file paths and symbol names."""
+
+
+async def _summarize_dropped_messages(dropped_messages: list[BaseMessage]) -> str:
+    """Use the tool model to summarize conversation messages that are being dropped.
+    
+    This preserves the key decisions, file edits, and findings from the middle
+    of a long conversation instead of just saying "[N messages omitted]".
+    """
+    # Build a compact representation of the dropped messages
+    parts = []
+    for msg in dropped_messages:
+        if isinstance(msg, HumanMessage):
+            parts.append(f"[User]: {msg.content[:500]}")
+        elif isinstance(msg, AIMessage):
+            text = msg.content[:500] if msg.content else ""
+            tools = ", ".join(tc["name"] for tc in (msg.tool_calls or []))
+            if tools:
+                parts.append(f"[Assistant]: {text}\n  Tools called: {tools}")
+            elif text:
+                parts.append(f"[Assistant]: {text}")
+        elif isinstance(msg, ToolMessage):
+            # Keep tool results short — just the first/last lines
+            content = msg.content
+            if len(content) > 300:
+                content = content[:150] + "\n...\n" + content[-150:]
+            parts.append(f"[Tool result]: {content}")
+    
+    conversation_text = "\n\n".join(parts)
+    
+    # Cap the input to avoid blowing up the summarization call itself
+    if len(conversation_text) > 30_000:
+        conversation_text = conversation_text[:30_000] + "\n\n... (further messages truncated for summarization)"
+    
+    try:
+        model = llm_provider.get_tool_model(temperature=0.0)
+        response = await model.ainvoke([
+            SystemMessage(content=SUMMARIZE_PROMPT),
+            HumanMessage(content=conversation_text),
+        ])
+        summary = response.content.strip()
+        logger.info("[summarize] Summarized %d messages into %d chars", len(dropped_messages), len(summary))
+        return summary
+    except Exception as e:
+        logger.warning("[summarize] Failed (%s), using fallback", e)
+        # Fallback: extract just the tool names and file paths
+        tool_names = set()
+        for msg in dropped_messages:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_names.add(tc["name"])
+                    path = tc.get("args", {}).get("path", "")
+                    if path:
+                        tool_names.add(f"  {tc['name']}({path})")
+        if tool_names:
+            return f"[Summary of {len(dropped_messages)} earlier messages — tools used: {', '.join(sorted(tool_names))}]"
+        return f"[{len(dropped_messages)} earlier messages omitted to fit context window]"
+
+
+async def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Truncate oversized tool messages and trim old history if needed.
+    
+    When dropping middle messages, summarizes them using the tool model
+    so the agent remembers what it did (files edited, decisions made).
+    """
     result = []
     total_chars = 0
     
@@ -1236,16 +1220,19 @@ def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
         result.append(msg)
     
     # If total history is still too large, keep first 2 + last N messages
+    # and SUMMARIZE the dropped middle instead of discarding it
     if total_chars > MAX_HISTORY_CHARS:
-        # Always keep: first HumanMessage (the question) + last few messages
-        # Drop middle messages (old tool call/result pairs)
         if len(result) > 6:
-            kept_start = result[:2]  # First human msg + first AI response
-            kept_end = result[-4:]    # Last 4 messages (most recent context)
-            dropped = len(result) - 6
-            summary = AIMessage(content=f"[{dropped} earlier messages omitted to fit context window]")
+            kept_start = result[:2]   # First human msg + first AI response
+            kept_end = result[-4:]     # Last 4 messages (most recent context)
+            dropped = result[2:-4]     # Middle messages to summarize
+            
+            logger.warning("[truncate] Summarizing %d middle messages to fit context", len(dropped))
+            summary_text = await _summarize_dropped_messages(dropped)
+            
+            summary = AIMessage(content=f"## Summary of Earlier Work\n\n{summary_text}")
             result = kept_start + [summary] + kept_end
-            logger.warning("[truncate] Dropped %d messages, kept %d", dropped, len(result))
+            logger.info("[truncate] Kept %d messages (2 start + summary + 4 end)", len(result))
     
     return result
 
@@ -1267,18 +1254,67 @@ def _truncate_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 # Just set the model string: "groq/kimi-k2", "gemini/gemini-2.0-flash", etc.
 
 
-def _pick_model_name(messages: list[BaseMessage], is_plan_execution: bool = False) -> str:
-    """Pick model string based on conversation phase.
+def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0) -> str:
+    """Pick model string based on what the agent needs to do RIGHT NOW.
     
-    - Planning / first call → reasoning model
-    - After tool results → tool model (faster iterations)
+    Reasoning model (stronger, slower) for moments that need deep thinking:
+      - First call (understand the question + codebase context)
+      - Right after creating a plan (first execution step needs understanding)
+      - After a tool failure (needs to reason about what went wrong)
+      - When there's no plan yet but the task looks complex (agent might create one)
+    
+    Tool model (faster, cheaper) for straightforward execution:
+      - Processing normal tool results (file contents, search results)
+      - Continuing plan execution on routine steps
     """
     config = llm_provider.get_config()
-    has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
     
-    if has_tool_messages:
-        return config.tool_model
-    return config.reasoning_model
+    # No tool messages at all → first call, always use reasoning
+    has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
+    if not has_tool_messages:
+        logger.info("[model_routing] → reasoning (first call)")
+        return config.reasoning_model
+    
+    # Look at the last few messages to understand what just happened
+    recent_tool_results = []
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            recent_tool_results.append(msg)
+        elif isinstance(msg, AIMessage):
+            break  # Stop at the last AI message
+    
+    # ── Check for failure signals → reasoning model ──
+    for tool_msg in recent_tool_results:
+        content_lower = tool_msg.content.lower() if tool_msg.content else ""
+        if any(signal in content_lower for signal in (
+            "error", "failed", "traceback", "exception", 
+            "not found", "permission denied", "command failed",
+            "no such file", "syntax error", "compile error",
+        )):
+            logger.info("[model_routing] → reasoning (tool failure detected)")
+            return config.reasoning_model
+    
+    # ── Check if agent just created a plan → reasoning for first step ──
+    if plan_steps and current_step == 1:
+        # Just started executing — first step after planning needs reasoning
+        any_done = any(s["status"] == "done" for s in plan_steps)
+        if not any_done:
+            logger.info("[model_routing] → reasoning (first step of new plan)")
+            return config.reasoning_model
+    
+    # ── Check if the last AI message had no tool calls (agent was talking) ──
+    # This means we're resuming after the agent gave a text response,
+    # possibly asking for clarification or explaining something complex
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if not msg.tool_calls:
+                logger.info("[model_routing] → reasoning (resuming after text response)")
+                return config.reasoning_model
+            break
+    
+    # ── Default: tool model for routine execution ──
+    logger.info("[model_routing] → tool (routine execution)")
+    return config.tool_model
 
 
 @traceable(name="call_model_node", run_type="chain", tags=["llm"])
@@ -1301,15 +1337,11 @@ async def call_model(state: AgentState) -> dict:
     # System prompt
     messages_to_send.append(SystemMessage(content=SYSTEM_PROMPT))
     
-    # ── Plan execution context ────────────────────────────────
+    # ── Active plan context (created by create_plan tool) ────
     if plan_steps and current_step > 0:
         plan_display = format_plan_for_prompt(plan_steps, current_step)
-        exec_prompt = PLAN_EXECUTION_PROMPT.format(
-            plan_display=plan_display,
-            current_step=current_step,
-        )
-        messages_to_send.append(SystemMessage(content=exec_prompt))
-        logger.info("[call_model] Injected plan execution context (step %d/%d)", 
+        messages_to_send.append(SystemMessage(content=plan_display))
+        logger.info("[call_model] Injected active plan context (step %d/%d)", 
                     current_step, len(plan_steps))
     
     # Add enriched context as a system message if we have it
@@ -1323,13 +1355,13 @@ async def call_model(state: AgentState) -> dict:
         logger.warning("[call_model] No enriched context to add!")
     
     # Add conversation history (with truncation)
-    history = _truncate_messages(state['messages'])
+    history = await _truncate_messages(state['messages'])
     messages_to_send.extend(history)
     
     total_chars = sum(len(m.content) for m in messages_to_send)
     
-    # Pick model based on conversation phase (works with any provider)
-    model_name = _pick_model_name(state['messages'], is_plan_execution=bool(plan_steps))
+    # Pick model based on what the agent needs to do right now
+    model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step)
     logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
     
     model = llm_provider.get_chat_model(model_name, temperature=0.1)
@@ -1344,46 +1376,20 @@ async def call_model(state: AgentState) -> dict:
                 model_name,
                 [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
-    # ── Plan step advancement ─────────────────────────────────
-    # If there's an active plan, check if the LLM signalled step completion
-    updates: dict = {"messages": [response]}
-    
-    if plan_steps and current_step > 0:
-        resp_text = (response.content or "").lower()
-        
-        # Detect step completion signals
-        step_done = (
-            f"step {current_step} complete" in resp_text
-            or f"step {current_step} done" in resp_text
-            or f"completed step {current_step}" in resp_text
-            or f"finished step {current_step}" in resp_text
-        )
-        
-        if step_done and current_step <= len(plan_steps):
-            # Mark current step done
-            new_steps = [dict(s) for s in plan_steps]  # Copy
-            new_steps[current_step - 1]["status"] = "done"
-            
-            next_step = current_step + 1
-            if next_step <= len(new_steps):
-                new_steps[next_step - 1]["status"] = "in_progress"
-                logger.info("[call_model] ✅ Step %d done, advancing to step %d", current_step, next_step)
-            else:
-                logger.info("[call_model] ✅ Step %d done — ALL STEPS COMPLETE", current_step)
-                next_step = 0  # Signal all done
-            
-            updates["plan_steps"] = new_steps
-            updates["current_step"] = next_step
-    
-    return updates
+    return {"messages": [response]}
 
 
 @traceable(name="execute_server_tools", run_type="chain", tags=["server-tools"])
 async def execute_server_tools(state: AgentState) -> dict:
-    """Execute tools that run on the server (search, trace, impact)."""
+    """Execute tools that run on the server (search, trace, impact, plan management)."""
     workspace_id = state['workspace_id']
     last_message = state['messages'][-1]
     tool_outputs = []
+    
+    # Track plan state mutations from plan tools
+    plan_steps = list(state.get('plan_steps', []))
+    current_step = state.get('current_step', 0)
+    plan_changed = False
     
     for tool_call in last_message.tool_calls:
         tool_name = tool_call['name']
@@ -1398,7 +1404,6 @@ async def execute_server_tools(state: AgentState) -> dict:
                 logger.info("codebase_search: got %d results", len(results))
                 
                 if results:
-                    # Extract symbol dicts and build context
                     flat_results = [r["symbol"] for r in results]
                     content = chat_utils.build_context_from_results(flat_results)
                     logger.info("codebase_search: built context len=%d", len(content))
@@ -1420,6 +1425,66 @@ async def execute_server_tools(state: AgentState) -> dict:
                 library = args.get('library', '')
                 query = args.get('query', '')
                 content = await _fetch_documentation(library, query)
+            
+            # ── Plan Management Tools ─────────────────────────────
+            elif tool_name == "create_plan":
+                step_descriptions = args.get('steps', [])
+                if not step_descriptions:
+                    content = "Error: steps list cannot be empty."
+                else:
+                    plan_steps = [
+                        PlanStep(number=i + 1, description=desc, status="pending")
+                        for i, desc in enumerate(step_descriptions)
+                    ]
+                    # Auto-mark step 1 as in_progress
+                    plan_steps[0]["status"] = "in_progress"
+                    current_step = 1
+                    plan_changed = True
+                    content = f"Plan created with {len(plan_steps)} steps. Step 1 is now in progress."
+                    logger.info("[create_plan] Created %d steps", len(plan_steps))
+            
+            elif tool_name == "update_plan":
+                step_num = args.get('step_number', 0)
+                new_status = args.get('status', '')
+                new_desc = args.get('new_description', '')
+                
+                if not plan_steps:
+                    content = "Error: No active plan. Use create_plan first."
+                elif step_num < 1 or step_num > len(plan_steps):
+                    content = f"Error: Invalid step number {step_num}. Plan has {len(plan_steps)} steps."
+                elif new_status not in ("done", "in_progress", "failed", "pending"):
+                    content = f"Error: Invalid status '{new_status}'. Use: done, in_progress, failed, pending."
+                else:
+                    idx = step_num - 1
+                    old_status = plan_steps[idx]["status"]
+                    plan_steps[idx]["status"] = new_status
+                    if new_desc:
+                        plan_steps[idx]["description"] = new_desc
+                    
+                    # Auto-advance current_step when marking done
+                    if new_status == "done" and step_num == current_step:
+                        next_step = step_num + 1
+                        if next_step <= len(plan_steps):
+                            plan_steps[next_step - 1]["status"] = "in_progress"
+                            current_step = next_step
+                        else:
+                            current_step = 0  # All steps done
+                    
+                    plan_changed = True
+                    content = f"Step {step_num}: {old_status} → {new_status}"
+                    if current_step == 0:
+                        content += " | All steps complete!"
+                    elif new_status == "done":
+                        content += f" | Now on step {current_step}"
+                    logger.info("[update_plan] Step %d: %s → %s (current=%d)", 
+                               step_num, old_status, new_status, current_step)
+            
+            elif tool_name == "discard_plan":
+                plan_steps = []
+                current_step = 0
+                plan_changed = True
+                content = "Plan discarded."
+                logger.info("[discard_plan] Plan cleared")
                 
             else:
                 # Not a server tool, skip
@@ -1434,42 +1499,27 @@ async def execute_server_tools(state: AgentState) -> dict:
             tool_call_id=tool_call['id']
         ))
     
-    return {"messages": tool_outputs}
+    result = {"messages": tool_outputs}
+    
+    # Propagate plan state changes
+    if plan_changed:
+        result["plan_steps"] = plan_steps
+        result["current_step"] = current_step
+    
+    return result
 
 
 # ── Router Logic ──────────────────────────────────────────────────
 
-def classify_router(state: AgentState) -> Literal["plan", "agent"]:
-    """After classify: route complex tasks to plan, simple to agent."""
-    complexity = state.get('task_complexity', 'simple')
-    plan_complete = state.get('plan_complete', True)
-    
-    if complexity == "complex" and not plan_complete:
-        logger.info("[classify_router] → plan (complex task, no plan yet)")
-        return "plan"
-    
-    logger.info("[classify_router] → agent (simple or plan already done)")
-    return "agent"
-
-
-def agent_router(state: AgentState) -> Literal["server_tools", "pause", "end", "continue_plan"]:
+def agent_router(state: AgentState) -> Literal["server_tools", "pause", "end"]:
     """After agent: route to server tools, pause for IDE, or finish.
     
-    New: if a plan step was just completed and there are more steps,
-    route back to agent to continue with the next step.
+    Server tools (including plan management) are always processed first.
+    If only IDE tools are present, we pause for the IDE to execute them.
     """
     last_message = state['messages'][-1]
-    plan_steps = state.get('plan_steps', [])
-    current_step = state.get('current_step', 0)
     
-    # If no tool calls, check if we should continue the plan
     if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
-        # If there's an active plan with remaining steps, loop back
-        if plan_steps and current_step > 0:
-            remaining = [s for s in plan_steps if s['status'] in ('pending', 'in_progress')]
-            if remaining:
-                logger.info("[agent_router] → continue_plan (step %d, %d remaining)", current_step, len(remaining))
-                return "continue_plan"
         return "end"
     
     has_server_tools = False
@@ -1481,78 +1531,68 @@ def agent_router(state: AgentState) -> Literal["server_tools", "pause", "end", "
         elif tc['name'] in SERVER_TOOL_NAMES:
             has_server_tools = True
     
-    # Priority: if any IDE tools, pause for IDE callback
-    if has_ide_tools:
-        return "pause"
-    
+    # Server tools first (search, plan management, docs)
     if has_server_tools:
         return "server_tools"
+    
+    # Then IDE tools (pause for the IDE to execute)
+    if has_ide_tools:
+        return "pause"
     
     return "end"
 
 
+def post_server_tools_router(state: AgentState) -> Literal["pause", "agent"]:
+    """After server tools: check if the same AI message also had IDE tools.
+    
+    This handles the case where the agent calls both server tools (e.g.,
+    update_plan) and IDE tools (e.g., read_file) in the same turn.
+    Server tools are processed first, then we pause for IDE tools.
+    """
+    # Find the last AIMessage (it's behind the ToolMessages from server tools)
+    for msg in reversed(state['messages']):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc['name'] in IDE_TOOL_NAMES:
+                    logger.info("[post_server_router] → pause (mixed server + IDE tools)")
+                    return "pause"
+            break
+    
+    return "agent"
+
+
 # ── Graph Construction ────────────────────────────────────────────
 #
-# New flow with task decomposition:
+# Simplified flow with tool-based planning:
 #
-#   enrich → classify ─┬─ (complex, no plan) → plan → agent ─┬→ server_tools → agent
-#                       │                                      ├→ pause (IDE tools)
-#                       └─ (simple or has plan) → agent ──┬────┴→ end
-#                                                         └→ continue_plan → agent
+#   enrich → agent ─┬→ server_tools → post_router ─┬→ agent
+#                    │                               └→ pause (IDE tools)
+#                    ├→ pause (IDE tools only) → END
+#                    └→ end → END
 #
-# The continue_plan node handles step transitions: when the agent
-# finishes a step (no tool calls) but there are more plan steps,
-# it injects a kick-start message and loops back to the agent.
-
-async def continue_plan(state: AgentState) -> dict:
-    """Inject a kick-start message to advance to the next plan step."""
-    current_step = state.get('current_step', 0)
-    plan_steps = state.get('plan_steps', [])
-    
-    if current_step > 0 and current_step <= len(plan_steps):
-        step_desc = plan_steps[current_step - 1]["description"]
-        logger.info("[continue_plan] Kicking off step %d: %s", current_step, step_desc)
-        return {
-            "messages": [
-                HumanMessage(content=f"Continue. Execute step {current_step}: {step_desc}. Use the tools now.")
-            ]
-        }
-    
-    return {}
-
+# The agent manages its own plan via create_plan/update_plan/discard_plan
+# tools. No separate classifier, planning node, or continue_plan needed.
 
 def create_agent():
-    """Build the LangGraph agent with task decomposition."""
+    """Build the LangGraph agent with tool-based planning.
+    
+    The agent decides when to plan using create_plan/update_plan/discard_plan
+    tools. This replaces the old classifier → planning node flow.
+    """
     workflow = StateGraph(AgentState)
 
     # Nodes
     workflow.add_node("enrich", enrich_context)
-    workflow.add_node("classify", classify_task)
-    workflow.add_node("plan", plan_task)
     workflow.add_node("agent", call_model)
     workflow.add_node("server_tools", execute_server_tools)
-    workflow.add_node("continue_plan", continue_plan)
 
     # ── Edges ─────────────────────────────────────────────────
     
-    # Entry: always start with enrichment
+    # Entry: pre-enrichment (semantic search, call chains)
     workflow.set_entry_point("enrich")
     
-    # After enrichment, classify the task
-    workflow.add_edge("enrich", "classify")
-    
-    # After classify, route based on complexity
-    workflow.add_conditional_edges(
-        "classify",
-        classify_router,
-        {
-            "plan": "plan",
-            "agent": "agent",
-        }
-    )
-    
-    # After planning, go to agent for execution
-    workflow.add_edge("plan", "agent")
+    # After enrichment, go to agent
+    workflow.add_edge("enrich", "agent")
     
     # After agent, route based on tool calls
     workflow.add_conditional_edges(
@@ -1562,15 +1602,18 @@ def create_agent():
             "server_tools": "server_tools",
             "pause": END,           # Return to API/IDE for tool execution
             "end": END,
-            "continue_plan": "continue_plan",  # Step done, more to go
         }
     )
     
-    # After server tools, call agent again for next reasoning step
-    workflow.add_edge("server_tools", "agent")
-    
-    # After continue_plan kick-start, go back to agent
-    workflow.add_edge("continue_plan", "agent")
+    # After server tools, check if we also need to pause for IDE tools
+    workflow.add_conditional_edges(
+        "server_tools",
+        post_server_tools_router,
+        {
+            "agent": "agent",       # No IDE tools, continue reasoning
+            "pause": END,           # Mixed call — pause for IDE tools
+        }
+    )
 
     return workflow.compile()
 

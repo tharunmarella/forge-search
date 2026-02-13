@@ -853,21 +853,19 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     stored = _conversations.get(conv_id)
     
     # ── Plan state defaults ──
-    task_complexity = ""
     plan_steps = []
     current_step = 0
-    plan_complete = False
+    enriched_question = ""
 
     if has_tool_results and stored:
         # TOOL RESULT CONTINUATION: restore full history + append tool results
         messages = stored["messages"]  # Full history from prior turns
         enriched_context = stored.get("enriched_context", "")
+        enriched_question = stored.get("enriched_question", "")
         attached_files_dict = stored.get("attached_files", {})
         # Restore plan state
-        task_complexity = stored.get("task_complexity", "")
         plan_steps = stored.get("plan_steps", [])
         current_step = stored.get("current_step", 0)
-        plan_complete = stored.get("plan_complete", False)
         
         for res in req.tool_results:
             messages.append(ToolMessage(
@@ -883,12 +881,11 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         # This preserves multi-turn memory across user messages
         messages = stored["messages"]
         enriched_context = stored.get("enriched_context", "")
+        enriched_question = stored.get("enriched_question", "")
         attached_files_dict = stored.get("attached_files", {})
         # Restore plan state
-        task_complexity = stored.get("task_complexity", "")
         plan_steps = stored.get("plan_steps", [])
         current_step = stored.get("current_step", 0)
-        plan_complete = stored.get("plan_complete", False)
         
         messages.append(HumanMessage(content=req.question))
         
@@ -980,28 +977,26 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "workspace_id": req.workspace_id,
                 "attached_files": attached_files_dict,
                 "enriched_context": enriched_context,  # Preserved on continuation!
+                "enriched_question": enriched_question,  # For topic shift detection
                 # Plan state (preserved across tool-result continuations)
-                "task_complexity": task_complexity,
                 "plan_steps": plan_steps,
                 "current_step": current_step,
-                "plan_complete": plan_complete,
             },
             config=config
         )
         
         enriched_ctx = result.get("enriched_context", "")
+        result_enriched_question = result.get("enriched_question", "")
         final_messages = result["messages"]
         last_message = final_messages[-1]
         
         # Extract plan state from result
         result_plan_steps = result.get("plan_steps", [])
         result_current_step = result.get("current_step", 0)
-        result_task_complexity = result.get("task_complexity", "")
-        result_plan_complete = result.get("plan_complete", False)
         
-        logger.info("[chat] Agent returned, enriched_context=%d, messages=%d, complexity=%s, plan_steps=%d, step=%d", 
+        logger.info("[chat] Agent returned, enriched_context=%d, messages=%d, plan_steps=%d, step=%d", 
                    len(enriched_ctx), len(final_messages), 
-                   result_task_complexity, len(result_plan_steps), result_current_step)
+                   len(result_plan_steps), result_current_step)
         
         # ── Determine response status ─────────────────────────────
         status = "done"
@@ -1022,12 +1017,11 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         _conversations.set(conv_id, {
             "messages": final_messages,
             "enriched_context": enriched_ctx,
+            "enriched_question": result_enriched_question,
             "attached_files": attached_files_dict,
             # Persist plan state across turns
-            "task_complexity": result_task_complexity,
             "plan_steps": result_plan_steps,
             "current_step": result_current_step,
-            "plan_complete": result_plan_complete,
         })
 
         # Serialize history for the IDE (for display/debugging)
@@ -1066,7 +1060,6 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             history=serialized_history,
             status=status,
             total_time_ms=round(elapsed, 1),
-            task_complexity=result_task_complexity or None,
             plan_steps=plan_step_responses,
             current_step=result_current_step if result_plan_steps else None,
         )
@@ -1101,19 +1094,17 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             
             # ── Reconstruct state (same as regular /chat) ──
             stored = _conversations.get(conv_id)
-            task_complexity = ""
             plan_steps = []
             current_step = 0
-            plan_complete = False
+            enriched_question = ""
 
             if has_tool_results and stored:
                 messages = stored["messages"]
                 enriched_context = stored.get("enriched_context", "")
+                enriched_question = stored.get("enriched_question", "")
                 attached_files_dict = stored.get("attached_files", {})
-                task_complexity = stored.get("task_complexity", "")
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
-                plan_complete = stored.get("plan_complete", False)
                 
                 for res in req.tool_results:
                     messages.append(ToolMessage(
@@ -1124,11 +1115,10 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             elif stored and req.question:
                 messages = stored["messages"]
                 enriched_context = stored.get("enriched_context", "")
+                enriched_question = stored.get("enriched_question", "")
                 attached_files_dict = stored.get("attached_files", {})
-                task_complexity = stored.get("task_complexity", "")
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
-                plan_complete = stored.get("plan_complete", False)
                 messages.append(HumanMessage(content=req.question))
             else:
                 messages = []
@@ -1210,26 +1200,24 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                     "workspace_id": req.workspace_id,
                     "attached_files": attached_files_dict,
                     "enriched_context": enriched_context,
-                    "task_complexity": task_complexity,
+                    "enriched_question": enriched_question,
                     "plan_steps": plan_steps,
                     "current_step": current_step,
-                    "plan_complete": plan_complete,
                 },
                 config=config
             )
             
             enriched_ctx = result.get("enriched_context", "")
+            result_enriched_question = result.get("enriched_question", "")
             final_messages = result["messages"]
             last_message = final_messages[-1]
             
             result_plan_steps = result.get("plan_steps", [])
             result_current_step = result.get("current_step", 0)
-            result_task_complexity = result.get("task_complexity", "")
-            result_plan_complete = result.get("plan_complete", False)
             
-            # Emit plan if present
+            # Emit plan if present (includes current_step so client knows which step is active)
             if result_plan_steps:
-                yield f"event: plan\ndata: {json.dumps({'steps': result_plan_steps})}\n\n"
+                yield f"event: plan\ndata: {json.dumps({'steps': result_plan_steps, 'current_step': result_current_step})}\n\n"
             
             # Determine what to send back
             if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -1261,11 +1249,10 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             _conversations.set(conv_id, {
                 "messages": final_messages,
                 "enriched_context": enriched_ctx,
+                "enriched_question": result_enriched_question,
                 "attached_files": attached_files_dict,
-                "task_complexity": result_task_complexity,
                 "plan_steps": result_plan_steps,
                 "current_step": result_current_step,
-                "plan_complete": result_plan_complete,
             })
             
             # Emit done event
