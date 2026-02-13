@@ -51,6 +51,7 @@ PROVIDERS: dict[str, dict] = {
             "groq/mixtral-8x7b-32768",
             "groq/moonshotai/kimi-k2-instruct-0905",
             "groq/openai/gpt-oss-20b",
+            "groq/qwen/qwen3-32b",
         ],
     },
     "gemini": {
