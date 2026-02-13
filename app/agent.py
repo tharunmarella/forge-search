@@ -1922,6 +1922,41 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
                 model_name,
                 [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
     
+    # ── Block repeated failing tool calls ──────────────────────
+    # If the model calls the same tool with same args that already failed 2+ times,
+    # block it and force the model to do something different.
+    if response.tool_calls:
+        blocked = False
+        for tc in response.tool_calls:
+            tc_key = tc["name"] + ":" + json.dumps(tc.get("args", {}), sort_keys=True)[:200]
+            
+            # Count how many times this exact call appears in recent history
+            repeat_count = 0
+            for msg in reversed(state['messages'][-30:]):
+                if isinstance(msg, AIMessage) and msg.tool_calls:
+                    for prev_tc in msg.tool_calls:
+                        prev_key = prev_tc["name"] + ":" + json.dumps(prev_tc.get("args", {}), sort_keys=True)[:200]
+                        if prev_key == tc_key:
+                            repeat_count += 1
+            
+            if repeat_count >= 2:
+                cmd_desc = tc.get("args", {}).get("command", tc["name"])[:60]
+                logger.warning("[call_model] BLOCKED repeated tool call: %s (called %d times before)", tc["name"], repeat_count)
+                
+                # Replace the response with a firm instruction
+                blocked_msg = AIMessage(
+                    content=f"⛔ **I was about to call `{tc['name']}` with the same arguments for the {repeat_count + 1}th time, which would fail again.**\n\n"
+                            f"The command `{cmd_desc}` has failed {repeat_count} times already. I need to:\n"
+                            f"1. Read the actual error output from the previous failures\n"
+                            f"2. Fix the root cause (likely a code issue, not a command issue)\n"
+                            f"3. Only then retry the build/test"
+                )
+                blocked = True
+                break
+        
+        if blocked:
+            return {"messages": [blocked_msg]}
+    
     # ── Detect empty response (no content AND no tool calls) ──
     has_content = response.content and response.content.strip()
     has_tools = response.tool_calls and len(response.tool_calls) > 0
