@@ -1633,18 +1633,24 @@ async def call_model(state: AgentState) -> dict:
     logger.info("[call_model] enriched_context=%d chars, plan_steps=%d, current_step=%d",
                 len(enriched_context), len(plan_steps), current_step)
     
-    # ── AUTO-SKIP: Force skip step after 8+ turns stuck ────────────
+    # ── AUTO-REPLAN: Force replan after 8+ turns stuck on same step ────────────
     if plan_steps and current_step > 0:
         turns_on_step = 0
+        plan_tools = {'create_plan', 'update_plan', 'replan', 'add_plan_step', 'remove_plan_step'}
+        
         for msg in reversed(state['messages']):
-            if isinstance(msg, AIMessage) and not msg.tool_calls:
+            # First check if this is a plan-modifying tool - if so, stop counting
+            # (we only want to count turns AFTER the current step started)
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                if any(tc['name'] in plan_tools for tc in msg.tool_calls):
+                    # Found where the current step started, stop here
+                    break
+                # Regular tool call - count it
+                turns_on_step += 1
+            elif isinstance(msg, AIMessage) and not msg.tool_calls:
                 # Text response - count it
                 turns_on_step += 1
-            elif isinstance(msg, AIMessage) and msg.tool_calls:
-                turns_on_step += 1
-                # Check if any tool is update_plan to advance step - that breaks the count
-                if any(tc['name'] == 'update_plan' for tc in msg.tool_calls):
-                    break
+            
             if turns_on_step >= 20:  # Don't scan too far back
                 break
         
