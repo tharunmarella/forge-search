@@ -82,6 +82,8 @@ class AgentState(TypedDict):
     enriched_question: str
     # Which plan step we last enriched for (0 = no step-specific enrichment)
     enriched_step: int
+    # Project profile: tech stack, versions, warnings (built once per workspace)
+    project_profile: str
     # Attached files from IDE (live file contents)
     attached_files: dict[str, str]  # path -> content
     # ── Plan state (managed by create_plan/update_plan/discard_plan tools) ──
@@ -490,6 +492,126 @@ async def _decompose_query(question: str, attached_files: dict[str, str] | None 
     except Exception as e:
         logger.warning("[decompose] Failed (%s), falling back to raw question", e)
         return [question], []
+
+
+# ── Project Profile ───────────────────────────────────────────────
+#
+# Reads key config files and uses the tool model to understand the
+# project's tech stack, versions, and detect compatibility issues
+# BEFORE the agent writes any code.
+
+# Config files to look for (checked in order, missing files are skipped)
+PROJECT_CONFIG_FILES = [
+    # Package managers / dependencies
+    "package.json", "Cargo.toml", "requirements.txt", "pyproject.toml",
+    "go.mod", "Gemfile", "pom.xml", "build.gradle",
+    # Framework configs
+    "next.config.js", "next.config.mjs", "next.config.ts",
+    "vite.config.ts", "vite.config.js",
+    "nuxt.config.ts", "angular.json", "svelte.config.js",
+    # TypeScript / JavaScript
+    "tsconfig.json", "jsconfig.json",
+    # Styling
+    "tailwind.config.js", "tailwind.config.ts", "postcss.config.js", "postcss.config.mjs",
+    # UI libraries
+    "components.json",  # Shadcn
+    # Linting / formatting
+    ".eslintrc.js", ".eslintrc.json", "eslint.config.js",
+    ".prettierrc", ".prettierrc.json",
+    # Environment / runtime
+    ".nvmrc", ".node-version", ".python-version", ".tool-versions",
+    "Dockerfile", "docker-compose.yml",
+    # Git
+    ".gitignore",
+]
+
+# Global CSS files to check for styling config
+PROJECT_CSS_FILES = [
+    "styles/globals.css", "src/styles/globals.css",
+    "app/globals.css", "src/app/globals.css",
+    "src/index.css", "styles/global.css",
+]
+
+PROFILE_ANALYSIS_PROMPT = """Analyze this project's configuration files and produce a concise project profile.
+
+Extract:
+1. **Framework** + exact version (e.g., "Next.js 13.4.0 (Pages Router)" or "Vite 5.2 + React 18")
+2. **Language** + version (e.g., "TypeScript 5.3, strict mode")
+3. **Styling** + version (e.g., "Tailwind CSS 4.1.18 with v4 CSS syntax")
+4. **UI Library** (e.g., "Shadcn UI" if components.json present)
+5. **Package manager** (npm/yarn/pnpm/bun — infer from lock file or config)
+6. **Test framework** (jest, vitest, pytest, etc. or "none detected")
+7. **Key conventions** (src/ vs app/ structure, module system ESM/CJS)
+
+Then check for **WARNINGS** — version conflicts, configuration mismatches, or common pitfalls:
+- Framework version vs dependency version compatibility
+- Config file syntax vs installed version mismatches (e.g., Tailwind v4 CSS syntax but v3 config file format)
+- Missing peer dependencies
+- Outdated patterns that will cause issues
+
+Format as a concise profile. Keep it under 400 words. Start warnings with "WARNING:" so they stand out.
+
+Respond with ONLY the profile text, no JSON wrapping."""
+
+
+@traceable(name="build_project_profile", run_type="chain", tags=["profile"])
+async def build_project_profile(attached_files: dict[str, str] | None = None) -> str:
+    """Build a project profile from config files.
+    
+    Reads key config files from attached_files (sent by IDE) and uses the
+    tool model to analyze tech stack, versions, and detect conflicts.
+    
+    Returns a profile string to inject into the agent's context.
+    """
+    if not attached_files:
+        return ""
+    
+    # Step 1: Collect config file contents from attached files
+    config_contents = {}
+    all_config_names = set(PROJECT_CONFIG_FILES + PROJECT_CSS_FILES)
+    
+    for path, content in attached_files.items():
+        # Match by filename (attached files have full paths)
+        filename = path.rsplit("/", 1)[-1] if "/" in path else path
+        # Also check path suffixes for nested configs like styles/globals.css
+        matches = (
+            filename in all_config_names
+            or any(path.endswith(f) for f in all_config_names)
+        )
+        if matches and content.strip():
+            # Truncate very large configs (package-lock.json etc.)
+            truncated = content[:3000] if len(content) > 3000 else content
+            config_contents[path] = truncated
+    
+    if not config_contents:
+        logger.info("[project_profile] No config files found in attached files")
+        return ""
+    
+    logger.info("[project_profile] Found %d config files: %s", 
+               len(config_contents), list(config_contents.keys()))
+    
+    # Step 2: Analyze with tool model
+    files_text = "\n\n".join(
+        f"### {path}\n```\n{content}\n```"
+        for path, content in config_contents.items()
+    )
+    
+    try:
+        model = llm_provider.get_tool_model(temperature=0.0)
+        response = await model.ainvoke([
+            SystemMessage(content=PROFILE_ANALYSIS_PROMPT),
+            HumanMessage(content=files_text),
+        ])
+        
+        profile = response.content.strip()
+        logger.info("[project_profile] Built profile (%d chars): %s", len(profile), profile[:200])
+        return profile
+        
+    except Exception as e:
+        logger.warning("[project_profile] Analysis failed (%s), building basic profile", e)
+        # Fallback: just list what we found
+        files_list = ", ".join(config_contents.keys())
+        return f"Project config files detected: {files_list}"
 
 
 # ── Pre-Enrichment Logic ──────────────────────────────────────────
@@ -955,12 +1077,30 @@ async def enrich_context(state: AgentState) -> dict:
         logger.warning("[enrich_context] No question found in messages")
         return {"enriched_context": "", "enriched_question": "", "enriched_step": 0}
     
-    # ── First turn: full enrichment ──
+    # ── First turn: full enrichment + project profile ──
     if not existing_context:
+        import asyncio
         logger.info("[enrich_context] First turn — enriching for: %s", question[:100])
-        context = await build_pre_enrichment(workspace_id, question, attached_files)
-        logger.info("[enrich_context] Built context with %d chars", len(context))
-        return {"enriched_context": context, "enriched_question": question, "enriched_step": current_step}
+        
+        # Build project profile and code enrichment in parallel
+        existing_profile = state.get('project_profile', '')
+        if not existing_profile:
+            # Profile + enrichment concurrently
+            profile_coro = build_project_profile(attached_files)
+            enrich_coro = build_pre_enrichment(workspace_id, question, attached_files)
+            profile, context = await asyncio.gather(profile_coro, enrich_coro)
+            logger.info("[enrich_context] Built context=%d chars, profile=%d chars", len(context), len(profile))
+            return {
+                "enriched_context": context,
+                "enriched_question": question,
+                "enriched_step": current_step,
+                "project_profile": profile,
+            }
+        else:
+            # Profile already exists (from Redis cache), just enrich
+            context = await build_pre_enrichment(workspace_id, question, attached_files)
+            logger.info("[enrich_context] Built context with %d chars (profile cached)", len(context))
+            return {"enriched_context": context, "enriched_question": question, "enriched_step": current_step}
     
     # ── Follow-up question: check for topic shift ──
     if enriched_question and question != enriched_question:
@@ -1290,6 +1430,22 @@ async def call_model(state: AgentState) -> dict:
     
     # System prompt
     messages_to_send.append(SystemMessage(content=SYSTEM_PROMPT))
+    
+    # ── Project profile (tech stack, versions, warnings) ────
+    project_profile = state.get('project_profile', '')
+    is_first_call = not any(isinstance(m, ToolMessage) for m in state['messages'])
+    
+    if project_profile:
+        messages_to_send.append(SystemMessage(
+            content=f"## Project Profile\n\n{project_profile}\n\nIMPORTANT: If there are WARNINGs above, address them BEFORE starting the user's task. Fix version conflicts, configuration mismatches, or compatibility issues first."
+        ))
+        logger.info("[call_model] Injected project profile (%d chars)", len(project_profile))
+    elif is_first_call:
+        # No profile yet — tell the agent to read config files first
+        messages_to_send.append(SystemMessage(
+            content="## Project Profile: Not Yet Available\n\nBefore making any changes, read the project's key config files to understand the tech stack:\n- `read_file(\"package.json\")` or `read_file(\"Cargo.toml\")` or `read_file(\"requirements.txt\")`\n- Check framework config, styling config (tailwind.config.*, globals.css)\n- Check for version conflicts between dependencies\n\nThis prevents writing code that's incompatible with the project's environment."
+        ))
+        logger.info("[call_model] No profile — injected config-read guidance")
     
     # ── Active plan context (created by create_plan tool) ────
     if plan_steps and current_step > 0:

@@ -958,6 +958,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     current_step = 0
     enriched_question = ""
     enriched_step = 0
+    project_profile = ""
 
     if has_tool_results and stored:
         # TOOL RESULT CONTINUATION: restore full history + append tool results
@@ -965,6 +966,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         enriched_context = stored.get("enriched_context", "")
         enriched_question = stored.get("enriched_question", "")
         enriched_step = stored.get("enriched_step", 0)
+        project_profile = stored.get("project_profile", "")
         attached_files_dict = stored.get("attached_files", {})
         # Restore plan state
         plan_steps = stored.get("plan_steps", [])
@@ -986,6 +988,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         enriched_context = stored.get("enriched_context", "")
         enriched_question = stored.get("enriched_question", "")
         enriched_step = stored.get("enriched_step", 0)
+        project_profile = stored.get("project_profile", "")
         attached_files_dict = stored.get("attached_files", {})
         # Restore plan state
         plan_steps = stored.get("plan_steps", [])
@@ -1083,6 +1086,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "enriched_context": enriched_context,  # Preserved on continuation!
                 "enriched_question": enriched_question,  # For topic shift detection
                 "enriched_step": enriched_step,  # For step-aware supplementary enrichment
+                "project_profile": project_profile,  # Tech stack, versions, warnings
                 # Plan state (preserved across tool-result continuations)
                 "plan_steps": plan_steps,
                 "current_step": current_step,
@@ -1093,6 +1097,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         enriched_ctx = result.get("enriched_context", "")
         result_enriched_question = result.get("enriched_question", "")
         result_enriched_step = result.get("enriched_step", 0)
+        result_project_profile = result.get("project_profile", "")
         final_messages = result["messages"]
         last_message = final_messages[-1]
         
@@ -1144,6 +1149,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             "enriched_context": enriched_ctx,
             "enriched_question": result_enriched_question,
             "enriched_step": result_enriched_step,
+            "project_profile": result_project_profile,
             "attached_files": attached_files_dict,
             # Persist plan state across turns
             "plan_steps": result_plan_steps,
@@ -1224,12 +1230,14 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             current_step = 0
             enriched_question = ""
             enriched_step = 0
+            project_profile = ""
 
             if has_tool_results and stored:
                 messages = stored["messages"]
                 enriched_context = stored.get("enriched_context", "")
                 enriched_question = stored.get("enriched_question", "")
                 enriched_step = stored.get("enriched_step", 0)
+                project_profile = stored.get("project_profile", "")
                 attached_files_dict = stored.get("attached_files", {})
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
@@ -1245,6 +1253,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 enriched_context = stored.get("enriched_context", "")
                 enriched_question = stored.get("enriched_question", "")
                 enriched_step = stored.get("enriched_step", 0)
+                project_profile = stored.get("project_profile", "")
                 attached_files_dict = stored.get("attached_files", {})
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
@@ -1331,6 +1340,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                     "enriched_context": enriched_context,
                     "enriched_question": enriched_question,
                     "enriched_step": enriched_step,
+                    "project_profile": project_profile,
                     "plan_steps": plan_steps,
                     "current_step": current_step,
                 },
@@ -1340,6 +1350,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             enriched_ctx = result.get("enriched_context", "")
             result_enriched_question = result.get("enriched_question", "")
             result_enriched_step = result.get("enriched_step", 0)
+            result_project_profile = result.get("project_profile", "")
             final_messages = result["messages"]
             last_message = final_messages[-1]
             
@@ -1389,6 +1400,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 "enriched_context": enriched_ctx,
                 "enriched_question": result_enriched_question,
                 "enriched_step": result_enriched_step,
+                "project_profile": result_project_profile,
                 "attached_files": attached_files_dict,
                 "plan_steps": result_plan_steps,
                 "current_step": result_current_step,
