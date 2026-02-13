@@ -67,6 +67,7 @@ PROVIDERS: dict[str, dict] = {
         "name": "Anthropic (Claude)",
         "env_key": "ANTHROPIC_API_KEY",
         "models": [
+            "anthropic/claude-opus-4-6",
             "anthropic/claude-sonnet-4-20250514",
             "anthropic/claude-3-5-haiku-20241022",
             "anthropic/claude-3-5-sonnet-20241022",
@@ -119,6 +120,7 @@ class ModelConfig:
     """Runtime model configuration (mutable at runtime via /models/set)."""
     reasoning_model: str = ""
     tool_model: str = ""
+    planning_model: str = ""  # Dedicated model for plan creation/replan (optional)
 
     def __post_init__(self):
         if not self.reasoning_model:
@@ -137,6 +139,13 @@ class ModelConfig:
             )
             if not _has_provider_prefix(self.tool_model):
                 self.tool_model = f"groq/{self.tool_model}"
+        
+        # Planning model: defaults to reasoning model if not set
+        # Use a strong model like Claude for high-quality plans
+        if not self.planning_model:
+            self.planning_model = os.getenv("LLM_PLANNING_MODEL", "")
+            if self.planning_model and not _has_provider_prefix(self.planning_model):
+                self.planning_model = f"anthropic/{self.planning_model}"
 
 
 def _has_provider_prefix(model: str) -> bool:
@@ -164,6 +173,16 @@ def set_reasoning_model(model: str):
 def set_tool_model(model: str):
     _config.tool_model = model
     logger.info("Tool model set to: %s", model)
+
+
+def set_planning_model(model: str):
+    _config.planning_model = model
+    logger.info("Planning model set to: %s", model)
+
+
+def get_planning_model_name() -> str | None:
+    """Get the dedicated planning model, or None to use reasoning model."""
+    return _config.planning_model if _config.planning_model else None
 
 
 # ── LangChain Chat Model Factory ──────────────────────────────────
@@ -259,6 +278,7 @@ def get_active_models() -> dict:
     return {
         "reasoning_model": _config.reasoning_model,
         "tool_model": _config.tool_model,
+        "planning_model": _config.planning_model or "(uses reasoning_model)",
     }
 
 
@@ -293,3 +313,4 @@ def log_provider_status():
         )
     logger.info("Reasoning model: %s", _config.reasoning_model)
     logger.info("Tool model: %s", _config.tool_model)
+    logger.info("Planning model: %s", _config.planning_model or "(uses reasoning model)")

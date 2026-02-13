@@ -53,13 +53,100 @@ SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tas
 3. **Search smart.** Use `codebase_search` for meaning, `grep` for exact text. Never `execute_command` with grep/find.
 4. **Don't loop.** If a command fails twice, use `lookup_documentation` or try a different approach. Never retry 3+ times.
 5. **Rename safely.** Prefer `lsp_rename` over manual find/replace — it's atomic and cross-file.
-6. **Plan complex tasks.** Use `create_plan` for 3+ step tasks. Call `update_plan` after each step so the user sees progress live.
+6. **Plan adaptively.** Use `create_plan` for 3+ step tasks. Update progress with `update_plan`. If things aren't working (2+ failures), use `replan` to revise your strategy. Use `add_plan_step`/`remove_plan_step` to adjust scope as you learn more.
 7. **Verify your work.** After edits: `diagnostics` on changed files → `find_symbol_references` on changed symbols → build/test command. Not done until checks pass.
 8. **Dev servers and long-running processes:** NEVER use `execute_command` for servers or watchers (npm run dev, cargo watch, etc.) — it blocks until timeout. Instead:
    - `execute_background(command, label)` to start the process
    - `wait_for_port(port, timeout, http_check=True)` to wait until it's ready
    - `read_process_output(pid)` to check logs if something goes wrong
    Install-then-run commands should be split: `execute_command("npm install")` first, then `execute_background("npm run dev")`."""
+
+
+# ── Master Planning Prompt (used when Claude is called for planning) ──
+# This prompt extracts maximum value from expensive Claude calls by asking
+# for deep analysis, comprehensive planning, and upfront risk identification.
+
+MASTER_PLANNING_PROMPT = """## Master Planning Mode
+
+You are being called with a powerful reasoning model for ONE purpose: create a comprehensive, production-quality execution plan. This is your ONE chance to think deeply before the faster execution model takes over.
+
+### Your Planning Responsibilities
+
+**1. ANALYZE THE REQUEST THOROUGHLY**
+- What is the user ACTUALLY trying to achieve? (Not just what they said)
+- What's the scope? (Single file fix vs architectural change vs new feature)
+- What domain knowledge is needed? (Framework conventions, API patterns, security considerations)
+
+**2. EXPLORE BEFORE PLANNING**
+Before calling `create_plan`, you SHOULD use tools to gather critical information:
+- `codebase_search` — find related code, similar implementations, patterns used in this codebase
+- `read_file` — examine key files (configs, existing implementations to match style)
+- `grep` — find all usages of symbols you'll modify
+
+**3. CREATE A MASTERFUL PLAN**
+Your plan should include:
+- **Preparation steps** (read files, understand existing patterns, check dependencies)
+- **Implementation steps** (concrete, specific changes with file paths when known)
+- **Verification steps** (tests to run, diagnostics to check, manual verification)
+- **Rollback awareness** (what to do if a step fails)
+
+Each step should be ATOMIC — completable without depending on later steps.
+Order steps to minimize risk: read → small change → verify → larger changes.
+
+**4. IDENTIFY RISKS UPFRONT**
+In your response (before the plan), briefly note:
+- Potential breaking changes or side effects
+- Dependencies that might need updating
+- Files that are touched by multiple steps (conflict risk)
+- Things you're uncertain about that need exploration
+
+**5. OPTIMIZE FOR THE EXECUTION MODEL**
+The execution model is faster but less capable. Write steps that are:
+- Clear and unambiguous (no "figure out how to X")
+- Self-contained (include file paths, function names)
+- Verifiable (each step should have a way to confirm success)
+
+### Example of Good vs Bad Plan Steps
+
+❌ Bad: "Update the authentication logic"
+✓ Good: "In auth/session.py, modify `create_session()` to return JWT instead of session ID. Update return type annotation."
+
+❌ Bad: "Fix any issues that come up"
+✓ Good: "Run `pytest tests/auth/` and fix any failures related to session token format"
+
+❌ Bad: "Refactor the codebase"
+✓ Good: "Extract `validate_token()` from auth/middleware.py into auth/jwt.py, update 3 imports in auth/routes.py"
+
+### Now: Think deeply, explore the codebase, then create your master plan."""
+
+
+# ── Replan Prompt (used when Claude is called to recover from stuck state) ──
+
+REPLAN_PROMPT = """## Strategic Replanning Mode
+
+The current approach isn't working. You're being called with a powerful reasoning model to diagnose the problem and create a BETTER plan.
+
+### Analyze What Went Wrong
+
+1. **Review the failures** — What specifically failed? Error messages, wrong assumptions, missing dependencies?
+2. **Identify root cause** — Was it a bad plan, unexpected codebase structure, or environmental issue?
+3. **Learn from attempts** — What DID work? What can be preserved?
+
+### Create a Revised Strategy
+
+Use `replan(reason, new_steps, keep_completed=True)` to:
+- Acknowledge what went wrong (the `reason` is shown to the user)
+- Create new steps that avoid the same pitfalls
+- Preserve completed work if it's still valid
+
+### Common Recovery Patterns
+
+- **Dependency issue?** → Add step to check/fix dependencies first
+- **Wrong file/location?** → Add exploration step before modifying
+- **Test failures?** → Add step to read test expectations, match them
+- **Config mismatch?** → Add step to align with project conventions
+
+### Now: Diagnose the issue, then use `replan` with a smarter approach."""
 
 
 
@@ -192,6 +279,63 @@ async def discard_plan() -> str:
     Discard the current plan entirely.
     Use when the approach needs to change fundamentally, or the task
     turned out to be simpler than expected and doesn't need a plan.
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+@tool
+async def add_plan_step(after_step: int, description: str) -> str:
+    """
+    Insert a new step into the current plan.
+    Use when you discover the task needs additional work not in the original plan.
+    
+    Args:
+        after_step: Insert the new step AFTER this step number (0 = insert at beginning).
+        description: What the new step should accomplish.
+    
+    Example:
+        # Discovered we need database migrations before updating the API
+        add_plan_step(2, "Create database migration for new user_roles table")
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+@tool
+async def remove_plan_step(step_number: int) -> str:
+    """
+    Remove a step from the current plan.
+    Use when a step is no longer needed (already handled, or approach changed).
+    
+    Args:
+        step_number: Which step to remove (1-indexed).
+    """
+    return "PENDING_SERVER_EXECUTION"
+
+
+@tool
+async def replan(reason: str, new_steps: list[str], keep_completed: bool = True) -> str:
+    """
+    Replace the current plan with a new one, optionally preserving completed work.
+    Use when:
+    - The original approach isn't working (2+ step failures)
+    - You discovered the task is significantly different than expected
+    - Major blockers require a different strategy
+    
+    Args:
+        reason: Brief explanation of why re-planning is needed (shown to user).
+        new_steps: The new list of steps to execute.
+        keep_completed: If True, completed steps from the old plan are preserved
+                       as a "completed" section for context. Default True.
+    
+    Example:
+        replan(
+            reason="Jest tests require different config than expected",
+            new_steps=[
+                "Check existing jest.config.js for test environment",
+                "Update jest config to use jsdom environment",
+                "Re-run failing tests with new config"
+            ]
+        )
     """
     return "PENDING_SERVER_EXECUTION"
 
@@ -372,7 +516,7 @@ def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
 
 
 # Tool lists
-PLAN_TOOLS = [create_plan, update_plan, discard_plan]
+PLAN_TOOLS = [create_plan, update_plan, discard_plan, add_plan_step, remove_plan_step, replan]
 SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation] + PLAN_TOOLS
 IDE_FILE_TOOLS = [read_file, write_to_file, replace_in_file, delete_file, apply_patch, list_files, glob]
 IDE_EXEC_TOOLS = [execute_command, execute_background, read_process_output, check_process_status, kill_process]
@@ -397,7 +541,7 @@ IDE_TOOL_NAMES = {
     # LSP
     "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
 }
-PLAN_TOOL_NAMES = {"create_plan", "update_plan", "discard_plan"}
+PLAN_TOOL_NAMES = {"create_plan", "update_plan", "discard_plan", "add_plan_step", "remove_plan_step", "replan"}
 SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"} | PLAN_TOOL_NAMES
 
 
@@ -1307,6 +1451,9 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
     # ── Check: 2+ consecutive errors ──
     if consecutive_errors >= 2:
         logger.warning("[reflect] STUCK: %d consecutive tool errors", consecutive_errors)
+        if plan_steps and current_step > 0:
+            # Suggest replan if there's an active plan
+            return REFLECT_PROMPT + f"\n\n**Detected: {consecutive_errors} consecutive tool errors.** The current approach is failing repeatedly. Consider using `replan` to revise your strategy, or `update_plan` to mark this step as failed and try a different approach."
         return REFLECT_PROMPT + f"\n\n**Detected: {consecutive_errors} consecutive tool errors.** The current approach is failing repeatedly."
     
     # ── Check: same tool+args called twice (loop) ──
@@ -1315,6 +1462,8 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
         for call in recent_ai_calls:
             if call["args_key"] in seen_calls:
                 logger.warning("[reflect] STUCK: duplicate tool call detected: %s", call["name"])
+                if plan_steps and current_step > 0:
+                    return REFLECT_PROMPT + f"\n\n**Detected: you called `{call['name']}` with the same arguments twice.** This is a loop. Consider using `replan` if the current plan isn't working, or try a fundamentally different approach."
                 return REFLECT_PROMPT + f"\n\n**Detected: you called `{call['name']}` with the same arguments twice.** This is a loop. Try a different approach."
             seen_calls.add(call["args_key"])
     
@@ -1323,7 +1472,14 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
         step_desc = plan_steps[current_step - 1]["description"] if current_step <= len(plan_steps) else "?"
         logger.warning("[reflect] STUCK: step %d ('%s') has been in progress for %d turns", 
                       current_step, step_desc, turns_on_current_step)
-        return REFLECT_PROMPT + f"\n\n**Detected: step {current_step} ('{step_desc}') has been in progress for {turns_on_current_step} turns.** Either break it into smaller steps, mark it failed, or try a different approach."
+        return REFLECT_PROMPT + f"\n\n**Detected: step {current_step} ('{step_desc}') has been in progress for {turns_on_current_step} turns.** Options: use `add_plan_step` to break this into smaller steps, use `update_plan` to mark it failed and move on, or use `replan` if the overall approach needs to change."
+    
+    # ── Check: multiple failed steps in plan (suggests overall approach is wrong) ──
+    if plan_steps:
+        failed_count = sum(1 for s in plan_steps if s["status"] == "failed")
+        if failed_count >= 2:
+            logger.warning("[reflect] STUCK: %d plan steps have failed", failed_count)
+            return REFLECT_PROMPT + f"\n\n**Detected: {failed_count} plan steps have failed.** The overall approach may be flawed. Use `replan` to create a new strategy based on what you've learned."
     
     return None
 
@@ -1348,27 +1504,38 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
 def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0, is_reflecting: bool = False) -> str:
     """Pick model string based on what the agent needs to do RIGHT NOW.
     
+    Planning model (Claude, best quality):
+      - First call when no plan exists (will likely create plan)
+      - Reflection mode suggesting replan
+    
     Reasoning model (stronger, slower) for moments that need deep thinking:
-      - First call (understand the question + codebase context)
       - Right after creating a plan (first execution step needs understanding)
       - After a tool failure (needs to reason about what went wrong)
-      - When there's no plan yet but the task looks complex (agent might create one)
     
     Tool model (faster, cheaper) for straightforward execution:
       - Processing normal tool results (file contents, search results)
       - Continuing plan execution on routine steps
     """
     config = llm_provider.get_config()
+    planning_model = llm_provider.get_planning_model_name()
     
-    # Reflection mode: always use reasoning (agent is stuck, needs to think)
-    if is_reflecting:
-        logger.info("[model_routing] → reasoning (reflection mode)")
-        return config.reasoning_model
-    
-    # No tool messages at all → first call, always use reasoning
+    # No tool messages at all → first call
     has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
     if not has_tool_messages:
+        # First call with no existing plan → use planning model (likely to create plan)
+        if not plan_steps and planning_model:
+            logger.info("[model_routing] → planning model (first call, no plan yet)")
+            return planning_model
         logger.info("[model_routing] → reasoning (first call)")
+        return config.reasoning_model
+    
+    # Reflection mode: check if it's suggesting replan
+    if is_reflecting:
+        # If planning model is available AND reflection mentions replan, use it
+        if planning_model:
+            logger.info("[model_routing] → planning model (reflection/replan scenario)")
+            return planning_model
+        logger.info("[model_routing] → reasoning (reflection mode)")
         return config.reasoning_model
     
     # Look at the last few messages to understand what just happened
@@ -1437,6 +1604,27 @@ async def call_model(state: AgentState) -> dict:
     project_profile = state.get('project_profile', '')
     is_first_call = not any(isinstance(m, ToolMessage) for m in state['messages'])
     
+    # ── Determine model early so we know if we should inject planning prompt ──
+    planning_model = llm_provider.get_planning_model_name()
+    using_planning_model = is_first_call and not plan_steps and planning_model
+    
+    # ── Master Planning Prompt (when Claude is doing the initial analysis) ──
+    if using_planning_model:
+        messages_to_send.append(SystemMessage(content=MASTER_PLANNING_PROMPT))
+        logger.info("[call_model] Injected MASTER_PLANNING_PROMPT (using planning model)")
+        
+        # Also inject full attached file contents for planning context
+        attached_files = state.get('attached_files', {})
+        if attached_files:
+            files_context = "## User's Open Files (Full Content)\n\nThe user has these files open in their IDE. Use them to understand context, patterns, and code style:\n\n"
+            for path, content in list(attached_files.items())[:8]:  # Up to 8 files for planning
+                # Truncate very large files but be generous for planning
+                if len(content) > 15000:
+                    content = content[:15000] + f"\n\n... (truncated, {len(content)} chars total)"
+                files_context += f"### {path}\n```\n{content}\n```\n\n"
+            messages_to_send.append(SystemMessage(content=files_context))
+            logger.info("[call_model] Injected %d attached files for planning", len(attached_files))
+    
     if project_profile:
         messages_to_send.append(SystemMessage(
             content=f"## Project Profile\n\n{project_profile}\n\nIMPORTANT: If there are WARNINGs above, address them BEFORE starting the user's task. Fix version conflicts, configuration mismatches, or compatibility issues first."
@@ -1471,6 +1659,11 @@ async def call_model(state: AgentState) -> dict:
     if reflection:
         messages_to_send.append(SystemMessage(content=reflection))
         logger.info("[call_model] Injected reflection prompt (agent appears stuck)")
+        
+        # If we have a planning model and there's an active plan, inject replan guidance
+        if planning_model and plan_steps:
+            messages_to_send.append(SystemMessage(content=REPLAN_PROMPT))
+            logger.info("[call_model] Injected REPLAN_PROMPT (Claude for strategic recovery)")
     
     # Add conversation history (with truncation)
     history = await _truncate_messages(state['messages'])
@@ -1625,6 +1818,96 @@ async def execute_server_tools(state: AgentState) -> dict:
                 plan_changed = True
                 content = "Plan discarded."
                 logger.info("[discard_plan] Plan cleared")
+            
+            elif tool_name == "add_plan_step":
+                after_step = args.get('after_step', 0)
+                description = args.get('description', '')
+                
+                if not plan_steps:
+                    content = "Error: No active plan. Use create_plan first."
+                elif after_step < 0 or after_step > len(plan_steps):
+                    content = f"Error: Invalid position. after_step must be 0-{len(plan_steps)}."
+                elif not description:
+                    content = "Error: description cannot be empty."
+                else:
+                    # Insert new step after the specified position
+                    new_step = PlanStep(
+                        number=after_step + 1,  # Will be renumbered
+                        description=description,
+                        status="pending"
+                    )
+                    plan_steps.insert(after_step, new_step)
+                    
+                    # Renumber all steps
+                    for i, step in enumerate(plan_steps):
+                        step["number"] = i + 1
+                    
+                    # Adjust current_step if we inserted before it
+                    if after_step < current_step:
+                        current_step += 1
+                    
+                    plan_changed = True
+                    content = f"Inserted new step {after_step + 1}: '{description[:50]}...' Plan now has {len(plan_steps)} steps."
+                    logger.info("[add_plan_step] Inserted step after %d, total=%d", after_step, len(plan_steps))
+            
+            elif tool_name == "remove_plan_step":
+                step_num = args.get('step_number', 0)
+                
+                if not plan_steps:
+                    content = "Error: No active plan."
+                elif step_num < 1 or step_num > len(plan_steps):
+                    content = f"Error: Invalid step number {step_num}. Plan has {len(plan_steps)} steps."
+                elif len(plan_steps) == 1:
+                    content = "Error: Cannot remove the last step. Use discard_plan instead."
+                else:
+                    removed = plan_steps.pop(step_num - 1)
+                    
+                    # Renumber remaining steps
+                    for i, step in enumerate(plan_steps):
+                        step["number"] = i + 1
+                    
+                    # Adjust current_step
+                    if step_num < current_step:
+                        current_step -= 1
+                    elif step_num == current_step and current_step > len(plan_steps):
+                        current_step = len(plan_steps) if plan_steps else 0
+                        if plan_steps and current_step > 0:
+                            plan_steps[current_step - 1]["status"] = "in_progress"
+                    
+                    plan_changed = True
+                    content = f"Removed step {step_num}: '{removed['description'][:40]}...' Plan now has {len(plan_steps)} steps."
+                    logger.info("[remove_plan_step] Removed step %d, total=%d", step_num, len(plan_steps))
+            
+            elif tool_name == "replan":
+                reason = args.get('reason', 'Re-planning required')
+                new_step_descs = args.get('new_steps', [])
+                keep_completed = args.get('keep_completed', True)
+                
+                if not new_step_descs:
+                    content = "Error: new_steps list cannot be empty."
+                else:
+                    # Capture completed steps for context
+                    completed_summary = ""
+                    if keep_completed and plan_steps:
+                        completed = [s for s in plan_steps if s["status"] == "done"]
+                        if completed:
+                            completed_summary = "Completed work preserved: " + "; ".join(
+                                f"✓ {s['description'][:40]}" for s in completed
+                            )
+                    
+                    # Create new plan
+                    plan_steps = [
+                        PlanStep(number=i + 1, description=desc, status="pending")
+                        for i, desc in enumerate(new_step_descs)
+                    ]
+                    plan_steps[0]["status"] = "in_progress"
+                    current_step = 1
+                    plan_changed = True
+                    
+                    content = f"Re-planned: {reason}\nNew plan has {len(plan_steps)} steps. Step 1 is now in progress."
+                    if completed_summary:
+                        content += f"\n{completed_summary}"
+                    logger.info("[replan] Reason='%s', new_steps=%d", reason, len(plan_steps))
                 
             else:
                 # Not a server tool, skip
