@@ -64,7 +64,6 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     # Startup
     logger.info("Starting up Forge Search API...")
-    await store.init_pool()
     await _ensure_mongo_indexes()
     logger.info("✓ Ready to serve requests")
     
