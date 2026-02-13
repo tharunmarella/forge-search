@@ -68,7 +68,7 @@ from .models import (
 )
 from .parser import parse_file, SymbolDef, SymbolRef, FileParseResult
 
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,6 +119,8 @@ def _serialize_messages(messages: list) -> list[dict]:
                 "content": m.content,
                 "tool_call_id": m.tool_call_id,
             })
+        elif isinstance(m, SystemMessage):
+            result.append({"type": "system", "content": m.content})
     return result
 
 
@@ -138,6 +140,8 @@ def _deserialize_messages(data: list[dict]) -> list:
                 content=m["content"],
                 tool_call_id=m["tool_call_id"],
             ))
+        elif m["type"] == "system":
+            messages.append(SystemMessage(content=m["content"]))
     return messages
 
 
@@ -1168,7 +1172,16 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         # Serialize history for the IDE (for display/debugging)
         serialized_history = []
         for m in final_messages:
-            m_type = "human" if isinstance(m, HumanMessage) else "ai" if isinstance(m, AIMessage) else "tool"
+            if isinstance(m, HumanMessage):
+                m_type = "human"
+            elif isinstance(m, AIMessage):
+                m_type = "ai"
+            elif isinstance(m, ToolMessage):
+                m_type = "tool"
+            elif isinstance(m, SystemMessage):
+                m_type = "system"
+            else:
+                continue  # skip unknown message types
             entry = {"type": m_type, "content": m.content}
             if m_type == "ai" and m.tool_calls:
                 entry["tool_calls"] = m.tool_calls
