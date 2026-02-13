@@ -1503,16 +1503,22 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
             return REFLECT_PROMPT + f"\n\n**CRITICAL: {consecutive_errors} consecutive tool errors.** STOP retrying the same approach.{dont_retry}\n\nOptions:\n1. `replan` - Create a new strategy\n2. `update_plan` - Mark this step failed and skip to next\n3. Ask the user for help or clarification"
         return REFLECT_PROMPT + f"\n\n**CRITICAL: {consecutive_errors} consecutive tool errors.** STOP retrying the same approach.{dont_retry}\n\nTry:\n1. Read error messages carefully and fix the root cause\n2. `lookup_documentation` for the failing tool/library\n3. Ask the user for help if you're stuck"
     
-    # ── Check: same tool+args called twice (loop) ──
+    # ── Check: same tool+args called multiple times (loop) ──
     if len(recent_ai_calls) >= 2:
-        seen_calls = set()
+        call_counts: dict[str, int] = {}
         for call in recent_ai_calls:
-            if call["args_key"] in seen_calls:
-                logger.warning("[reflect] STUCK: duplicate tool call detected: %s", call["name"])
+            call_counts[call["args_key"]] = call_counts.get(call["args_key"], 0) + 1
+        
+        for args_key, count in call_counts.items():
+            if count >= 2:
+                call_name = next(c["name"] for c in recent_ai_calls if c["args_key"] == args_key)
+                logger.warning("[reflect] STUCK: tool '%s' called %d times with same args", call_name, count)
+                
+                severity = "CRITICAL" if count >= 3 else "WARNING"
+                
                 if plan_steps and current_step > 0:
-                    return REFLECT_PROMPT + f"\n\n**LOOP DETECTED: You called `{call['name']}` with identical arguments twice.**\n\n**DO NOT** call `{call['name']}` again with the same arguments. This will fail again.\n\nYou MUST:\n1. Use `replan` to create a new strategy, OR\n2. Use `update_plan` to mark this step failed and move on, OR\n3. Try a COMPLETELY different tool or approach"
-                return REFLECT_PROMPT + f"\n\n**LOOP DETECTED: You called `{call['name']}` with identical arguments twice.**\n\n**DO NOT** repeat this call. You MUST try a different approach:\n1. Read the error and understand WHY it failed\n2. Use a different tool or different arguments\n3. Ask the user if you need more information"
-            seen_calls.add(call["args_key"])
+                    return REFLECT_PROMPT + f"\n\n**{severity} LOOP: `{call_name}` called {count} times with identical arguments — it will NEVER succeed this way.**\n\nYou MUST pick ONE of these RIGHT NOW:\n1. `replan` - Create a completely new strategy\n2. `update_plan` with status='failed' - Skip this step and move on\n\n**DO NOT call `{call_name}` again.** Read the error output and fix the underlying issue first."
+                return REFLECT_PROMPT + f"\n\n**{severity} LOOP: `{call_name}` called {count} times with identical arguments.**\n\n**DO NOT** call `{call_name}` again. You MUST:\n1. Read the error output carefully — what SPECIFIC error is being reported?\n2. Fix the root cause (wrong file, missing dependency, syntax error, etc.)\n3. Only then try a build/test command again"
     
     # ── Check: plan step stuck for 4+ AI turns ──
     if plan_steps and current_step > 0 and turns_on_current_step >= 4:
@@ -1644,65 +1650,102 @@ async def call_model(state: AgentState) -> dict:
     # ── AUTO-REPLAN: Force replan after 8+ turns stuck on same step ────────────
     if plan_steps and current_step > 0:
         turns_on_step = 0
+        auto_replan_count = 0  # How many times we've already auto-replanned
         plan_tools = {'create_plan', 'update_plan', 'replan', 'add_plan_step', 'remove_plan_step'}
         
         for msg in reversed(state['messages']):
-            # First check if this is a plan-modifying tool - if so, stop counting
-            # (we only want to count turns AFTER the current step started)
             if isinstance(msg, AIMessage) and msg.tool_calls:
                 if any(tc['name'] in plan_tools for tc in msg.tool_calls):
-                    # Found where the current step started, stop here
-                    break
-                # Regular tool call - count it
+                    # Count auto-replans to detect repeated replan cycles
+                    if any(tc.get('id', '').startswith('auto_replan_') for tc in msg.tool_calls):
+                        auto_replan_count += 1
+                        if auto_replan_count >= 2:
+                            break  # Stop counting - we've been through this cycle before
+                        continue  # Don't break, keep counting turns past auto-replans
+                    break  # Manual plan tool - stop counting
                 turns_on_step += 1
             elif isinstance(msg, AIMessage) and not msg.tool_calls:
-                # Text response - count it
                 turns_on_step += 1
             
-            if turns_on_step >= 20:  # Don't scan too far back
+            if turns_on_step >= 20:
                 break
         
         if turns_on_step >= 8 and current_step <= len(plan_steps):
             step_desc = plan_steps[current_step - 1].get("description", "?")
-            logger.warning("[call_model] STUCK: step %d stuck for %d turns, forcing replan", 
-                          current_step, turns_on_step)
+            
+            # Strip any previous "[REVISED] Find alternative approach for:" prefixes
+            import re
+            clean_desc = re.sub(r'(\[REVISED\]\s*(Find alternative approach for:\s*)?)+', '', step_desc).strip()
+            if not clean_desc:
+                clean_desc = step_desc  # Fallback if stripping removes everything
+            
+            logger.warning("[call_model] STUCK: step %d stuck for %d turns (auto_replan_count=%d), desc='%s'", 
+                          current_step, turns_on_step, auto_replan_count, clean_desc)
             
             # Collect recent error messages to learn from
             recent_errors = []
             failed_tools = []
+            failed_commands = []
             for msg in reversed(state['messages'][:30]):
                 if isinstance(msg, ToolMessage) and ("error" in msg.content.lower() or "failed" in msg.content.lower() or "exit code: 1" in msg.content.lower()):
-                    error_snippet = msg.content[:150].replace('\n', ' ')
+                    error_snippet = msg.content[:200].replace('\n', ' ')
                     if error_snippet not in recent_errors:
                         recent_errors.append(error_snippet)
                 if isinstance(msg, AIMessage) and msg.tool_calls:
                     for tc in msg.tool_calls:
                         if tc['name'] not in failed_tools:
                             failed_tools.append(tc['name'])
+                        if tc['name'] == 'execute_command':
+                            cmd = tc.get('args', {}).get('command', '')[:80]
+                            if cmd and cmd not in failed_commands:
+                                failed_commands.append(cmd)
                 if len(recent_errors) >= 3:
                     break
             
-            # Build learnings from failures
-            learnings = f"Step '{step_desc}' failed after {turns_on_step} attempts."
-            if recent_errors:
-                learnings += f" Errors encountered: {'; '.join(recent_errors[:2])}"
-            if failed_tools:
-                learnings += f" Tools tried: {', '.join(failed_tools[:5])}"
+            # If we've already auto-replanned 2+ times on this step, SKIP it
+            if auto_replan_count >= 2:
+                logger.warning("[call_model] SKIP: step %d auto-replanned %d times, marking failed and moving on", 
+                              current_step, auto_replan_count)
+                plan_steps[current_step - 1]["status"] = "failed"
+                # Advance to next step
+                next_step = current_step + 1
+                if next_step <= len(plan_steps):
+                    plan_steps[next_step - 1]["status"] = "in_progress"
+                
+                skip_msg = AIMessage(
+                    content=f"⏭️ **Skipping step {current_step}** ('{clean_desc}') — failed after multiple replan attempts. Moving to next step.",
+                    tool_calls=[]
+                )
+                return {
+                    "messages": [skip_msg],
+                    "plan_steps": plan_steps,
+                    "current_step": next_step,
+                }
             
             # Mark current step as failed
             plan_steps[current_step - 1]["status"] = "failed"
             
-            # Create new plan steps that avoid the same approach
-            # We'll create a replan tool call that the model would have made
-            replan_reason = f"Step {current_step} ('{step_desc}') failed repeatedly. {learnings}. Need a different approach."
+            # Build specific guidance based on actual errors
+            error_guidance = ""
+            if failed_commands:
+                error_guidance = f" Commands that failed: {', '.join(failed_commands[:3])}. DO NOT retry these."
+            if recent_errors:
+                error_guidance += f" Error details: {recent_errors[0][:100]}"
             
-            # Generate a synthetic replan tool call
+            replan_reason = f"Step {current_step} ('{clean_desc}') failed after {turns_on_step} attempts.{error_guidance}"
+            
+            # Create actionable replacement step (not just "find alternative")
+            if failed_commands:
+                new_step = f"Fix errors from: {clean_desc}. Read the error output, fix the root cause, then verify"
+            else:
+                new_step = f"Retry with different approach: {clean_desc}"
+            
             replan_tool_call = {
                 "name": "replan",
                 "args": {
                     "reason": replan_reason,
                     "new_steps": [
-                        f"[REVISED] Find alternative approach for: {step_desc}",
+                        new_step,
                         *[s["description"] for s in plan_steps[current_step:] if s["status"] == "pending"]
                     ],
                     "keep_completed": True
@@ -1711,7 +1754,7 @@ async def call_model(state: AgentState) -> dict:
             }
             
             replan_msg = AIMessage(
-                content=f"🔄 **Auto-replanning:** Step {current_step} ('{step_desc}') failed after {turns_on_step} attempts. Creating a revised strategy...",
+                content=f"🔄 **Auto-replanning:** Step {current_step} ('{clean_desc}') failed after {turns_on_step} attempts.{error_guidance}\n\nCreating a revised strategy...",
                 tool_calls=[replan_tool_call]
             )
             
