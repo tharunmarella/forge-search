@@ -77,18 +77,15 @@ You are being called with a powerful reasoning model for ONE purpose: create a c
 - What's the scope? (Single file fix vs architectural change vs new feature)
 - What domain knowledge is needed? (Framework conventions, API patterns, security considerations)
 
-**2. EXPLORE WITH SEMANTIC SEARCH FIRST**
-CRITICAL: Before calling `create_plan`, you MUST use `codebase_search` to find relevant code:
-- `codebase_search("login authentication form")` — find similar implementations
-- `codebase_search("user session handling")` — find related patterns
-- `codebase_search("page component structure")` — understand codebase conventions
+**2. USE THE PRE-GATHERED CONTEXT**
+IMPORTANT: You have already been given semantic search results in the "Pre-gathered Context" section above.
+This contains relevant code snippets found via AI-powered codebase search.
 
-DO NOT just use `list_files` — that only gives you filenames without code.
-The `codebase_search` tool uses AI embeddings to find semantically relevant code snippets.
-
-After semantic search, you can use:
-- `read_file` — examine specific files in detail
-- `grep` — find exact symbol usages
+- Study the code snippets in the pre-gathered context FIRST
+- Reference specific file paths, function names, and patterns from that context
+- Only call `codebase_search` if you need ADDITIONAL information not covered above
+- Use `read_file` to see full file contents if snippets aren't enough
+- Use `grep` to find exact symbol usages across the codebase
 
 **3. CREATE A MASTERFUL PLAN**
 Your plan should include:
@@ -132,10 +129,10 @@ The execution model is faster but less capable. Write steps that are:
 
 ### Workflow Example
 1. User asks: "Add login functionality"
-2. You call: `codebase_search("login form authentication")` → find similar auth patterns
-3. You call: `codebase_search("page component layout")` → understand page structure
-4. You call: `read_file("pages/index.tsx")` → see exact patterns to follow
-5. THEN you call `create_plan` with specific steps referencing what you found
+2. Review the Pre-gathered Context above — it already has relevant code from semantic search
+3. If you need more detail on a specific file, call `read_file("pages/index.tsx")`
+4. If the context is missing something specific, call `codebase_search("session handling")`
+5. Call `create_plan` with steps that reference actual code patterns you found
 
 ### Now: Think deeply, explore the codebase, then create your master plan."""
 
