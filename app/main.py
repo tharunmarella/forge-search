@@ -1249,7 +1249,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         await _log_trace_to_mongo(
             thread_id=conv_id,
             workspace_id=req.workspace_id,
-            user_email=user.get("email", "unknown"),
+            user_email=user.get("email", "unknown") if user else "unknown",
             request_data={
                 "question": req.question,
                 "tool_results": req.tool_results,
@@ -1283,7 +1283,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         await _log_trace_to_mongo(
             thread_id=conv_id,
             workspace_id=req.workspace_id,
-            user_email=user.get("email", "unknown"),
+            user_email=user.get("email", "unknown") if user else "unknown",
             request_data={
                 "question": req.question,
                 "tool_results": req.tool_results,
