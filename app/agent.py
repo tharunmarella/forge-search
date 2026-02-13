@@ -86,6 +86,8 @@ class AgentState(TypedDict):
     project_profile: str
     # Attached files from IDE (live file contents)
     attached_files: dict[str, str]  # path -> content
+    # Attached images from user (paste/screenshot) — list of {filename, data, mime_type}
+    attached_images: list[dict]
     # ── Plan state (managed by create_plan/update_plan/discard_plan tools) ──
     plan_steps: list[PlanStep]
     # 1-indexed step the agent is currently executing (0 = no plan)
@@ -1472,9 +1474,30 @@ async def call_model(state: AgentState) -> dict:
     
     # Add conversation history (with truncation)
     history = await _truncate_messages(state['messages'])
+    
+    # ── Inject attached images into the last HumanMessage ────
+    # Vision models expect images as part of the message content array.
+    attached_images = state.get('attached_images', [])
+    if attached_images and history:
+        # Find the last HumanMessage in history and make it multimodal
+        for i in range(len(history) - 1, -1, -1):
+            if isinstance(history[i], HumanMessage):
+                text_content = history[i].content
+                # Build multimodal content: text + images
+                content_parts = [{"type": "text", "text": text_content}]
+                for img in attached_images:
+                    data_uri = f"data:{img.get('mime_type', 'image/png')};base64,{img['data']}"
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    })
+                history[i] = HumanMessage(content=content_parts)
+                logger.info("[call_model] Attached %d images to HumanMessage", len(attached_images))
+                break
+    
     messages_to_send.extend(history)
     
-    total_chars = sum(len(m.content) for m in messages_to_send)
+    total_chars = sum(len(m.content) if isinstance(m.content, str) else len(str(m.content)) for m in messages_to_send)
     
     # Pick model based on what the agent needs to do right now
     # Reflection forces reasoning model — the agent needs to think its way out

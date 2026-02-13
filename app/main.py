@@ -1041,6 +1041,14 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
     else:
         attached_files_dict = attached_files_dict_new
 
+    # Collect attached images (base64-encoded, from paste/screenshot)
+    attached_images_list = []
+    if req.attached_images:
+        attached_images_list = [
+            {"filename": img.filename, "data": img.data, "mime_type": img.mime_type}
+            for img in req.attached_images
+        ]
+
     try:
         # ── LangSmith-enriched config ──────────────────────────────
         # Compute turn number from stored state
@@ -1083,6 +1091,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 "messages": messages, 
                 "workspace_id": req.workspace_id,
                 "attached_files": attached_files_dict,
+                "attached_images": attached_images_list,  # base64 images from paste/screenshot
                 "enriched_context": enriched_context,  # Preserved on continuation!
                 "enriched_question": enriched_question,  # For topic shift detection
                 "enriched_step": enriched_step,  # For step-aware supplementary enrichment

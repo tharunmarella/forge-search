@@ -175,6 +175,13 @@ class AttachedFile(BaseModel):
     content: str
 
 
+class AttachedImage(BaseModel):
+    """An image attached to the chat (screenshot, paste, etc.)."""
+    filename: str       # e.g., "screenshot-1.png"
+    data: str           # base64-encoded image data
+    mime_type: str = "image/png"  # "image/png", "image/jpeg"
+
+
 class ChatRequest(BaseModel):
     workspace_id: str
     conversation_id: str | None = None  # Unique ID per conversation (for state tracking)
@@ -183,6 +190,8 @@ class ChatRequest(BaseModel):
     tool_results: list[ToolResultPayload] | None = None
     # Live file contents from the IDE (open files, recently edited, etc.)
     attached_files: list[AttachedFile] | None = None
+    # Images pasted/attached by the user (base64-encoded)
+    attached_images: list[AttachedImage] | None = None
     # History of messages (serialized LangChain messages)
     history: list[dict] | None = None
     max_tokens: int = Field(default=1024, ge=1, le=4096)
