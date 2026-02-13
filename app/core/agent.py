@@ -93,11 +93,16 @@ SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tas
 
 MASTER_PLANNING_PROMPT = """## Master Planning Mode
 
-You are being called with a powerful reasoning model for ONE purpose: create a comprehensive, production-quality execution plan. This is your ONE chance to think deeply before the faster execution model takes over.
+You are being called with a powerful reasoning model. Your goal is to choose the BEST path: either execute immediately (for simple tasks) or create a plan (for complex ones).
 
 ### Your Planning Responsibilities
 
 **1. ANALYZE THE REQUEST THOROUGHLY**
+- **DECIDE FIRST: Do you need a plan?**
+  - **Simple task** (e.g. "fix typo", "read file", "explain code") → **JUST EXECUTE**. Do not call `create_plan`.
+  - **Complex task** (e.g. "refactor module", "add feature", "multi-file change") → **CREATE PLAN**.
+  - If you decide to execute immediately, just call the relevant tools (read_file, codebase_search, etc.).
+
 - What is the user ACTUALLY trying to achieve? (Not just what they said)
 - What's the scope? (Single file fix vs architectural change vs new feature)
 - What domain knowledge is needed? (Framework conventions, API patterns, security considerations)
@@ -1811,24 +1816,20 @@ async def call_model(state: AgentState) -> dict:
                 if len(recent_errors) >= 3:
                     break
             
-            # If we've already auto-replanned 2+ times on this step, SKIP it
+            # If we've already auto-replanned 2+ times on this step, STOP and ask for help
             if auto_replan_count >= 2:
-                logger.warning("[call_model] SKIP: step %d auto-replanned %d times, marking failed and moving on", 
+                logger.warning("[call_model] STOP: step %d auto-replanned %d times, asking for user help", 
                               current_step, auto_replan_count)
-                plan_steps[current_step - 1]["status"] = "failed"
-                # Advance to next step
-                next_step = current_step + 1
-                if next_step <= len(plan_steps):
-                    plan_steps[next_step - 1]["status"] = "in_progress"
                 
-                skip_msg = AIMessage(
-                    content=f"⏭️ **Skipping step {current_step}** ('{clean_desc}') — failed after multiple replan attempts. Moving to next step.",
+                help_msg = AIMessage(
+                    content=f"🛑 **I'm stuck on step {current_step}** ('{clean_desc}').\n\nI've tried significantly to fix it (auto-replanning {auto_replan_count} times), but I'm still encountering errors. To avoid making things worse, I'm pausing.\n\n**Could you please:**\n1. Review the recent errors above\n2. Give me a specific hint or command to try\n3. Or use `update_plan(step_number={current_step}, status='done')` if you fixed it manually.",
                     tool_calls=[]
                 )
                 return {
-                    "messages": [skip_msg],
+                    "messages": [help_msg],
+                    # Do NOT advance the plan steps or current_step
                     "plan_steps": plan_steps,
-                    "current_step": next_step,
+                    "current_step": current_step,
                 }
             
             # Mark current step as failed
