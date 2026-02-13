@@ -118,15 +118,30 @@ PYTHON_REF_QUERY = """
 (call function: (attribute attribute: (identifier) @name))
 """
 
-# JavaScript/TypeScript definitions
+# JavaScript definitions (uses `identifier` for class names)
 JS_DEF_QUERY = """
 (function_declaration name: (identifier) @name) @def
 (class_declaration name: (identifier) @name) @def
 (method_definition name: (property_identifier) @name) @def
-(lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function))) @def
+(variable_declarator name: (identifier) @name value: (arrow_function)) @def
+(variable_declarator name: (identifier) @name value: (function_expression)) @def
 """
 
 JS_REF_QUERY = """
+(call_expression function: (identifier) @name)
+(call_expression function: (member_expression property: (property_identifier) @name))
+"""
+
+# TypeScript/TSX definitions (uses `type_identifier` for class names)
+TS_DEF_QUERY = """
+(function_declaration name: (identifier) @name) @def
+(class_declaration name: (type_identifier) @name) @def
+(method_definition name: (property_identifier) @name) @def
+(variable_declarator name: (identifier) @name value: (arrow_function)) @def
+(variable_declarator name: (identifier) @name value: (function_expression)) @def
+"""
+
+TS_REF_QUERY = """
 (call_expression function: (identifier) @name)
 (call_expression function: (member_expression property: (property_identifier) @name))
 """
@@ -148,8 +163,8 @@ DEF_QUERIES: dict[str, str] = {
     "rs": RUST_DEF_QUERY,
     "py": PYTHON_DEF_QUERY,
     "js": JS_DEF_QUERY,
-    "ts": JS_DEF_QUERY,
-    "tsx": JS_DEF_QUERY,
+    "ts": TS_DEF_QUERY,
+    "tsx": TS_DEF_QUERY,  # TSX uses same queries as TS
     "go": GO_DEF_QUERY,
 }
 
@@ -157,8 +172,8 @@ REF_QUERIES: dict[str, str] = {
     "rs": RUST_REF_QUERY,
     "py": PYTHON_REF_QUERY,
     "js": JS_REF_QUERY,
-    "ts": JS_REF_QUERY,
-    "tsx": JS_REF_QUERY,
+    "ts": TS_REF_QUERY,
+    "tsx": TS_REF_QUERY,
     "go": GO_REF_QUERY,
 }
 

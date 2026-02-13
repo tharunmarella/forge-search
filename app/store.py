@@ -314,6 +314,31 @@ async def index_file_result(
                             VALUES (%s, %s, %s, 'BELONGS_TO')
                         """, (workspace_id, defn.name, defn.parent))
                         stats["relationships_created"] += 1
+                
+                # Handle fallback whole-file embeddings when tree-sitter extraction failed
+                # These have keys like "path/to/file.tsx:__file__:0"
+                if not parse_result.definitions:
+                    file_key = f"{parse_result.file_path}:__file__:0"
+                    emb = embeddings_map.get(file_key)
+                    enriched = enriched_texts.get(file_key, "")
+                    
+                    if emb:
+                        uid = f"{workspace_id}:{file_key}"
+                        file_name = parse_result.file_path.rsplit("/", 1)[-1]
+                        emb_str = f"[{','.join(str(x) for x in emb)}]"
+                        
+                        await cur.execute("""
+                            INSERT INTO symbols (uid, workspace_id, name, kind, file_path, start_line, end_line,
+                                                 signature, content, enriched_content, parent, embedding)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (uid) DO UPDATE SET
+                                name=%s, kind=%s, signature=%s, content=%s, enriched_content=%s, parent=%s, embedding=%s
+                        """, (uid, workspace_id, file_name, "file", parse_result.file_path,
+                              0, 0, f"File: {parse_result.file_path}", "", enriched, "", emb_str,
+                              file_name, "file", f"File: {parse_result.file_path}", "", enriched, "", emb_str))
+                        
+                        stats["nodes_created"] += 1
+                        logger.debug("Stored fallback file embedding for %s", parse_result.file_path)
 
                 # Commit the entire transaction
                 await conn.commit()
