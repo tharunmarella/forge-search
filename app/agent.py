@@ -1650,18 +1650,38 @@ async def call_model(state: AgentState) -> dict:
         
         if turns_on_step >= 8 and current_step <= len(plan_steps):
             step_desc = plan_steps[current_step - 1].get("description", "?")
-            logger.warning("[call_model] AUTO-SKIP: step %d stuck for %d turns, forcing skip", 
+            logger.warning("[call_model] STUCK: step %d stuck for %d turns, asking user for help", 
                           current_step, turns_on_step)
             
-            # Mark step as failed and advance
-            plan_steps[current_step - 1]["status"] = "failed"
-            current_step += 1
+            # Collect recent error messages to show user
+            recent_errors = []
+            for msg in reversed(state['messages'][:20]):
+                if isinstance(msg, ToolMessage) and ("error" in msg.content.lower() or "failed" in msg.content.lower() or "exit code: 1" in msg.content.lower()):
+                    # Extract first 200 chars of error
+                    error_snippet = msg.content[:200].replace('\n', ' ')
+                    if error_snippet not in recent_errors:
+                        recent_errors.append(error_snippet)
+                    if len(recent_errors) >= 2:
+                        break
             
-            # Return early with a synthetic AI message explaining the skip
-            skip_msg = f"⚠️ **Auto-skipped step {current_step - 1}** ('{step_desc}') after {turns_on_step} attempts without progress. Moving to the next step. The skipped step may need manual intervention later."
+            error_context = ""
+            if recent_errors:
+                error_context = "\n\n**Recent errors:**\n" + "\n".join(f"- {e}..." for e in recent_errors)
+            
+            # Ask user for help instead of auto-skipping
+            help_msg = f"""⚠️ **I'm stuck on step {current_step}:** '{step_desc}'
+
+I've tried {turns_on_step} different approaches without success.{error_context}
+
+**How would you like to proceed?**
+1. **Give me a hint** - Tell me what I might be missing or a different approach to try
+2. **Skip this step** - Say "skip" and I'll move to the next step
+3. **Provide what's needed** - If something external is required (install software, start a service, etc.), let me know when it's ready
+
+What would you like me to do?"""
             
             return {
-                "messages": [AIMessage(content=skip_msg)],
+                "messages": [AIMessage(content=help_msg)],
                 "plan_steps": plan_steps,
                 "current_step": current_step,
             }
