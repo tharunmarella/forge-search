@@ -114,11 +114,12 @@ async def index_files(req: IndexRequest):
     )
 
     return IndexResponse(
+        workspace_id=workspace_id,
         files_indexed=files_indexed,
         nodes_created=total_nodes,
         relationships_created=total_rels,
         embeddings_generated=total_embeddings,
-        time_ms=round(elapsed, 1),
+        index_time_ms=round(elapsed, 1),
     )
 
 
@@ -136,18 +137,49 @@ async def search_code(req: SearchRequest):
     t0 = time.monotonic()
 
     # Generate embedding for query
-    query_embedding = await embeddings.embed_text(req.query)
+    query_embedding = await embeddings.embed_query(req.query)
 
     if query_embedding is None:
         raise HTTPException(status_code=500, detail="Failed to generate query embedding")
 
     # Search with pgvector cosine similarity
-    results = await store.search_code(
+    results = await store.vector_search(
         workspace_id=req.workspace_id,
         query_embedding=query_embedding,
-        limit=req.limit,
-        min_similarity=req.min_similarity,
+        top_k=req.top_k,
     )
+
+    # For each result, find related symbols via expand_neighbors
+    search_results = []
+    for item in results:
+        sym = item["symbol"]
+        uid = sym["uid"]
+
+        neighbors = await store.expand_neighbors(
+            req.workspace_id, [uid], hops=1,
+        )
+
+        search_results.append(
+            SearchResult(
+                file_path=sym["file_path"],
+                name=sym["name"],
+                symbol_type=sym["kind"],
+                start_line=sym["start_line"],
+                end_line=sym["end_line"],
+                signature=sym.get("signature", ""),
+                content=sym.get("content", ""),
+                score=item["score"],
+                related=[
+                    RelatedSymbol(
+                        name=r["name"],
+                        file_path=r["file_path"],
+                        relationship=r["rel_type"],
+                        signature=r.get("signature", ""),
+                    )
+                    for r in neighbors
+                ],
+            )
+        )
 
     elapsed = (time.monotonic() - t0) * 1000
     logger.info(
@@ -155,34 +187,11 @@ async def search_code(req: SearchRequest):
         req.workspace_id, req.query, len(results), elapsed,
     )
 
-    # For each result, find related symbols (calls + called_by)
-    search_results = []
-    for item in results:
-        related = await store.get_related_symbols(
-            req.workspace_id, item["symbol_name"], max_depth=1,
-        )
-
-        search_results.append(
-            SearchResult(
-                file_path=item["file_path"],
-                symbol_name=item["symbol_name"],
-                kind=item["kind"],
-                start_line=item["start_line"],
-                end_line=item["end_line"],
-                signature=item["signature"],
-                content=item["content"],
-                similarity=item["similarity"],
-                related_symbols=[
-                    RelatedSymbol(name=r["name"], kind=r["kind"], relationship=r["relationship"])
-                    for r in related
-                ],
-            )
-        )
-
     return SearchResponse(
         results=search_results,
-        total=len(search_results),
-        time_ms=round(elapsed, 1),
+        query=req.query,
+        workspace_id=req.workspace_id,
+        search_time_ms=round(elapsed, 1),
     )
 
 
@@ -207,10 +216,10 @@ async def reindex_workspace(
     logger.info("[reindex] Cleared workspace %s", workspace_id)
     
     return IndexResponse(
+        workspace_id=workspace_id,
         files_indexed=0,
         nodes_created=0,
         relationships_created=0,
         embeddings_generated=0,
-        time_ms=0,
-        message=f"Workspace {workspace_id} cleared. Use /index or /watch to re-index files."
+        index_time_ms=0,
     )
