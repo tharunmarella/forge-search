@@ -92,7 +92,7 @@ _langfuse_enabled = all([
 ])
 if _langfuse_enabled:
     try:
-        from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+        from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
         langfuse_handler = LangfuseCallbackHandler()
         logger.info(f"Langfuse tracing ENABLED (base_url: {os.getenv('LANGFUSE_BASE_URL', 'default')})")
     except Exception as e:
