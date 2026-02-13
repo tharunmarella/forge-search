@@ -1261,24 +1261,38 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             ]
         
         # Log trace to MongoDB — capture full request, response, and message history
+        # Serialize tool_results to plain dicts (they may be Pydantic objects)
+        serialized_tool_results = None
+        if req.tool_results:
+            try:
+                serialized_tool_results = [
+                    {"call_id": tr.call_id, "output": tr.output[:500], "success": tr.success}
+                    for tr in req.tool_results
+                ]
+            except Exception:
+                serialized_tool_results = str(req.tool_results)[:500]
+        
         await _log_trace_to_mongo(
             thread_id=conv_id,
             workspace_id=req.workspace_id,
             user_email=user.get("email", "unknown") if user else "unknown",
             request_data={
                 "question": req.question,
-                "tool_results": req.tool_results,
+                "tool_results": serialized_tool_results,
                 "attached_files": len(attached_files_dict),
                 "attached_images": len(attached_images_list),
                 "is_continuation": has_tool_results,
             },
             response_data={
                 "answer": answer,
-                "tool_calls": tool_calls,
+                "tool_calls": [
+                    {"name": tc.get("name"), "args": str(tc.get("args", ""))[:300], "id": tc.get("id")}
+                    for tc in (tool_calls or [])
+                ] if tool_calls else None,
                 "plan_steps": [dict(s) for s in result_plan_steps] if result_plan_steps else None,
                 "current_step": result_current_step,
                 "message_count": len(final_messages),
-                "messages": serialized_history,  # Full message history for replay
+                "messages": serialized_history,
             },
             execution_time_ms=elapsed,
             status=status,
