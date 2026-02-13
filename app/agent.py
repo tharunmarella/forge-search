@@ -77,18 +77,28 @@ You are being called with a powerful reasoning model for ONE purpose: create a c
 - What's the scope? (Single file fix vs architectural change vs new feature)
 - What domain knowledge is needed? (Framework conventions, API patterns, security considerations)
 
-**2. EXPLORE BEFORE PLANNING**
-Before calling `create_plan`, you SHOULD use tools to gather critical information:
-- `codebase_search` — find related code, similar implementations, patterns used in this codebase
-- `read_file` — examine key files (configs, existing implementations to match style)
-- `grep` — find all usages of symbols you'll modify
+**2. EXPLORE WITH SEMANTIC SEARCH FIRST**
+CRITICAL: Before calling `create_plan`, you MUST use `codebase_search` to find relevant code:
+- `codebase_search("login authentication form")` — find similar implementations
+- `codebase_search("user session handling")` — find related patterns
+- `codebase_search("page component structure")` — understand codebase conventions
+
+DO NOT just use `list_files` — that only gives you filenames without code.
+The `codebase_search` tool uses AI embeddings to find semantically relevant code snippets.
+
+After semantic search, you can use:
+- `read_file` — examine specific files in detail
+- `grep` — find exact symbol usages
 
 **3. CREATE A MASTERFUL PLAN**
 Your plan should include:
-- **Preparation steps** (read files, understand existing patterns, check dependencies)
-- **Implementation steps** (concrete, specific changes with file paths when known)
-- **Verification steps** (tests to run, diagnostics to check, manual verification)
+- **Preparation steps** (read specific files you found via codebase_search)
+- **Implementation steps** (concrete changes with EXACT file paths, function names, patterns to follow)
+- **Verification steps** (tests to run, diagnostics to check, build commands)
 - **Rollback awareness** (what to do if a step fails)
+
+IMPORTANT: Reference actual code you found. Instead of "create a login page", say:
+"Create pages/login.tsx following the pattern in pages/index.tsx (uses Hero component, Tailwind classes)"
 
 Each step should be ATOMIC — completable without depending on later steps.
 Order steps to minimize risk: read → small change → verify → larger changes.
@@ -108,6 +118,9 @@ The execution model is faster but less capable. Write steps that are:
 
 ### Example of Good vs Bad Plan Steps
 
+❌ Bad: "Create a login page" (too vague, no context)
+✓ Good: "Create pages/login.tsx. Based on codebase_search results, follow the pattern from pages/index.tsx which uses: `import Layout from '../components/Layout'`, Tailwind classes like 'flex flex-col min-h-screen', and the existing form styling from the search results."
+
 ❌ Bad: "Update the authentication logic"
 ✓ Good: "In auth/session.py, modify `create_session()` to return JWT instead of session ID. Update return type annotation."
 
@@ -116,6 +129,13 @@ The execution model is faster but less capable. Write steps that are:
 
 ❌ Bad: "Refactor the codebase"
 ✓ Good: "Extract `validate_token()` from auth/middleware.py into auth/jwt.py, update 3 imports in auth/routes.py"
+
+### Workflow Example
+1. User asks: "Add login functionality"
+2. You call: `codebase_search("login form authentication")` → find similar auth patterns
+3. You call: `codebase_search("page component layout")` → understand page structure
+4. You call: `read_file("pages/index.tsx")` → see exact patterns to follow
+5. THEN you call `create_plan` with specific steps referencing what you found
 
 ### Now: Think deeply, explore the codebase, then create your master plan."""
 
@@ -1648,7 +1668,19 @@ async def call_model(state: AgentState) -> dict:
     if enriched_context:
         # Cap enriched context to avoid blowing up on its own
         ctx = enriched_context[:80_000] if len(enriched_context) > 80_000 else enriched_context
-        context_msg = f"## Pre-gathered Context\n\n{ctx}\n\n---\n\nNow, answer the user's question using this context. If you need more information, use the available tools."
+        context_msg = f"""## Pre-gathered Context (SEMANTIC SEARCH RESULTS)
+
+The following code was found via AI-powered semantic search on the user's codebase.
+USE THIS CODE as the primary reference for understanding patterns, conventions, and structure.
+
+{ctx}
+
+---
+
+IMPORTANT: The semantic search above already queried the codebase for relevant code.
+- Study the code snippets above to understand existing patterns before creating your plan
+- Reference specific file paths, function names, and patterns from this context
+- You can call `codebase_search` for ADDITIONAL context if needed, but start with what's above"""
         messages_to_send.append(SystemMessage(content=context_msg))
         logger.info("[call_model] Added context message, total messages: %d", len(messages_to_send))
     else:
