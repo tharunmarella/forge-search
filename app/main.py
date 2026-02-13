@@ -1112,6 +1112,9 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         config = {}
         if langfuse_handler:
             config["callbacks"] = [langfuse_handler]
+            logger.info("[chat] Langfuse callback added to config")
+        else:
+            logger.warning("[chat] Langfuse handler is None, not adding callback")
         
         result = await agent.forge_agent.ainvoke(
             {
@@ -1381,6 +1384,9 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             config = {}
             if langfuse_handler:
                 config["callbacks"] = [langfuse_handler]
+                logger.info("[chat/stream] Langfuse callback added to config")
+            else:
+                logger.warning("[chat/stream] Langfuse handler is None, not adding callback")
             
             result = await agent.forge_agent.ainvoke(
                 {
