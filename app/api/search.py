@@ -33,6 +33,8 @@ async def index_files(req: IndexRequest):
     t0 = time.monotonic()
     workspace_id = req.workspace_id
 
+    logger.info("Index request: workspace=%s, files=%d", workspace_id, len(req.files))
+
     total_nodes = 0
     total_rels = 0
     total_embeddings = 0
@@ -182,6 +184,10 @@ async def search_code(req: SearchRequest):
         )
 
     elapsed = (time.monotonic() - t0) * 1000
+
+    # Get total symbol count so the client knows if the workspace is indexed
+    stats = await store.get_workspace_stats(req.workspace_id)
+
     logger.info(
         "Search workspace=%s query=%r -> %d results in %.0fms",
         req.workspace_id, req.query, len(results), elapsed,
@@ -191,6 +197,7 @@ async def search_code(req: SearchRequest):
         results=search_results,
         query=req.query,
         workspace_id=req.workspace_id,
+        total_nodes=stats["symbols"],
         search_time_ms=round(elapsed, 1),
     )
 
