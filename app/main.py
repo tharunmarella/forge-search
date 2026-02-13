@@ -76,13 +76,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Log LangSmith status on import
+# ── Observability: LangSmith + Langfuse ──────────────────────────
+# LangSmith
 _langsmith_enabled = os.getenv("LANGSMITH_TRACING", "").lower() == "true"
 _langsmith_project = os.getenv("LANGSMITH_PROJECT", "default")
 if _langsmith_enabled:
     logger.info(f"LangSmith tracing ENABLED for project: {_langsmith_project}")
 else:
     logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable)")
+
+# Langfuse (runs alongside LangSmith)
+_langfuse_enabled = all([
+    os.getenv("LANGFUSE_PUBLIC_KEY"),
+    os.getenv("LANGFUSE_SECRET_KEY"),
+])
+if _langfuse_enabled:
+    try:
+        from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+        langfuse_handler = LangfuseCallbackHandler()
+        logger.info(f"Langfuse tracing ENABLED (base_url: {os.getenv('LANGFUSE_BASE_URL', 'default')})")
+    except Exception as e:
+        logger.warning(f"Langfuse init failed: {e}")
+        langfuse_handler = None
+else:
+    langfuse_handler = None
+    logger.info("Langfuse tracing disabled (set LANGFUSE_PUBLIC_KEY/SECRET_KEY to enable)")
 
 
 # ── Conversation state store (Redis-backed) ───────────────────────
@@ -1090,6 +1108,11 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         logger.info("[chat] Invoking agent for workspace=%s conv=%s with %d messages (tool_cont=%s, stored=%s, enriched=%d chars)", 
                    req.workspace_id, conv_id, len(messages), has_tool_results, bool(stored), len(enriched_context))
         
+        # Prepare config with callbacks
+        config = {}
+        if langfuse_handler:
+            config["callbacks"] = [langfuse_handler]
+        
         result = await agent.forge_agent.ainvoke(
             {
                 "messages": messages, 
@@ -1353,6 +1376,11 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
             
             # For now, emit a thinking event at start
             yield f"event: thinking\ndata: {json.dumps({'step_type': 'start', 'message': 'Processing request...', 'detail': ''})}\n\n"
+            
+            # Prepare config with callbacks
+            config = {}
+            if langfuse_handler:
+                config["callbacks"] = [langfuse_handler]
             
             result = await agent.forge_agent.ainvoke(
                 {
