@@ -653,8 +653,7 @@ async def _decompose_query(question: str, attached_files: dict[str, str] | None 
         
         logger.info("[decompose] %d queries, %d symbols from: %s", len(queries), len(symbols), question[:80])
         return queries, symbols
-        
-        except Exception as e:
+    except Exception as e:
         logger.warning("[decompose] Failed (%s), falling back to raw question", e)
         return [question], []
 
@@ -1906,7 +1905,7 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     
     # Call the model (with fallback if planning model fails)
     try:
-    response = await model_with_tools.ainvoke(messages_to_send)
+        response = await model_with_tools.ainvoke(messages_to_send)
     except Exception as e:
         # If planning model failed (e.g., no credits), fallback to reasoning model
         config = llm_provider.get_config()
