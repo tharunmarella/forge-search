@@ -1280,18 +1280,7 @@ async def enrich_context(state: AgentState) -> dict:
     # ── Follow-up question: check for topic shift ──
     if enriched_question and question != enriched_question:
         try:
-            # Add timeout to embedding calls to prevent freezes
-            async def get_embeddings():
-                old_emb = await embeddings.embed_query(enriched_question)
-                new_emb = await embeddings.embed_query(question)
-                return old_emb, new_emb
-            
-            try:
-                old_emb, new_emb = await asyncio.wait_for(get_embeddings(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("[enrich_context] Embedding timeout — keeping existing context")
-                return {}
-            
+            old_emb, new_emb = await embeddings.embed_query(enriched_question), await embeddings.embed_query(question)
             similarity = _cosine_similarity(old_emb, new_emb)
             logger.info("[enrich_context] Topic similarity: %.3f (threshold=%.2f) | old=%s | new=%s",
                        similarity, TOPIC_SHIFT_THRESHOLD, enriched_question[:60], question[:60])
