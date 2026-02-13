@@ -1650,38 +1650,59 @@ async def call_model(state: AgentState) -> dict:
         
         if turns_on_step >= 8 and current_step <= len(plan_steps):
             step_desc = plan_steps[current_step - 1].get("description", "?")
-            logger.warning("[call_model] STUCK: step %d stuck for %d turns, asking user for help", 
+            logger.warning("[call_model] STUCK: step %d stuck for %d turns, forcing replan", 
                           current_step, turns_on_step)
             
-            # Collect recent error messages to show user
+            # Collect recent error messages to learn from
             recent_errors = []
-            for msg in reversed(state['messages'][:20]):
+            failed_tools = []
+            for msg in reversed(state['messages'][:30]):
                 if isinstance(msg, ToolMessage) and ("error" in msg.content.lower() or "failed" in msg.content.lower() or "exit code: 1" in msg.content.lower()):
-                    # Extract first 200 chars of error
-                    error_snippet = msg.content[:200].replace('\n', ' ')
+                    error_snippet = msg.content[:150].replace('\n', ' ')
                     if error_snippet not in recent_errors:
                         recent_errors.append(error_snippet)
-                    if len(recent_errors) >= 2:
-                        break
+                if isinstance(msg, AIMessage) and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc['name'] not in failed_tools:
+                            failed_tools.append(tc['name'])
+                if len(recent_errors) >= 3:
+                    break
             
-            error_context = ""
+            # Build learnings from failures
+            learnings = f"Step '{step_desc}' failed after {turns_on_step} attempts."
             if recent_errors:
-                error_context = "\n\n**Recent errors:**\n" + "\n".join(f"- {e}..." for e in recent_errors)
+                learnings += f" Errors encountered: {'; '.join(recent_errors[:2])}"
+            if failed_tools:
+                learnings += f" Tools tried: {', '.join(failed_tools[:5])}"
             
-            # Ask user for help instead of auto-skipping
-            help_msg = f"""⚠️ **I'm stuck on step {current_step}:** '{step_desc}'
-
-I've tried {turns_on_step} different approaches without success.{error_context}
-
-**How would you like to proceed?**
-1. **Give me a hint** - Tell me what I might be missing or a different approach to try
-2. **Skip this step** - Say "skip" and I'll move to the next step
-3. **Provide what's needed** - If something external is required (install software, start a service, etc.), let me know when it's ready
-
-What would you like me to do?"""
+            # Mark current step as failed
+            plan_steps[current_step - 1]["status"] = "failed"
+            
+            # Create new plan steps that avoid the same approach
+            # We'll create a replan tool call that the model would have made
+            replan_reason = f"Step {current_step} ('{step_desc}') failed repeatedly. {learnings}. Need a different approach."
+            
+            # Generate a synthetic replan tool call
+            replan_tool_call = {
+                "name": "replan",
+                "args": {
+                    "reason": replan_reason,
+                    "new_steps": [
+                        f"[REVISED] Find alternative approach for: {step_desc}",
+                        *[s["description"] for s in plan_steps[current_step:] if s["status"] == "pending"]
+                    ],
+                    "keep_completed": True
+                },
+                "id": f"auto_replan_{current_step}"
+            }
+            
+            replan_msg = AIMessage(
+                content=f"🔄 **Auto-replanning:** Step {current_step} ('{step_desc}') failed after {turns_on_step} attempts. Creating a revised strategy...",
+                tool_calls=[replan_tool_call]
+            )
             
             return {
-                "messages": [AIMessage(content=help_msg)],
+                "messages": [replan_msg],
                 "plan_steps": plan_steps,
                 "current_step": current_step,
             }
