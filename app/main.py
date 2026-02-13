@@ -92,13 +92,17 @@ _langfuse_enabled = all([
 ])
 if _langfuse_enabled:
     try:
+        from langfuse import Langfuse
         from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
+        langfuse_client = Langfuse()
         langfuse_handler = LangfuseCallbackHandler()
         logger.info(f"Langfuse tracing ENABLED (base_url: {os.getenv('LANGFUSE_BASE_URL', 'default')})")
     except Exception as e:
         logger.warning(f"Langfuse init failed: {e}")
+        langfuse_client = None
         langfuse_handler = None
 else:
+    langfuse_client = None
     langfuse_handler = None
     logger.info("Langfuse tracing disabled (set LANGFUSE_PUBLIC_KEY/SECRET_KEY to enable)")
 
@@ -1234,6 +1238,11 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
                 for s in result_plan_steps
             ]
         
+        # Flush Langfuse traces (they're batched/async by default)
+        if langfuse_client:
+            langfuse_client.flush()
+            logger.info("[chat] Flushed Langfuse traces")
+        
         return ChatResponse(
             answer=answer,
             tool_calls=tool_calls,
@@ -1245,6 +1254,9 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         )
 
     except Exception as e:
+        # Flush Langfuse even on error
+        if langfuse_client:
+            langfuse_client.flush()
         logger.error("Agent execution failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)[:200]}")
 
@@ -1469,9 +1481,18 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                     answer = last_message.content
             
             elapsed = (time.monotonic() - t0) * 1000
+            
+            # Flush Langfuse traces before completing
+            if langfuse_client:
+                langfuse_client.flush()
+                logger.info("[chat/stream] Flushed Langfuse traces")
+            
             yield f"event: done\ndata: {json.dumps({'answer': answer, 'total_time_ms': round(elapsed, 1)})}\n\n"
             
         except Exception as e:
+            # Flush Langfuse even on error
+            if langfuse_client:
+                langfuse_client.flush()
             logger.error("Streaming agent execution failed: %s", e, exc_info=True)
             yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
     
