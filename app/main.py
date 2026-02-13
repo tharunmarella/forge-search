@@ -1109,13 +1109,32 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         tool_calls = None
         answer = None
         
-        if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            # Check if any tool calls are for the IDE
-            if any(tc["name"] in agent.IDE_TOOL_NAMES for tc in last_message.tool_calls):
+        # Find the last AIMessage — it may not be the very last message.
+        # When the agent calls both server tools and IDE tools in one turn,
+        # server tools get processed first (producing ToolMessages), then the
+        # graph pauses for IDE tools. In that case the last message is a
+        # ToolMessage, but the IDE tool calls are in an earlier AIMessage.
+        last_ai = None
+        for msg in reversed(final_messages):
+            if isinstance(msg, AIMessage):
+                last_ai = msg
+                break
+        
+        if last_ai and last_ai.tool_calls:
+            # Check which tool calls still need IDE execution
+            # (server tool calls already have ToolMessages, IDE ones don't)
+            responded_ids = {m.tool_call_id for m in final_messages if isinstance(m, ToolMessage)}
+            pending_ide_calls = [
+                tc for tc in last_ai.tool_calls
+                if tc["name"] in agent.IDE_TOOL_NAMES and tc.get("id") not in responded_ids
+            ]
+            
+            if pending_ide_calls:
                 status = "requires_action"
-                tool_calls = last_message.tool_calls
+                tool_calls = pending_ide_calls
             else:
-                answer = last_message.content
+                # All tool calls handled (server-only), return text
+                answer = last_ai.content if last_ai.content else last_message.content
         else:
             answer = last_message.content
 
@@ -1332,25 +1351,32 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 yield f"event: plan\ndata: {json.dumps({'steps': result_plan_steps, 'current_step': result_current_step})}\n\n"
             
             # Determine what to send back
-            if isinstance(last_message, AIMessage) and last_message.tool_calls:
-                # Check if any are IDE tools
-                ide_tool_calls = [tc for tc in last_message.tool_calls if tc["name"] in agent.IDE_TOOL_NAMES]
+            # Find last AIMessage (may not be the very last message if server tools were processed)
+            last_ai = None
+            for msg in reversed(final_messages):
+                if isinstance(msg, AIMessage):
+                    last_ai = msg
+                    break
+            
+            if last_ai and last_ai.tool_calls:
+                # Find pending IDE tool calls (server tools already have ToolMessages)
+                responded_ids = {m.tool_call_id for m in final_messages if isinstance(m, ToolMessage)}
+                pending_ide_calls = [
+                    tc for tc in last_ai.tool_calls
+                    if tc["name"] in agent.IDE_TOOL_NAMES and tc.get("id") not in responded_ids
+                ]
                 
-                if ide_tool_calls:
-                    # IDE needs to execute these tools
+                if pending_ide_calls:
                     tool_calls_data = [
-                        {
-                            "id": tc["id"],
-                            "name": tc["name"],
-                            "args": tc["args"],
-                        }
-                        for tc in ide_tool_calls
+                        {"id": tc["id"], "name": tc["name"], "args": tc["args"]}
+                        for tc in pending_ide_calls
                     ]
                     yield f"event: requires_action\ndata: {json.dumps({'tool_calls': tool_calls_data})}\n\n"
                 else:
-                    # Server-side tools (already executed by agent)
-                    if last_message.content:
-                        yield f"event: text_delta\ndata: {json.dumps({'text': last_message.content})}\n\n"
+                    # All tool calls handled (server-only), return text
+                    text = last_ai.content if last_ai.content else (last_message.content if last_message.content else "")
+                    if text:
+                        yield f"event: text_delta\ndata: {json.dumps({'text': text})}\n\n"
             else:
                 # Plain text response
                 if last_message.content:
