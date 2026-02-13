@@ -1472,10 +1472,28 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
     # ── Check: 2+ consecutive errors ──
     if consecutive_errors >= 2:
         logger.warning("[reflect] STUCK: %d consecutive tool errors", consecutive_errors)
+        
+        # Extract failing command from recent messages for explicit "don't do this" guidance
+        failing_commands = []
+        for msg in reversed(messages[:20]):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc['name'] == 'execute_command':
+                        failing_commands.append(tc['args'].get('command', '')[:50])
+                    else:
+                        failing_commands.append(tc['name'])
+                    if len(failing_commands) >= 2:
+                        break
+            if len(failing_commands) >= 2:
+                break
+        
+        dont_retry = ""
+        if failing_commands:
+            dont_retry = f"\n\n**DO NOT** retry these failing commands: {failing_commands}. Try a COMPLETELY different approach."
+        
         if plan_steps and current_step > 0:
-            # Suggest replan if there's an active plan
-            return REFLECT_PROMPT + f"\n\n**Detected: {consecutive_errors} consecutive tool errors.** The current approach is failing repeatedly. Consider using `replan` to revise your strategy, or `update_plan` to mark this step as failed and try a different approach."
-        return REFLECT_PROMPT + f"\n\n**Detected: {consecutive_errors} consecutive tool errors.** The current approach is failing repeatedly."
+            return REFLECT_PROMPT + f"\n\n**CRITICAL: {consecutive_errors} consecutive tool errors.** STOP retrying the same approach.{dont_retry}\n\nOptions:\n1. `replan` - Create a new strategy\n2. `update_plan` - Mark this step failed and skip to next\n3. Ask the user for help or clarification"
+        return REFLECT_PROMPT + f"\n\n**CRITICAL: {consecutive_errors} consecutive tool errors.** STOP retrying the same approach.{dont_retry}\n\nTry:\n1. Read error messages carefully and fix the root cause\n2. `lookup_documentation` for the failing tool/library\n3. Ask the user for help if you're stuck"
     
     # ── Check: same tool+args called twice (loop) ──
     if len(recent_ai_calls) >= 2:
@@ -1484,8 +1502,8 @@ def _detect_stuck_signals(messages: list[BaseMessage], plan_steps: list[PlanStep
             if call["args_key"] in seen_calls:
                 logger.warning("[reflect] STUCK: duplicate tool call detected: %s", call["name"])
                 if plan_steps and current_step > 0:
-                    return REFLECT_PROMPT + f"\n\n**Detected: you called `{call['name']}` with the same arguments twice.** This is a loop. Consider using `replan` if the current plan isn't working, or try a fundamentally different approach."
-                return REFLECT_PROMPT + f"\n\n**Detected: you called `{call['name']}` with the same arguments twice.** This is a loop. Try a different approach."
+                    return REFLECT_PROMPT + f"\n\n**LOOP DETECTED: You called `{call['name']}` with identical arguments twice.**\n\n**DO NOT** call `{call['name']}` again with the same arguments. This will fail again.\n\nYou MUST:\n1. Use `replan` to create a new strategy, OR\n2. Use `update_plan` to mark this step failed and move on, OR\n3. Try a COMPLETELY different tool or approach"
+                return REFLECT_PROMPT + f"\n\n**LOOP DETECTED: You called `{call['name']}` with identical arguments twice.**\n\n**DO NOT** repeat this call. You MUST try a different approach:\n1. Read the error and understand WHY it failed\n2. Use a different tool or different arguments\n3. Ask the user if you need more information"
             seen_calls.add(call["args_key"])
     
     # ── Check: plan step stuck for 4+ AI turns ──
