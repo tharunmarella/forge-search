@@ -37,15 +37,8 @@ from ..storage import store
 from . import embeddings, chat as chat_utils
 from . import llm as llm_provider
 
-# Intelligence System - All 3 Phases
-from ..intelligence.phase1 import workspace_memory as ws_memory
-from ..intelligence.phase2 import error_analyzer, adaptive_config
-from ..intelligence.phase3 import (
-    hierarchical_planner,
-    learning_checkpoints,
-    model_router as intelligent_model_router,
-    parallel_executor,
-)
+# Intelligence System - Phase 1, 2, 3 (Simplified Roo-Code Style)
+# (Old imports removed)
 
 # Documentation API configuration
 CONTEXT7_API_URL = "https://mcp.context7.com/mcp"
@@ -57,7 +50,7 @@ logger = logging.getLogger(__name__)
 # ── Configuration: Enable/Disable Intelligence Phases ──────────────
 ENABLE_PHASE_1 = os.getenv("ENABLE_PHASE_1", "true").lower() == "true"  # Persistent memory
 ENABLE_PHASE_2 = os.getenv("ENABLE_PHASE_2", "true").lower() == "true"  # LLM-powered intelligence
-ENABLE_PHASE_3 = os.getenv("ENABLE_PHASE_3", "true").lower() == "true"  # Long-term intelligence
+# Phase 3 (Hierarchical Planning/Checkpoints) disabled for simplicity
 
 logger.info(
     "[config] Intelligence phases: Phase1=%s, Phase2=%s, Phase3=%s",
@@ -85,116 +78,52 @@ SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tas
 9. **Docker auto-start:** If a Docker command fails with "Cannot connect to the Docker daemon":
    - On macOS: `execute_command("open -a Docker")` then wait 10 seconds and retry
    - On Linux: `execute_command("sudo systemctl start docker")` then retry
-   After starting Docker, wait for it to be ready before retrying the original command."""
+   After starting Docker, wait for it to be ready before retrying the original command.
+
+## Tool Selection Guide
+
+- **Navigation**: Use `lsp_go_to_definition` to jump to code and `lsp_hover` to understand types/docs. This is 100% accurate, unlike search.
+- **Deep Understanding**: Use `trace_call_chain` to see the flow of data (who calls this, what does this call).
+- **Refactoring & Impact**: Use `impact_analysis` BEFORE changing a symbol to see what might break. Use `lsp_rename` for renaming.
+- **Search**: Use `codebase_search` for "how does X work" and `grep` for "where is the string 'Y'".
+- **Diagnostics**: Always run `diagnostics` after editing to catch syntax/type errors immediately."""
 
 
 # ── Master Planning Prompt (used when Claude is called for planning) ──
 # This prompt extracts maximum value from expensive Claude calls by asking
 # for deep analysis, comprehensive planning, and upfront risk identification.
 
-MASTER_PLANNING_PROMPT = """## Master Planning Mode
+MASTER_PLANNING_PROMPT = """## Architect Mode
+You are in planning mode. Your goal is to analyze the task and the pre-gathered context to create a surgical execution strategy.
 
-You are being called with a powerful reasoning model. Your goal is to choose the BEST path: either execute immediately (for simple tasks) or create a plan (for complex ones).
+### Planning Principles:
+1. **Context First**: Use the "Pre-gathered Context" above as your primary source. Reference specific file paths and patterns found there.
+2. **Atomic Steps**: Create steps that are self-contained and verifiable (e.g., "Run pytest tests/auth.py" instead of "Verify it works").
+3. **Risk Analysis**: Identify potential breaking changes, side effects, or conflict risks before listing steps.
+4. **Worker-Ready**: Write steps for a less-capable execution model. Be explicit with file paths, function names, and exact logic.
 
-### Your Planning Responsibilities
+### Your Decision:
+- **Simple Task** (typos, single-file reads, simple explanations) → **Execute immediately** using tools. Do NOT call `create_plan`.
+- **Complex Task** (refactors, new features, multi-file changes) → **Call `create_plan`** with a structured checklist.
 
-**1. ANALYZE THE REQUEST THOROUGHLY**
-- **DECIDE FIRST: Do you need a plan?**
-  - **Simple task** (e.g. "fix typo", "read file", "explain code") → **JUST EXECUTE**. Do not call `create_plan`.
-  - **Complex task** (e.g. "refactor module", "add feature", "multi-file change") → **CREATE PLAN**.
-  - If you decide to execute immediately, just call the relevant tools (read_file, codebase_search, etc.).
-
-- What is the user ACTUALLY trying to achieve? (Not just what they said)
-- What's the scope? (Single file fix vs architectural change vs new feature)
-- What domain knowledge is needed? (Framework conventions, API patterns, security considerations)
-
-**2. USE THE PRE-GATHERED CONTEXT**
-IMPORTANT: You have already been given semantic search results in the "Pre-gathered Context" section above.
-This contains relevant code snippets found via AI-powered codebase search.
-
-- Study the code snippets in the pre-gathered context FIRST
-- Reference specific file paths, function names, and patterns from that context
-- Only call `codebase_search` if you need ADDITIONAL information not covered above
-- Use `read_file` to see full file contents if snippets aren't enough
-- Use `grep` to find exact symbol usages across the codebase
-
-**3. CREATE A MASTERFUL PLAN**
-Your plan should include:
-- **Preparation steps** (read specific files you found via codebase_search)
-- **Implementation steps** (concrete changes with EXACT file paths, function names, patterns to follow)
-- **Verification steps** (tests to run, diagnostics to check, build commands)
-- **Rollback awareness** (what to do if a step fails)
-
-IMPORTANT: Reference actual code you found. Instead of "create a login page", say:
-"Create pages/login.tsx following the pattern in pages/index.tsx (uses Hero component, Tailwind classes)"
-
-Each step should be ATOMIC — completable without depending on later steps.
-Order steps to minimize risk: read → small change → verify → larger changes.
-
-**4. IDENTIFY RISKS UPFRONT**
-In your response (before the plan), briefly note:
-- Potential breaking changes or side effects
-- Dependencies that might need updating
-- Files that are touched by multiple steps (conflict risk)
-- Things you're uncertain about that need exploration
-
-**5. OPTIMIZE FOR THE EXECUTION MODEL**
-The execution model is faster but less capable. Write steps that are:
-- Clear and unambiguous (no "figure out how to X")
-- Self-contained (include file paths, function names)
-- Verifiable (each step should have a way to confirm success)
-
-### Example of Good vs Bad Plan Steps
-
-❌ Bad: "Create a login page" (too vague, no context)
-✓ Good: "Create pages/login.tsx. Based on codebase_search results, follow the pattern from pages/index.tsx which uses: `import Layout from '../components/Layout'`, Tailwind classes like 'flex flex-col min-h-screen', and the existing form styling from the search results."
-
-❌ Bad: "Update the authentication logic"
-✓ Good: "In auth/session.py, modify `create_session()` to return JWT instead of session ID. Update return type annotation."
-
-❌ Bad: "Fix any issues that come up"
-✓ Good: "Run `pytest tests/auth/` and fix any failures related to session token format"
-
-❌ Bad: "Refactor the codebase"
-✓ Good: "Extract `validate_token()` from auth/middleware.py into auth/jwt.py, update 3 imports in auth/routes.py"
-
-### Workflow Example
-1. User asks: "Add login functionality"
-2. Review the Pre-gathered Context above — it already has relevant code from semantic search
-3. If you need more detail on a specific file, call `read_file("pages/index.tsx")`
-4. If the context is missing something specific, call `codebase_search("session handling")`
-5. Call `create_plan` with steps that reference actual code patterns you found
-
-### Now: Think deeply, explore the codebase, then create your master plan."""
+Think deeply, identify risks, then execute or plan."""
 
 
 # ── Replan Prompt (used when Claude is called to recover from stuck state) ──
 
-REPLAN_PROMPT = """## Strategic Replanning Mode
+REPLAN_PROMPT = """## Replanning Mode
+The current approach failed. Analyze the failures and create a revised strategy.
 
-The current approach isn't working. You're being called with a powerful reasoning model to diagnose the problem and create a BETTER plan.
+### Analysis:
+1. **Identify Root Cause**: Why did it fail? (e.g., wrong file, dependency issue, test failure).
+2. **Preserve Progress**: What work is still valid?
 
-### Analyze What Went Wrong
-
-1. **Review the failures** — What specifically failed? Error messages, wrong assumptions, missing dependencies?
-2. **Identify root cause** — Was it a bad plan, unexpected codebase structure, or environmental issue?
-3. **Learn from attempts** — What DID work? What can be preserved?
-
-### Create a Revised Strategy
-
+### Strategy:
 Use `replan(reason, new_steps, keep_completed=True)` to:
-- Acknowledge what went wrong (the `reason` is shown to the user)
-- Create new steps that avoid the same pitfalls
-- Preserve completed work if it's still valid
+- Explain the failure briefly in `reason`.
+- Provide surgical `new_steps` that avoid the previous pitfalls.
 
-### Common Recovery Patterns
-
-- **Dependency issue?** → Add step to check/fix dependencies first
-- **Wrong file/location?** → Add exploration step before modifying
-- **Test failures?** → Add step to read test expectations, match them
-- **Config mismatch?** → Add step to align with project conventions
-
-### Now: Diagnose the issue, then use `replan` with a smarter approach."""
+Diagnose, then replan."""
 
 
 
@@ -227,11 +156,10 @@ class AgentState(TypedDict):
     plan_steps: list[PlanStep]
     # 1-indexed step the agent is currently executing (0 = no plan)
     current_step: int
-    # ── Persistent workspace memory (cross-trace learning) ── Phase 1
-    workspace_memory: ws_memory.WorkspaceMemory
-    # ── Learning checkpoints ── Phase 3
-    checkpoints: list[learning_checkpoints.Checkpoint]
-    last_checkpoint_time: str | None  # ISO timestamp
+    # ── Roo-Code Style Mechanisms ──
+    consecutive_mistake_count: int
+    last_tool_call: str | None
+    repetition_count: int
 
 
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
@@ -239,8 +167,8 @@ class AgentState(TypedDict):
 @tool
 async def codebase_search(query: str, state: Annotated[AgentState, InjectedState]) -> str:
     """
-    Semantic code search - find code by meaning.
-    Use for: understanding how things work, finding related code, exploring the codebase.
+    Semantic code search - find code by meaning or concept.
+    Use for: "how does authentication work?", "where is the database connection handled?", "find examples of error handling".
     Returns relevant code snippets with file paths and line numbers.
     """
     workspace_id = state['workspace_id']
@@ -261,9 +189,10 @@ async def codebase_search(query: str, state: Annotated[AgentState, InjectedState
 @tool  
 async def trace_call_chain(symbol_name: str, state: Annotated[AgentState, InjectedState], direction: str = "both") -> str:
     """
-    Deep call-chain traversal.
+    Deep call-chain traversal to understand the flow of execution.
     Direction: 'upstream' (who calls this), 'downstream' (what does this call), 'both'.
-    Returns the execution flow as a graph.
+    Use this to: understand how data flows through the system or find the root cause of a bug by tracing logic.
+    Returns the execution flow as a graph of symbol relationships.
     """
     workspace_id = state['workspace_id']
     result = await store.trace_call_chain(workspace_id, symbol_name, direction=direction, max_depth=3)
@@ -273,8 +202,9 @@ async def trace_call_chain(symbol_name: str, state: Annotated[AgentState, Inject
 @tool
 async def impact_analysis(symbol_name: str, state: Annotated[AgentState, InjectedState]) -> str:
     """
-    Blast radius analysis - find what's affected if you change this symbol.
-    Returns all callers and dependent code.
+    Blast radius analysis - find what code is affected if you change this symbol.
+    Use this BEFORE editing a function or class to identify potential breaking changes in other modules.
+    Returns all callers and dependent code across the entire workspace.
     """
     workspace_id = state['workspace_id']
     result = await store.impact_analysis(workspace_id, symbol_name, max_depth=3)
@@ -660,8 +590,9 @@ def find_symbol_references(symbol: str, path: str = "") -> str:
 @tool
 def lsp_go_to_definition(path: str, line: int, column: int) -> str:
     """
-    Get the definition location for a symbol at a specific position.
-    Uses the IDE's language server (rust-analyzer, pyright, etc.) for accurate results.
+    Get the exact definition location for a symbol at a specific position.
+    Uses the IDE's language server (rust-analyzer, pyright, etc.) for 100% accurate results.
+    Use this for reliable navigation instead of searching.
     Returns the file path and line number where the symbol is defined.
     """
     return "PENDING_IDE_EXECUTION"
@@ -670,7 +601,7 @@ def lsp_go_to_definition(path: str, line: int, column: int) -> str:
 @tool
 def lsp_find_references(path: str, line: int, column: int) -> str:
     """
-    Find ALL references to a symbol at a specific position.
+    Find ALL exact references to a symbol at a specific position.
     Uses the IDE's language server for accurate cross-file results.
     Great for understanding usage patterns and safe refactoring.
     Returns list of locations where the symbol is used.
@@ -681,8 +612,9 @@ def lsp_find_references(path: str, line: int, column: int) -> str:
 @tool
 def lsp_hover(path: str, line: int, column: int) -> str:
     """
-    Get type information and documentation for a symbol at a position.
+    Get exact type information and documentation for a symbol at a position.
     Uses the IDE's language server for accurate type info.
+    Use this to understand complex types or function signatures without reading the whole file.
     Returns type signature, documentation, and other hover info.
     """
     return "PENDING_IDE_EXECUTION"
@@ -1398,6 +1330,9 @@ async def enrich_context(state: AgentState) -> dict:
     1. Analyzes history to find the 'Context Gap'.
     2. Generates a precise code-search query.
     3. Injects only the highly relevant snippets.
+    
+    NOTE: This node now explicitly CLEARS stale context if no new gap is identified,
+    ensuring the model only sees what it needs for the CURRENT turn.
     """
     workspace_id = state['workspace_id']
     messages = state['messages']
@@ -1407,8 +1342,9 @@ async def enrich_context(state: AgentState) -> dict:
     context_intent = await _analyze_retrieval_intent(messages)
     
     if context_intent == "NONE_NEEDED":
-        logger.info("[enrich_context] No additional context needed for this turn")
-        return {}
+        logger.info("[enrich_context] No additional context needed - clearing stale context")
+        # Explicitly return an empty string to clear previous turn's context from state
+        return {"enriched_context": ""}
 
     # 2. TARGETED SEARCH
     # We embed the precise intent, not the raw history.
@@ -1422,10 +1358,14 @@ async def enrich_context(state: AgentState) -> dict:
             new_context = chat_utils.build_context_from_results(flat_results)
             logger.info(f"[enrich_context] Injected {len(flat_results)} relevant snippets for: {context_intent}")
             return {"enriched_context": new_context}
+        else:
+            logger.info(f"[enrich_context] No results found for: {context_intent} - clearing context")
+            return {"enriched_context": ""}
+            
     except Exception as e:
         logger.error(f"[enrich_context] Targeted RAG failed: {e}")
-    
-    return {}
+        # Clear context on error to prevent model from acting on stale/wrong information
+        return {"enriched_context": ""}
 
 
 
@@ -1589,23 +1529,13 @@ async def _pick_model_name_intelligent(state: AgentState) -> str:
         return config.reasoning_model
 
 
-def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0, is_reflecting: bool = False) -> str:
+def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = None, current_step: int = 0) -> str:
     """Pick model string based on what the agent needs to do RIGHT NOW.
     
-    NOTE: If ENABLE_PHASE_3, this uses intelligent LLM-based routing.
-    Otherwise, uses heuristic-based routing (legacy).
-    
-    Planning model (Claude, best quality):
-      - First call when no plan exists (will likely create plan)
-      - Reflection mode suggesting replan
-    
-    Reasoning model (stronger, slower) for moments that need deep thinking:
-      - Right after creating a plan (first execution step needs understanding)
-      - After a tool failure (needs to reason about what went wrong)
-    
-    Tool model (faster, cheaper) for straightforward execution:
-      - Processing normal tool results (file contents, search results)
-      - Continuing plan execution on routine steps
+    Heuristic-based routing:
+    - Planning model (Claude): First call when no plan exists.
+    - Reasoning model (Stronger): After a tool failure or first step of a new plan.
+    - Tool model (Faster): Straightforward execution and routine steps.
     """
     config = llm_provider.get_config()
     planning_model = llm_provider.get_planning_model_name()
@@ -1613,61 +1543,25 @@ def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = N
     # No tool messages at all → first call
     has_tool_messages = any(isinstance(m, ToolMessage) for m in messages)
     if not has_tool_messages:
-        # First call with no existing plan → use planning model (likely to create plan)
         if not plan_steps and planning_model:
-            logger.info("[model_routing] → planning model (first call, no plan yet)")
             return planning_model
-        logger.info("[model_routing] → reasoning (first call)")
         return config.reasoning_model
     
-    # Reflection mode: check if it's suggesting replan
-    if is_reflecting:
-        # If planning model is available AND reflection mentions replan, use it
-        if planning_model:
-            logger.info("[model_routing] → planning model (reflection/replan scenario)")
-            return planning_model
-        logger.info("[model_routing] → reasoning (reflection mode)")
-    return config.reasoning_model
-
-    # Look at the last few messages to understand what just happened
-    recent_tool_results = []
+    # Check for failure signals → reasoning model
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage):
-            recent_tool_results.append(msg)
-        elif isinstance(msg, AIMessage):
-            break  # Stop at the last AI message
-    
-    # ── Check for failure signals → reasoning model ──
-    for tool_msg in recent_tool_results:
-        content_lower = tool_msg.content.lower() if tool_msg.content else ""
-        if any(signal in content_lower for signal in (
-            "error", "failed", "traceback", "exception", 
-            "not found", "permission denied", "command failed",
-            "no such file", "syntax error", "compile error",
-        )):
-            logger.info("[model_routing] → reasoning (tool failure detected)")
-            return config.reasoning_model
-    
-    # ── Check if agent just created a plan → reasoning for first step ──
-    if plan_steps and current_step == 1:
-        # Just started executing — first step after planning needs reasoning
-        any_done = any(s["status"] == "done" for s in plan_steps)
-        if not any_done:
-            logger.info("[model_routing] → reasoning (first step of new plan)")
-            return config.reasoning_model
-    
-    # ── Check if the last AI message had no tool calls (agent was talking) ──
-    # This means we're resuming after the agent gave a text response,
-    # possibly asking for clarification or explaining something complex
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            if not msg.tool_calls:
-                logger.info("[model_routing] → reasoning (resuming after text response)")
+            content_lower = msg.content.lower() if msg.content else ""
+            if any(signal in content_lower for signal in ("error", "failed", "exception", "not found")):
                 return config.reasoning_model
+        elif isinstance(msg, AIMessage):
             break
     
-    # ── Default: tool model for routine execution ──
-    logger.info("[model_routing] → tool (routine execution)")
+    # First step of new plan → reasoning
+    if plan_steps and current_step == 1:
+        any_done = any(s["status"] == "done" for s in plan_steps)
+        if not any_done:
+            return config.reasoning_model
+            
     return config.tool_model
 
 
@@ -1864,108 +1758,40 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     
     total_chars = sum(len(m.content) if isinstance(m.content, str) else len(str(m.content)) for m in messages_to_send)
     
-    # Pick model based on what the agent needs to do right now
-    # PHASE 3: Use intelligent LLM-based routing if enabled
-    if ENABLE_PHASE_3:
-        model_name = await _pick_model_name_intelligent(state)
-        logger.info("[call_model] Using %s (Phase 3 intelligent routing) | %d messages, %d chars", 
-                   model_name, len(messages_to_send), total_chars)
-    else:
-        # Legacy heuristic-based routing
-        model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step, is_reflecting=bool(reflection))
-        logger.info("[call_model] Using %s | %d messages, %d chars", model_name, len(messages_to_send), total_chars)
+    # Heuristic-based routing (removed Phase 3 intelligent routing for speed/simplicity)
+    model_name = _pick_model_name(state['messages'], plan_steps=plan_steps, current_step=current_step)
+    logger.info("[call_model] Using %s | %d messages", model_name, len(messages_to_send))
     
     model = llm_provider.get_chat_model(model_name, temperature=0.1)
-    
-    # Bind all tools
     model_with_tools = model.bind_tools(ALL_TOOLS)
     
-    # Call the model (with fallback if planning model fails)
+    # Invoke
     try:
         response = await model_with_tools.ainvoke(messages_to_send)
     except Exception as e:
-        # If planning model failed (e.g., no credits), fallback to reasoning model
         config = llm_provider.get_config()
         if model_name != config.reasoning_model:
-            logger.warning("[call_model] %s failed (%s), falling back to %s", 
-                          model_name, str(e)[:100], config.reasoning_model)
             fallback_model = llm_provider.get_chat_model(config.reasoning_model, temperature=0.1)
             model_with_tools = fallback_model.bind_tools(ALL_TOOLS)
             response = await model_with_tools.ainvoke(messages_to_send)
-            model_name = config.reasoning_model  # Update for logging
         else:
-            raise  # Re-raise if reasoning model itself failed
+            raise
     
-    logger.info("[call_model] Got response from %s, tool_calls=%s", 
-                model_name,
-                [tc['name'] for tc in response.tool_calls] if response.tool_calls else "none")
-    
-    # ── PHASE 1: Pre-emptive blocking with workspace memory ──────────────────
-    # Check workspace memory first (cross-trace failures), then in-conversation repeats
+    # ── Roo-Code Style: Repetition Detection ──
     if response.tool_calls:
-        blocked = False
-        blocked_msg = None
-        
         for tc in response.tool_calls:
-            # Extract command for execute_command tool
-            command = None
-            if tc["name"] == "execute_command":
-                command = tc.get("args", {}).get("command", "")
-            elif tc["name"] == "execute_background":
-                command = tc.get("args", {}).get("command", "")
-            else:
-                # For other tools, use the tool name + key args
-                command = tc["name"] + ":" + json.dumps(tc.get("args", {}), sort_keys=True)[:100]
+            # Check for identical consecutive tool calls
+            current_call = f"{tc['name']}:{json.dumps(tc.get('args', {}), sort_keys=True)}"
+            if state.get('last_tool_call') == current_call:
+                repetition_count = state.get('repetition_count', 0) + 1
+                if repetition_count >= 3:
+                    return {"messages": [AIMessage(content=f"I've attempted the same tool call `{tc['name']}` 3 times without success. I'll stop to avoid a loop. Please guide me on how to proceed.")]}
             
-            # PHASE 1: Check if this is an exhausted approach
-            if command:
-                is_exhausted, record = await ws_memory.is_exhausted_approach(workspace_id, command)
-                
-                if is_exhausted and record:
-                    logger.error("[call_model] BLOCKED exhausted approach: %s (failed %d times across traces)",
-                               command[:60], record["attempts"])
-                    
-                    blocked_msg = AIMessage(
-                        content=f"🛑 **EXHAUSTED APPROACH BLOCKED**\n\n"
-                                f"Command: `{command[:100]}`\n"
-                                f"Failed: {record['attempts']} times across multiple attempts\n"
-                                f"Error: {record['error_signature'][:150]}\n\n"
-                                f"**This approach will NOT work. You MUST:**\n"
-                                f"1. Call `lookup_documentation` to find the correct solution\n"
-                                f"2. Ask the user for help with a specific question\n"
-                                f"3. Use `update_plan` to skip this step\n\n"
-                                f"**DO NOT** try variations of this command."
-                    )
-                    blocked = True
-                    break
-            
-            # Loop detection removed to allow retries after fixes
-            pass
-        
-        if blocked:
-            return {"messages": [blocked_msg]}
+    # Empty response fallback
+    if not response.content and not response.tool_calls:
+        return {"messages": [AIMessage(content="I encountered an issue. Let me try a different approach.")]}
     
-    # ── Detect empty response (no content AND no tool calls) ──
-    has_content = response.content and response.content.strip()
-    has_tools = response.tool_calls and len(response.tool_calls) > 0
-    
-    if not has_content and not has_tools:
-        logger.warning("[call_model] EMPTY RESPONSE from %s - no content or tool calls!", model_name)
-        # Return a fallback message so the conversation can continue
-        fallback_msg = AIMessage(
-            content="I encountered an issue processing this request. Let me try a different approach. Could you clarify what you'd like me to do, or I can check the current state of the files."
-        )
-        return {"messages": [fallback_msg]}
-    
-    # Build return dict with checkpoints if Phase 3 is enabled
-    result = {"messages": [response]}
-    
-    if ENABLE_PHASE_3 and checkpoints:
-        result["checkpoints"] = checkpoints
-        if last_checkpoint_time:
-            result["last_checkpoint_time"] = last_checkpoint_time.isoformat()
-    
-    return result
+    return {"messages": [response]}
 
 
 async def execute_server_tools(state: AgentState) -> dict:

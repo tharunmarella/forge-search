@@ -23,7 +23,6 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, System
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from ..core import agent, llm as llm_provider
-from ..intelligence.phase1 import workspace_memory as ws_memory
 from ..models import ChatRequest, ChatResponse, PlanStepResponse
 from ..utils import auth, mermaid
 
@@ -208,94 +207,19 @@ _redis_url = os.getenv("REDIS_URL", "")
 _conversations = ConversationStore(redis_url=_redis_url if _redis_url else None)
 
 
-# ── Helper: analyze and learn from error ───────────────────────────
-
-async def _analyze_and_learn_from_error(
-    workspace_id: str,
-    command: str,
-    error_output: str,
-) -> None:
-    """
-    PHASE 2: Analyze error with LLM and store insights.
-
-    This runs asynchronously to avoid blocking the main flow.
-    """
-    try:
-        from ..intelligence.phase2 import error_analyzer, adaptive_config
-
-        config = llm_provider.get_config()
-        fast_model = llm_provider.get_chat_model(config.tool_model, temperature=0)
-
-        analysis = await error_analyzer.analyze_error_with_llm(
-            error_output,
-            command,
-            [],
-            fast_model,
-        )
-
-        if analysis.get("is_fundamental_issue"):
-            logger.info(
-                "[phase2] Fundamental issue detected: %s",
-                analysis.get("root_cause", "unknown"),
-            )
-
-            await adaptive_config.record_outcome_for_learning(
-                workspace_id,
-                "fundamental_issue_detected",
-                {
-                    "command": command,
-                    "error_type": analysis.get("error_type"),
-                    "root_cause": analysis.get("root_cause"),
-                },
-            )
-    except Exception as e:
-        logger.error("[phase2] Error analysis failed: %s", e)
-
-
-# ── Shared: process tool results (record success/failure) ───────────
+# ── Roo-Code Style: Minimal tool result processing ─────────────────
+# We no longer need cross-trace memory or background error analysis.
+# The agent's state-based repetition detection handles loops within the task.
 
 def _process_tool_result_for_memory(
     workspace_id: str,
     messages: list,
     res,
 ) -> None:
-    """Record success/failure in workspace memory for execute_command/execute_background."""
-    tool_call = None
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            for tc in msg.tool_calls:
-                if tc.get("id") == res.call_id:
-                    tool_call = tc
-                    break
-        if tool_call:
-            break
-
-    if not tool_call:
-        return
-
-    tool_name = tool_call["name"]
-    if tool_name not in ["execute_command", "execute_background"]:
-        return
-
-    command = tool_call.get("args", {}).get("command", "")
-    if not command:
-        return
-
-    if res.success:
-        asyncio.create_task(ws_memory.record_success(workspace_id, command))
-    else:
-        error_msg = res.output[:500] if res.output else "Unknown error"
-        asyncio.create_task(
-            ws_memory.record_failure(workspace_id, command, error_msg)
-        )
-        if os.getenv("ENABLE_PHASE_2", "true").lower() == "true":
-            asyncio.create_task(
-                _analyze_and_learn_from_error(
-                    workspace_id,
-                    command,
-                    res.output or "Unknown error",
-                )
-            )
+    """Placeholder for future task-level persistence (optional)."""
+    # In Roo-Code style, we don't track cross-trace failures.
+    # All loop detection happens within the current conversation state.
+    pass
 
 
 # ── POST /chat ─────────────────────────────────────────────────────
