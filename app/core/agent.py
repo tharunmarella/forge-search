@@ -84,10 +84,21 @@ SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tas
 
 ## Tool Selection Guide
 
+- **Architecture First**: ALWAYS start with `get_architecture_map()` to understand the system structure before making changes or searching.
 - **Navigation**: Use `lsp_go_to_definition` to jump to code and `lsp_hover` to understand types/docs. This is 100% accurate, unlike search.
 - **Deep Understanding**: Use `trace_call_chain` to see the flow of data (who calls this, what does this call).
 - **Refactoring & Impact**: Use `impact_analysis` BEFORE changing a symbol to see what might break. Use `lsp_rename` for renaming.
-- **Search**: Use `codebase_search` for "how does X work" and `grep` for "where is the string 'Y'".
+- **Search - Architecture Aware**: Use `codebase_search` with `component_focus` to search within specific architectural components:
+  - `component_focus="api_endpoints"` - Search only API routes and handlers
+  - `component_focus="state_management"` - Search only React Context and global state
+  - `component_focus="feature_components"` - Search only business logic components
+  - `component_focus="ui_components"` - Search only reusable UI components
+- **Search - Targeted**: Use specialized search for focused results:
+  - `search_functions` - Find implementation logic, algorithms, business rules
+  - `search_classes` - Find data structures, models, type definitions  
+  - `search_constants` - Find configuration, limits, API endpoints, defaults
+  - `search_files` - Find modules, understand high-level architecture
+- **Search - General**: Use `codebase_search` for broad "how does X work" questions and `grep` for exact strings.
 - **Diagnostics**: Always run `diagnostics` after editing to catch syntax/type errors immediately.
 
 ## Efficiency
@@ -171,25 +182,221 @@ class AgentState(TypedDict):
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
 
 @tool
-async def codebase_search(query: str, state: Annotated[AgentState, InjectedState]) -> str:
+async def codebase_search(query: str, state: Annotated[AgentState, InjectedState], component_focus: str = None) -> str:
     """
-    Semantic code search - find code by meaning or concept.
+    Intelligent semantic code search with architectural awareness.
+    
+    Args:
+        query: What you're looking for (e.g., "authentication logic", "database queries", "error handling")
+        component_focus: Optional component to focus on (api_endpoints, state_management, feature_components, etc.)
+    
     Use for: "how does authentication work?", "where is the database connection handled?", "find examples of error handling".
-    Returns relevant code snippets with file paths and line numbers.
+    Returns relevant code snippets with architectural context and file paths.
     """
     workspace_id = state['workspace_id']
-    logger.info("codebase_search: query=%s, workspace=%s", query, workspace_id)
+    logger.info("codebase_search: query=%s, workspace=%s, component_focus=%s", query, workspace_id, component_focus)
+    
+    # Get architectural context first
+    arch_context = ""
+    if not component_focus:
+        # Get architecture overview to understand what components exist
+        arch_map = await store.get_project_map(workspace_id=workspace_id)
+        components = [n for n in arch_map.get("nodes", []) if n.get("kind") == "component"]
+        if components:
+            arch_context = "🏗️ Available Components:\n"
+            for comp in components:
+                arch_context += f"- {comp['name']}: {comp.get('description', 'No description')}\n"
+            arch_context += "\n"
+    
+    # Perform semantic search
     query_emb = await embeddings.embed_query(query)
-    results = await store.vector_search(workspace_id, query_emb, top_k=8)
+    results = await store.vector_search(workspace_id, query_emb, top_k=12)  # Get more results for better context
     logger.info("codebase_search: got %d results", len(results))
     
+    if not results:
+        return f"{arch_context}No results found for this query. Try a different search term or use get_architecture_map() to explore the codebase structure."
+    
+    # Filter results by component if specified
+    filtered_results = []
+    if component_focus:
+        # Get files in the focused component
+        comp_map = await store.get_project_map(workspace_id=workspace_id, focus_path=component_focus)
+        component_files = {n["file_path"] for n in comp_map.get("nodes", []) if n.get("kind") == "file"}
+        
+        for r in results:
+            if r["symbol"].get("file_path") in component_files:
+                filtered_results.append(r)
+        
+        if not filtered_results:
+            return f"{arch_context}No results found in component '{component_focus}'. Try a broader search or different component."
+    else:
+        filtered_results = results
+    
+    # Group results by architectural component for better organization
+    component_groups = {}
+    for r in filtered_results:
+        file_path = r["symbol"].get("file_path", "")
+        
+        # Determine which component this file belongs to
+        if file_path.startswith("pages/api/"):
+            comp = "API Endpoints"
+        elif file_path.startswith("pages/"):
+            comp = "Pages & Routes"
+        elif file_path.startswith("components/ui/"):
+            comp = "UI Components"
+        elif file_path.startswith("components/"):
+            comp = "Feature Components"
+        elif file_path.startswith("context/"):
+            comp = "State Management"
+        elif file_path.startswith(("lib/", "utils/")):
+            comp = "Utilities"
+        else:
+            comp = "Configuration"
+        
+        if comp not in component_groups:
+            component_groups[comp] = []
+        component_groups[comp].append(r)
+    
+    # Build organized context
+    content_parts = [arch_context] if arch_context else []
+    
+    for comp_name, comp_results in component_groups.items():
+        content_parts.append(f"📦 {comp_name}:")
+        content_parts.append("-" * 30)
+        
+        flat_results = [r["symbol"] for r in comp_results[:4]]  # Limit per component
+        comp_content = chat_utils.build_context_from_results(flat_results)
+        content_parts.append(comp_content)
+        content_parts.append("")
+    
+    final_content = "\n".join(content_parts)
+    logger.info("codebase_search: built organized context len=%d", len(final_content))
+    
+    return final_content
+
+
+@tool
+async def search_functions(query: str, state: Annotated[AgentState, InjectedState]) -> str:
+    """
+    Search only functions and methods for implementation logic.
+    Use for: "how is X implemented?", "find the logic for Y", "what functions handle Z?".
+    More focused than codebase_search when you specifically need executable code.
+    """
+    workspace_id = state['workspace_id']
+    logger.info("search_functions: query=%s, workspace=%s", query, workspace_id)
+    query_emb = await embeddings.embed_query(query)
+    results = await store.vector_search_by_type(workspace_id, query_emb, ['function', 'method'], top_k=8)
+    logger.info("search_functions: got %d results", len(results))
+    
     if results:
-        flat_results = [r["symbol"] for r in results]
-        content = chat_utils.build_context_from_results(flat_results)
-        logger.info("codebase_search: built context len=%d", len(content))
+        content = f"🔧 **Function Search Results for '{query}':**\n\n"
+        for i, result in enumerate(results, 1):
+            sym = result["symbol"]
+            score = result["score"]
+            content += f"**{i}. {sym['name']}** ({sym['kind']}) - Score: {score:.3f}\n"
+            content += f"   📁 `{sym['file_path']}:{sym['start_line']}-{sym['end_line']}`\n"
+            if sym.get('signature'):
+                content += f"   📝 `{sym['signature']}`\n"
+            if sym.get('content'):
+                preview = sym['content'][:200].replace('\n', ' ')
+                content += f"   💡 {preview}{'...' if len(sym['content']) > 200 else ''}\n"
+            content += "\n"
         return content
     else:
-        return "No results found for this query. Try a different search term or use read_file to explore specific files."
+        return "No functions or methods found for this query. Try a broader search term or use codebase_search for general results."
+
+
+@tool
+async def search_classes(query: str, state: Annotated[AgentState, InjectedState]) -> str:
+    """
+    Search only classes, structs, and type definitions for data structures.
+    Use for: "what data structures exist?", "find the User class", "what types are defined?".
+    Perfect for understanding the data model and object hierarchies.
+    """
+    workspace_id = state['workspace_id']
+    logger.info("search_classes: query=%s, workspace=%s", query, workspace_id)
+    query_emb = await embeddings.embed_query(query)
+    results = await store.vector_search_by_type(workspace_id, query_emb, ['class', 'struct', 'type'], top_k=8)
+    logger.info("search_classes: got %d results", len(results))
+    
+    if results:
+        content = f"🏛️ **Class/Type Search Results for '{query}':**\n\n"
+        for i, result in enumerate(results, 1):
+            sym = result["symbol"]
+            score = result["score"]
+            content += f"**{i}. {sym['name']}** ({sym['kind']}) - Score: {score:.3f}\n"
+            content += f"   📁 `{sym['file_path']}:{sym['start_line']}-{sym['end_line']}`\n"
+            if sym.get('signature'):
+                content += f"   📝 `{sym['signature']}`\n"
+            if sym.get('parent'):
+                content += f"   👆 Parent: `{sym['parent']}`\n"
+            if sym.get('content'):
+                preview = sym['content'][:200].replace('\n', ' ')
+                content += f"   💡 {preview}{'...' if len(sym['content']) > 200 else ''}\n"
+            content += "\n"
+        return content
+    else:
+        return "No classes, structs, or types found for this query. Try a broader search term or use codebase_search for general results."
+
+
+@tool
+async def search_constants(query: str, state: Annotated[AgentState, InjectedState]) -> str:
+    """
+    Search only constants and configuration values.
+    Use for: "what timeouts are configured?", "find API endpoints", "what limits are set?".
+    Great for finding configuration, limits, defaults, and static values.
+    """
+    workspace_id = state['workspace_id']
+    logger.info("search_constants: query=%s, workspace=%s", query, workspace_id)
+    query_emb = await embeddings.embed_query(query)
+    results = await store.vector_search_by_type(workspace_id, query_emb, ['constant', 'const', 'static'], top_k=8)
+    logger.info("search_constants: got %d results", len(results))
+    
+    if results:
+        content = f"⚙️ **Constants Search Results for '{query}':**\n\n"
+        for i, result in enumerate(results, 1):
+            sym = result["symbol"]
+            score = result["score"]
+            content += f"**{i}. {sym['name']}** ({sym['kind']}) - Score: {score:.3f}\n"
+            content += f"   📁 `{sym['file_path']}:{sym['start_line']}-{sym['end_line']}`\n"
+            if sym.get('signature'):
+                content += f"   📝 `{sym['signature']}`\n"
+            if sym.get('content'):
+                preview = sym['content'][:150].replace('\n', ' ')
+                content += f"   💡 {preview}{'...' if len(sym['content']) > 150 else ''}\n"
+            content += "\n"
+        return content
+    else:
+        return "No constants or configuration values found for this query. Try a broader search term or use codebase_search for general results."
+
+
+@tool
+async def search_files(query: str, state: Annotated[AgentState, InjectedState]) -> str:
+    """
+    Search only file-level symbols to understand module structure.
+    Use for: "what modules exist?", "find the auth module", "what files handle payments?".
+    Perfect for understanding the high-level architecture and finding the right modules.
+    """
+    workspace_id = state['workspace_id']
+    logger.info("search_files: query=%s, workspace=%s", query, workspace_id)
+    query_emb = await embeddings.embed_query(query)
+    results = await store.vector_search_by_type(workspace_id, query_emb, ['file'], top_k=8)
+    logger.info("search_files: got %d results", len(results))
+    
+    if results:
+        content = f"📄 **File/Module Search Results for '{query}':**\n\n"
+        for i, result in enumerate(results, 1):
+            sym = result["symbol"]
+            score = result["score"]
+            content += f"**{i}. {sym['name']}** ({sym['kind']}) - Score: {score:.3f}\n"
+            content += f"   📁 `{sym['file_path']}`\n"
+            if sym.get('content'):
+                preview = sym['content'][:200].replace('\n', ' ')
+                content += f"   💡 {preview}{'...' if len(sym['content']) > 200 else ''}\n"
+            content += "\n"
+        return content
+    else:
+        return "No files or modules found for this query. Try a broader search term or use codebase_search for general results."
 
 
 @tool  
@@ -231,6 +438,118 @@ async def lookup_documentation(library: str, query: str) -> str:
         Relevant documentation snippets from official sources.
     """
     return await _fetch_documentation(library, query)
+
+
+@tool
+async def get_architecture_map(state: Annotated[AgentState, InjectedState], focus_path: str = None, focus_symbol: str = None) -> str:
+    """
+    Get the hierarchical architecture map of the codebase.
+    
+    Level 0 (no focus): Shows high-level architectural components (API, UI, State, etc.)
+    Level 1 (focus_path=component): Shows files within that component  
+    Level 2 (focus_path=file): Shows symbols/methods within that file
+    Level 3 (focus_symbol=method): Shows call graph for that method
+    
+    Use this to understand system architecture before making changes or to navigate large codebases.
+    Perfect for: "show me the architecture", "what components exist?", "how is this organized?"
+    """
+    workspace_id = state['workspace_id']
+    logger.info("get_architecture_map: workspace=%s, focus_path=%s, focus_symbol=%s", workspace_id, focus_path, focus_symbol)
+    
+    result = await store.get_project_map(
+        workspace_id=workspace_id,
+        focus_path=focus_path, 
+        focus_symbol=focus_symbol,
+        depth=1
+    )
+    
+    # Format the result for the agent
+    nodes = result.get("nodes", [])
+    edges = result.get("edges", [])
+    
+    if not nodes:
+        return "No architecture data found. The codebase may need to be indexed first."
+    
+    # Build a readable summary
+    summary = []
+    
+    if not focus_path and not focus_symbol:
+        # Level 0: Architecture overview
+        summary.append("🏗️ SYSTEM ARCHITECTURE OVERVIEW")
+        summary.append("=" * 40)
+        
+        components = [n for n in nodes if n.get("kind") == "component"]
+        if components:
+            for comp in components:
+                summary.append(f"📦 {comp['name']} ({comp['id']})")
+                summary.append(f"   └─ {comp.get('file_count', 0)} files, {comp.get('symbol_count', 0)} symbols")
+                summary.append(f"   └─ {comp.get('description', 'No description')}")
+                summary.append("")
+        
+        if edges:
+            summary.append("🔗 COMPONENT DEPENDENCIES:")
+            for edge in edges:
+                summary.append(f"   {edge['from']} → {edge['to']} ({edge['type']})")
+        
+        summary.append(f"\n💡 Use focus_path='component_id' to drill down into a specific component")
+        
+    elif focus_path and not focus_symbol:
+        if focus_path in ["api_endpoints", "pages_ui", "feature_components", "ui_components", "state_management", "utilities", "configuration"]:
+            # Level 1: Component drill-down
+            summary.append(f"📂 COMPONENT: {focus_path}")
+            summary.append("=" * 40)
+            
+            for node in nodes:
+                if node.get("kind") == "file":
+                    summary.append(f"📄 {node['name']} ({node['file_path']})")
+                    summary.append(f"   └─ {node.get('description', 'No description')}")
+            
+            if edges:
+                summary.append("\n🔗 FILE RELATIONSHIPS:")
+                for edge in edges:
+                    summary.append(f"   {edge['from']} → {edge['to']} ({edge['type']})")
+            
+            summary.append(f"\n💡 Use focus_path='file_path' to see symbols in a specific file")
+        else:
+            # Level 2: File drill-down
+            summary.append(f"📄 FILE: {focus_path}")
+            summary.append("=" * 40)
+            
+            for node in nodes:
+                summary.append(f"⚙️  {node['name']} ({node.get('kind', 'unknown')})")
+                if node.get('signature'):
+                    summary.append(f"   └─ {node['signature'][:80]}{'...' if len(node['signature']) > 80 else ''}")
+                if node.get('description'):
+                    summary.append(f"   └─ {node['description']}")
+                summary.append("")
+            
+            if edges:
+                summary.append("🔗 SYMBOL RELATIONSHIPS:")
+                for edge in edges:
+                    summary.append(f"   {edge['from']} → {edge['to']} ({edge['type']})")
+            
+            summary.append(f"\n💡 Use focus_symbol='symbol_name' to see call graph")
+    
+    elif focus_symbol:
+        # Level 3: Symbol call graph
+        summary.append(f"🕸️ CALL GRAPH: {focus_symbol}")
+        summary.append("=" * 40)
+        
+        root_node = next((n for n in nodes if n['name'] == focus_symbol), None)
+        if root_node:
+            summary.append(f"🎯 ROOT: {root_node['name']} in {root_node['file_path']}")
+            summary.append("")
+        
+        for node in nodes:
+            if node['name'] != focus_symbol:
+                summary.append(f"🔗 {node['name']} ({node.get('kind', 'unknown')}) in {node['file_path']}")
+        
+        if edges:
+            summary.append("\n🔗 CALL RELATIONSHIPS:")
+            for edge in edges:
+                summary.append(f"   {edge['from']} → {edge['to']} ({edge['type']})")
+    
+    return "\n".join(summary)
 
 
 # ── Plan Management Tools (Cloud-side) ────────────────────────────
@@ -638,7 +957,7 @@ def lsp_rename(path: str, line: int, column: int, new_name: str) -> str:
 
 # Tool lists
 PLAN_TOOLS = [create_plan, update_plan, discard_plan, add_plan_step, remove_plan_step, replan]
-SERVER_TOOLS = [codebase_search, trace_call_chain, impact_analysis, lookup_documentation] + PLAN_TOOLS
+SERVER_TOOLS = [codebase_search, search_functions, search_classes, search_constants, search_files, trace_call_chain, impact_analysis, lookup_documentation, get_architecture_map] + PLAN_TOOLS
 IDE_FILE_TOOLS = [read_file, write_to_file, replace_in_file, delete_file, apply_patch, list_files, glob]
 IDE_EXEC_TOOLS = [execute_command, execute_background, read_process_output, check_process_status, kill_process]
 IDE_PORT_TOOLS = [wait_for_port, check_port, kill_port]
@@ -1352,24 +1671,86 @@ async def enrich_context(state: AgentState) -> dict:
         # Explicitly return an empty string to clear previous turn's context from state
         return {"enriched_context": ""}
 
-    # 2. TARGETED SEARCH
-    # We embed the precise intent, not the raw history.
+    # 2. ARCHITECTURE-AWARE TARGETED SEARCH
+    # First get architectural context to understand the system structure
     try:
+        # Get high-level architecture overview
+        arch_map = await store.get_project_map(workspace_id=workspace_id)
+        components = [n for n in arch_map.get("nodes", []) if n.get("kind") == "component"]
+        
+        # Build architecture context
+        arch_context = "🏗️ SYSTEM ARCHITECTURE:\n"
+        for comp in components:
+            arch_context += f"- {comp['name']}: {comp.get('description', 'No description')} ({comp.get('file_count', 0)} files)\n"
+        arch_context += "\n"
+        
+        # Perform semantic search with architectural awareness
         query_emb = await embeddings.embed_query(context_intent)
-        # Use a slightly higher top_k but stricter threshold for precision
-        results = await store.vector_search(workspace_id, query_emb, top_k=5)
+        results = await store.vector_search(workspace_id, query_emb, top_k=8)  # Get more results for better coverage
         
         if results:
-            flat_results = [r["symbol"] for r in results]
-            new_context = chat_utils.build_context_from_results(flat_results)
-            logger.info(f"[enrich_context] Injected {len(flat_results)} relevant snippets for: {context_intent}")
+            # Group results by architectural component for better organization
+            component_groups = {}
+            for r in results:
+                file_path = r["symbol"].get("file_path", "")
+                
+                # Determine which component this file belongs to
+                if file_path.startswith("pages/api/"):
+                    comp = "API Endpoints"
+                elif file_path.startswith("pages/"):
+                    comp = "Pages & Routes"
+                elif file_path.startswith("components/ui/"):
+                    comp = "UI Components"
+                elif file_path.startswith("components/"):
+                    comp = "Feature Components"
+                elif file_path.startswith("context/"):
+                    comp = "State Management"
+                elif file_path.startswith(("lib/", "utils/")):
+                    comp = "Utilities"
+                else:
+                    comp = "Configuration"
+                
+                if comp not in component_groups:
+                    component_groups[comp] = []
+                component_groups[comp].append(r)
+            
+            # Build organized context with architecture information
+            context_parts = [arch_context]
+            context_parts.append("🎯 RELEVANT CODE BY COMPONENT:")
+            context_parts.append("=" * 40)
+            
+            for comp_name, comp_results in component_groups.items():
+                if comp_results:  # Only show components that have relevant results
+                    context_parts.append(f"\n📦 {comp_name}:")
+                    context_parts.append("-" * 20)
+                    
+                    flat_results = [r["symbol"] for r in comp_results[:3]]  # Limit per component
+                    comp_context = chat_utils.build_context_from_results(flat_results)
+                    context_parts.append(comp_context)
+            
+            new_context = "\n".join(context_parts)
+            logger.info(f"[enrich_context] Injected architecture-aware context for: {context_intent}")
             return {"enriched_context": new_context}
         else:
-            logger.info(f"[enrich_context] No results found for: {context_intent} - clearing context")
-            return {"enriched_context": ""}
+            # Even if no search results, provide architecture context
+            logger.info(f"[enrich_context] No search results, providing architecture context only")
+            return {"enriched_context": arch_context}
             
     except Exception as e:
-        logger.error(f"[enrich_context] Targeted RAG failed: {e}")
+        logger.error(f"[enrich_context] Architecture-aware RAG failed: {e}")
+        # Fallback to basic search
+        try:
+            query_emb = await embeddings.embed_query(context_intent)
+            results = await store.vector_search(workspace_id, query_emb, top_k=5)
+            
+            if results:
+                flat_results = [r["symbol"] for r in results]
+                new_context = chat_utils.build_context_from_results(flat_results)
+                logger.info(f"[enrich_context] Fallback: Injected {len(flat_results)} snippets for: {context_intent}")
+                return {"enriched_context": new_context}
+        except Exception as fallback_e:
+            logger.error(f"[enrich_context] Fallback also failed: {fallback_e}")
+        
         # Clear context on error to prevent model from acting on stale/wrong information
         return {"enriched_context": ""}
 
@@ -1826,7 +2207,12 @@ async def execute_server_tools(state: AgentState) -> dict:
             
         try:
             # Extract kwargs and inject state if needed
-            sig = inspect.signature(tool_func.func)
+            # For async tools, use coroutine instead of func
+            actual_func = tool_func.coroutine if tool_func.coroutine else tool_func.func
+            if actual_func is None:
+                raise ValueError(f"Tool {tool_name} has no callable function or coroutine")
+                
+            sig = inspect.signature(actual_func)
             kwargs = tool_call['args'].copy()
             
             # Find if any parameter expects state
@@ -1838,7 +2224,7 @@ async def execute_server_tools(state: AgentState) -> dict:
             if state_param:
                 kwargs[state_param] = state
             
-            content = await tool_func.func(**kwargs)
+            content = await actual_func(**kwargs)
             
             # Check if the output is a plan update (JSON string with plan_steps)
             # Note: We capture these updates to return them in the final dict

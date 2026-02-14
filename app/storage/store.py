@@ -152,9 +152,17 @@ async def ensure_schema():
                     content TEXT DEFAULT '',
                     enriched_content TEXT DEFAULT '',
                     parent TEXT DEFAULT '',
-                    embedding vector({dims})
+                    embedding vector({dims}),
+                    service_id TEXT DEFAULT '',
+                    architectural_role TEXT DEFAULT '',
+                    description TEXT DEFAULT ''
                 )
             """.format(dims=VECTOR_DIMENSIONS))
+            
+            # Migration: Add columns if they don't exist
+            await cur.execute("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS service_id TEXT DEFAULT ''")
+            await cur.execute("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS architectural_role TEXT DEFAULT ''")
+            await cur.execute("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
             
             # Migrate if needed (handles Jina 768 -> Voyage 1024 transition)
             await _migrate_embedding_dimensions(conn, cur)
@@ -168,11 +176,26 @@ async def ensure_schema():
                     edge_type TEXT NOT NULL
                 )
             """)
+
+            # Services table for hierarchical map (Level 0)
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS services (
+                    id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    service_type TEXT DEFAULT 'core',
+                    files TEXT[] DEFAULT '{}',
+                    PRIMARY KEY (id, workspace_id)
+                )
+            """)
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_services_ws ON services(workspace_id)")
             
             # Indexes for fast lookups
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_symbols_ws ON symbols(workspace_id)")
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_symbols_ws_name ON symbols(workspace_id, name)")
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_symbols_ws_fp ON symbols(workspace_id, file_path)")
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_symbols_service_id ON symbols(workspace_id, service_id)")
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_files_ws ON files(workspace_id)")
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_files_ws_path ON files(workspace_id, path)")
             await cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_ws ON edges(workspace_id)")
@@ -292,19 +315,114 @@ async def get_file_hash(workspace_id: str, file_path: str) -> str | None:
         return row["content_hash"] if row else None
 
 
+async def upsert_service(
+    workspace_id: str,
+    service_id: str,
+    name: str,
+    description: str = "",
+    service_type: str = "core",
+    files: list[str] | None = None
+):
+    """Upsert a service definition."""
+    files = files or []
+    async with _connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                INSERT INTO services (id, workspace_id, name, description, service_type, files)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id, workspace_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    service_type = EXCLUDED.service_type,
+                    files = EXCLUDED.files
+            """, (service_id, workspace_id, name, description, service_type, files))
+            await conn.commit()
+
+
+async def get_services(workspace_id: str) -> list[dict[str, Any]]:
+    """Get all services for a workspace."""
+    async with _cursor() as cur:
+        await cur.execute(
+            "SELECT id, name, description, service_type, files FROM services WHERE workspace_id = %s",
+            (workspace_id,)
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_external_calls(
+    workspace_id: str,
+    file_path: str,
+    defined_names: set[str],
+    references: list,
+) -> dict[str, dict[str, list[tuple[str, str]]]]:
+    """
+    Get cross-file callers and callees for symbols in the current file.
+    Used to enrich embeddings with architectural context.
+
+    Returns:
+        For each symbol_name in defined_names:
+        {
+            "callers": [(caller_name, caller_file_path), ...],
+            "callees": [(callee_name, callee_file_path), ...]
+        }
+    """
+    result: dict[str, dict[str, list[tuple[str, str]]]] = {
+        name: {"callers": [], "callees": []} for name in defined_names
+    }
+
+    async with _cursor() as cur:
+        # External callers: who (in other files) calls each of our symbols?
+        for sym_name in defined_names:
+            await cur.execute("""
+                SELECT DISTINCT s.file_path, e.from_name
+                FROM edges e
+                JOIN symbols s ON s.workspace_id = e.workspace_id AND s.name = e.from_name
+                WHERE e.workspace_id = %s AND e.to_name = %s AND e.edge_type = 'CALLS'
+                  AND s.file_path != %s
+            """, (workspace_id, sym_name, file_path))
+            async for row in cur:
+                result[sym_name]["callers"].append((row["from_name"], row["file_path"]))
+
+        # External callees: for each of our symbols as caller, what external symbols do they call?
+        # From references: (context_name, name) where name not in defined_names
+        callee_refs: dict[str, set[str]] = {}  # context_name -> set of external callee names
+        for ref in references:
+            if not ref.context_name or ref.name in defined_names:
+                continue
+            callee_refs.setdefault(ref.context_name, set()).add(ref.name)
+
+        for caller_name, callee_names in callee_refs.items():
+            if caller_name not in result:
+                continue
+            seen: set[tuple[str, str]] = set()
+            for callee_name in callee_names:
+                await cur.execute("""
+                    SELECT DISTINCT name, file_path FROM symbols
+                    WHERE workspace_id = %s AND name = %s AND file_path != %s
+                """, (workspace_id, callee_name, file_path))
+                async for row in cur:
+                    key = (row["name"], row["file_path"])
+                    if key not in seen:
+                        seen.add(key)
+                        result[caller_name]["callees"].append((row["name"], row["file_path"]))
+
+    return result
+
+
 async def index_file_result(
     workspace_id: str,
     parse_result,
     embeddings_map: dict[str, list[float]],
     enriched_texts: dict[str, str] | None = None,
+    classifications: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """
-    Index a parsed file with embeddings.
+    Index a parsed file with embeddings and architectural metadata.
     
-    Uses a single transaction for atomicity - if anything fails,
-    the entire operation is rolled back cleanly.
+    classifications: Map of symbol_uid -> {service_id, architectural_role, description}
     """
     enriched_texts = enriched_texts or {}
+    classifications = classifications or {}
     stats = {"nodes_created": 0, "relationships_created": 0}
 
     file_uid = f"{workspace_id}:{parse_result.file_path}"
@@ -329,7 +447,6 @@ async def index_file_result(
                 )
 
                 # Remove old edges originating from this file
-                # This ensures that if a call or import is removed, the edge is also removed.
                 await cur.execute("""
                     DELETE FROM edges 
                     WHERE workspace_id = %s 
@@ -353,19 +470,28 @@ async def index_file_result(
                     defn_key = f"{defn.file_path}:{defn.name}:{defn.start_line}"
                     emb = embeddings_map.get(defn_key)
                     enriched = enriched_texts.get(defn_key, "")
+                    
+                    # Classification metadata
+                    cls = classifications.get(defn_key, {})
+                    service_id = cls.get("service_id", "")
+                    arch_role = cls.get("architectural_role", "")
+                    description = cls.get("description", "")
 
                     emb_str = f"[{','.join(str(x) for x in emb)}]" if emb else None
 
                     await cur.execute("""
                         INSERT INTO symbols (uid, workspace_id, name, kind, file_path, start_line, end_line,
-                                             signature, content, enriched_content, parent, embedding)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                             signature, content, enriched_content, parent, embedding,
+                                             service_id, architectural_role, description)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (uid) DO UPDATE SET
-                            name=%s, kind=%s, signature=%s, content=%s, enriched_content=%s, parent=%s, embedding=%s
+                            name=%s, kind=%s, signature=%s, content=%s, enriched_content=%s, parent=%s, embedding=%s,
+                            service_id=%s, architectural_role=%s, description=%s
                     """, (uid, workspace_id, defn.name, defn.kind, defn.file_path,
                           defn.start_line, defn.end_line, defn.signature, defn.content,
-                          enriched, defn.parent or "", emb_str,
-                          defn.name, defn.kind, defn.signature, defn.content, enriched, defn.parent or "", emb_str))
+                          enriched, defn.parent or "", emb_str, service_id, arch_role, description,
+                          defn.name, defn.kind, defn.signature, defn.content, enriched, defn.parent or "", emb_str,
+                          service_id, arch_role, description))
 
                     stats["nodes_created"] += 1
                     stats["relationships_created"] += 1
@@ -377,12 +503,16 @@ async def index_file_result(
                         """, (workspace_id, defn.name, defn.parent))
                         stats["relationships_created"] += 1
                 
-                # Handle fallback whole-file embeddings when tree-sitter extraction failed
-                # These have keys like "path/to/file.tsx:__file__:0"
+                # Handle fallback whole-file embeddings
                 if not parse_result.definitions:
                     file_key = f"{parse_result.file_path}:__file__:0"
                     emb = embeddings_map.get(file_key)
                     enriched = enriched_texts.get(file_key, "")
+                    
+                    cls = classifications.get(file_key, {})
+                    service_id = cls.get("service_id", "")
+                    arch_role = cls.get("architectural_role", "")
+                    description = cls.get("description", "")
                     
                     if emb:
                         uid = f"{workspace_id}:{file_key}"
@@ -391,22 +521,22 @@ async def index_file_result(
                         
                         await cur.execute("""
                             INSERT INTO symbols (uid, workspace_id, name, kind, file_path, start_line, end_line,
-                                                 signature, content, enriched_content, parent, embedding)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                 signature, content, enriched_content, parent, embedding,
+                                                 service_id, architectural_role, description)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (uid) DO UPDATE SET
-                                name=%s, kind=%s, signature=%s, content=%s, enriched_content=%s, parent=%s, embedding=%s
+                                name=%s, kind=%s, signature=%s, content=%s, enriched_content=%s, parent=%s, embedding=%s,
+                                service_id=%s, architectural_role=%s, description=%s
                         """, (uid, workspace_id, file_name, "file", parse_result.file_path,
                               0, 0, f"File: {parse_result.file_path}", "", enriched, "", emb_str,
-                              file_name, "file", f"File: {parse_result.file_path}", "", enriched, "", emb_str))
+                              service_id, arch_role, description,
+                              file_name, "file", f"File: {parse_result.file_path}", "", enriched, "", emb_str,
+                              service_id, arch_role, description))
                         
                         stats["nodes_created"] += 1
-                        logger.debug("Stored fallback file embedding for %s", parse_result.file_path)
 
-                # Commit the entire transaction
                 await conn.commit()
-                
         except Exception as e:
-            # Rollback on any error - no partial state
             await conn.rollback()
             logger.error(f"index_file_result failed, rolled back: {e}")
             raise
@@ -490,6 +620,56 @@ async def vector_search(
             ORDER BY embedding <=> %s::vector
             LIMIT %s
         """, (emb_str, workspace_id, emb_str, threshold, emb_str, top_k))
+
+        results = []
+        async for row in cur:
+            results.append({
+                "symbol": dict(row),
+                "score": float(row["score"]),
+            })
+        
+        return results
+
+
+async def vector_search_by_type(
+    workspace_id: str,
+    query_embedding: list[float],
+    symbol_types: list[str],
+    top_k: int = 10,
+    score_threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Type-filtered vector search using pgvector cosine distance.
+    
+    Args:
+        workspace_id: Filter to this workspace
+        query_embedding: The query vector
+        symbol_types: List of symbol types to filter by (e.g., ['function', 'method'])
+        top_k: Maximum results to return
+        score_threshold: Minimum cosine similarity (0-1). Defaults to SCORE_THRESHOLD.
+    """
+    threshold = score_threshold if score_threshold is not None else SCORE_THRESHOLD
+    
+    async with _cursor() as cur:
+        emb_str = f"[{','.join(str(x) for x in query_embedding)}]"
+        types_placeholder = ','.join(['%s'] * len(symbol_types))
+
+        # Set HNSW search parameter for quality vs speed tradeoff
+        await cur.execute("SET hnsw.ef_search = 64")
+
+        # Query with type filtering and score threshold
+        await cur.execute(f"""
+            SELECT uid, name, kind, file_path, start_line, end_line,
+                   signature, content, parent,
+                   1 - (embedding <=> %s::vector) AS score
+            FROM symbols
+            WHERE workspace_id = %s 
+              AND embedding IS NOT NULL
+              AND kind = ANY(%s)
+              AND 1 - (embedding <=> %s::vector) > %s
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """, (emb_str, workspace_id, symbol_types, emb_str, threshold, emb_str, top_k))
 
         results = []
         async for row in cur:
@@ -724,9 +904,10 @@ async def get_project_map(
     """
     Build a hierarchical project map.
     
-    Level 1 (High): Project/Module view (file tree + imports)
-    Level 2 (Mid): File/Class view (symbols inside a file)
-    Level 3 (Low): Method/Call view (call graph for a symbol)
+    Level 0: Service architecture view (logical components)
+    Level 1: Service drill-down (files within a service)
+    Level 2: File drill-down (symbols within a file)
+    Level 3: Symbol drill-down (call graph)
     """
     nodes = []
     edges = []
@@ -796,10 +977,102 @@ async def get_project_map(
                 })
                 edges.append({"from": row["uid"], "to": root_sym["uid"], "type": "CALLS"})
 
-        elif focus_path:
+        elif focus_path and focus_path in ["api_endpoints", "pages_ui", "feature_components", "ui_components", "state_management", "utilities", "configuration"]:
+            # Level 1: Component drill-down (files within a component)
+            component_id = focus_path
+            
+            # Define file patterns for each component
+            file_patterns = {
+                "api_endpoints": ["pages/api/%"],
+                "pages_ui": ["pages/%"],
+                "feature_components": ["components/%"],
+                "ui_components": ["components/ui/%"],
+                "state_management": ["context/%"],
+                "utilities": ["lib/%", "utils/%"],
+                "configuration": ["%"]  # Catch-all for config files
+            }
+            
+            patterns = file_patterns.get(component_id, [])
+            
+            # Get files that match the component patterns with proper exclusions
+            files_to_add = []
+            
+            if component_id == "feature_components":
+                # Special case: feature components excludes UI components
+                await cur.execute("""
+                    SELECT DISTINCT file_path, COUNT(*) as symbol_count
+                    FROM symbols
+                    WHERE workspace_id = %s 
+                      AND file_path LIKE %s 
+                      AND file_path NOT LIKE %s
+                      AND kind = 'function'
+                    GROUP BY file_path
+                    ORDER BY file_path
+                """, (workspace_id, 'components/%', 'components/ui/%'))
+                files_to_add = await cur.fetchall()
+                
+            elif component_id == "pages_ui":
+                # Special case: pages UI excludes API endpoints
+                await cur.execute("""
+                    SELECT DISTINCT file_path, COUNT(*) as symbol_count
+                    FROM symbols
+                    WHERE workspace_id = %s 
+                      AND file_path LIKE %s 
+                      AND file_path NOT LIKE %s
+                      AND kind = 'function'
+                    GROUP BY file_path
+                    ORDER BY file_path
+                """, (workspace_id, 'pages/%', 'pages/api/%'))
+                files_to_add = await cur.fetchall()
+                
+            else:
+                # Standard pattern matching for other components
+                for pattern in patterns:
+                    await cur.execute("""
+                        SELECT DISTINCT file_path, COUNT(*) as symbol_count
+                        FROM symbols
+                        WHERE workspace_id = %s AND file_path LIKE %s AND kind = 'function'
+                        GROUP BY file_path
+                        ORDER BY file_path
+                    """, (workspace_id, pattern))
+                    pattern_files = await cur.fetchall()
+                    files_to_add.extend(pattern_files)
+            
+            # Process the results
+            for row in files_to_add:
+                file_path = row["file_path"]
+                
+                # Additional filtering for configuration component
+                if component_id == "configuration" and any(file_path.startswith(p.rstrip('%')) for p in ["pages/", "components/", "context/", "lib/", "utils/"]):
+                    continue  # Skip files that belong to other components
+                
+                nodes.append({
+                    "id": file_path,
+                    "name": file_path.split("/")[-1],
+                    "kind": "file",
+                    "file_path": file_path,
+                    "description": f"{row['symbol_count']} functions"
+                })
+            
+            # Add CALLS edges between files in this component
+            file_paths = [n["id"] for n in nodes]
+            if file_paths:
+                await cur.execute("""
+                    SELECT DISTINCT s1.file_path as from_file, s2.file_path as to_file
+                    FROM edges e
+                    JOIN symbols s1 ON s1.workspace_id = e.workspace_id AND s1.name = e.from_name
+                    JOIN symbols s2 ON s2.workspace_id = e.workspace_id AND s2.name = e.to_name
+                    WHERE e.workspace_id = %s AND e.edge_type = 'CALLS'
+                      AND s1.file_path = ANY(%s) AND s2.file_path = ANY(%s)
+                """, (workspace_id, file_paths, file_paths))
+                
+                async for row in cur:
+                    edges.append({"from": row["from_file"], "to": row["to_file"], "type": "CALLS"})
+
+        elif focus_path and not focus_path.startswith("service_"):
             # Level 2: Mid-level view of symbols inside a file
             await cur.execute("""
-                SELECT uid, name, kind, file_path, signature, parent
+                SELECT uid, name, kind, file_path, signature, parent, architectural_role, description
                 FROM symbols
                 WHERE workspace_id = %s AND file_path = %s
                 ORDER BY start_line
@@ -811,7 +1084,8 @@ async def get_project_map(
                     "name": row["name"],
                     "kind": row["kind"],
                     "file_path": row["file_path"],
-                    "signature": row["signature"]
+                    "signature": row["signature"],
+                    "description": f"[{row['architectural_role']}] {row['description']}" if row['architectural_role'] else row['description']
                 })
                 if row["parent"]:
                     # Find parent symbol UID
@@ -823,44 +1097,198 @@ async def get_project_map(
                     if parent_row:
                         edges.append({"from": row["uid"], "to": parent_row["uid"], "type": "BELONGS_TO"})
 
-        else:
-            # Level 1: High-level project view (file tree + imports)
-            await cur.execute("SELECT path, language FROM files WHERE workspace_id = %s", (workspace_id,))
+        elif focus_path and focus_path.startswith("service_"):
+            # Level 1: Service drill-down (files within a service)
+            service_id = focus_path
+            await cur.execute("""
+                SELECT DISTINCT file_path, architectural_role, description
+                FROM symbols
+                WHERE workspace_id = %s AND service_id = %s
+            """, (workspace_id, service_id))
+            
             async for row in cur:
                 nodes.append({
-                    "id": row["path"],
-                    "name": row["path"].split("/")[-1],
+                    "id": row["file_path"],
+                    "name": row["file_path"].split("/")[-1],
                     "kind": "file",
-                    "file_path": row["path"]
+                    "file_path": row["file_path"],
+                    "description": f"[{row['architectural_role']}] {row['description']}" if row['architectural_role'] else row['description']
                 })
+            
+            # Add IMPORTS edges between these files
+            file_paths = [n["id"] for n in nodes]
+            if file_paths:
+                placeholders = ', '.join(['%s'] * len(file_paths))
+                await cur.execute(f"""
+                    SELECT from_name, to_name
+                    FROM edges
+                    WHERE workspace_id = %s AND edge_type = 'IMPORTS'
+                      AND from_name IN ({placeholders})
+                      AND to_name IN ({placeholders})
+                """, (workspace_id, *file_paths, *file_paths))
+                async for row in cur:
+                    edges.append({"from": row["from_name"], "to": row["to_name"], "type": "IMPORTS"})
 
-            # Add directory nodes
-            dirs = set()
-            for node in nodes:
-                parts = node["file_path"].split("/")[:-1]
-                curr = ""
-                for p in parts:
-                    parent = curr
-                    curr = f"{curr}/{p}" if curr else p
-                    if curr not in dirs:
-                        dirs.add(curr)
-                        nodes.append({
-                            "id": curr,
-                            "name": p,
-                            "kind": "directory",
-                            "file_path": curr
-                        })
-                        if parent:
-                            edges.append({"from": curr, "to": parent, "type": "CONTAINS"})
-
-            # Add file-level IMPORTS edges
+        else:
+            # Level 0: High-level service architecture view
             await cur.execute("""
-                SELECT from_name, to_name
-                FROM edges
-                WHERE workspace_id = %s AND edge_type = 'IMPORTS'
+                SELECT id, name, description, service_type, files
+                FROM services
+                WHERE workspace_id = %s
             """, (workspace_id,))
+            
+            service_nodes = []
             async for row in cur:
-                edges.append({"from": row["from_name"], "to": row["to_name"], "type": "IMPORTS"})
+                s_node = {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "kind": "service",
+                    "description": row["description"],
+                    "file_count": len(row["files"]) if row["files"] else 0,
+                    "files": row["files"] or []
+                }
+                service_nodes.append(s_node)
+                nodes.append(s_node)
+
+            # If no services found in table, try to infer from symbols
+            if not nodes:
+                await cur.execute("""
+                    SELECT DISTINCT service_id
+                    FROM symbols
+                    WHERE workspace_id = %s AND service_id != ''
+                """, (workspace_id,))
+                
+                s_ids = [row["service_id"] for row in await cur.fetchall()]
+                for sid in s_ids:
+                    # Get file count and some key symbols for this service
+                    await cur.execute("""
+                        SELECT COUNT(DISTINCT file_path) as f_count, 
+                               COUNT(*) as s_count
+                        FROM symbols
+                        WHERE workspace_id = %s AND service_id = %s
+                    """, (workspace_id, sid))
+                    stats = await cur.fetchone()
+                    
+                    s_node = {
+                        "id": sid,
+                        "name": sid.replace("service_", "").replace("_", " ").title(),
+                        "kind": "service",
+                        "file_count": stats["f_count"],
+                        "symbol_count": stats["s_count"]
+                    }
+                    nodes.append(s_node)
+                    service_nodes.append(s_node)
+
+            # If still no services found, create component-based architecture view
+            if not nodes:
+                component_groups = {}
+                
+                # Get all files and their symbols to analyze patterns
+                await cur.execute("""
+                    SELECT DISTINCT file_path, COUNT(*) as symbol_count
+                    FROM symbols 
+                    WHERE workspace_id = %s AND kind = 'function'
+                    GROUP BY file_path
+                    ORDER BY file_path
+                """, (workspace_id,))
+                
+                files_data = await cur.fetchall()
+                
+                # Classify files into architectural components
+                for file_data in files_data:
+                    file_path = file_data["file_path"]
+                    symbol_count = file_data["symbol_count"]
+                    
+                    # Determine component category
+                    component_id = None
+                    component_name = None
+                    component_description = None
+                    
+                    if file_path.startswith("pages/"):
+                        if "api/" in file_path:
+                            component_id = "api_endpoints"
+                            component_name = "API Endpoints"
+                            component_description = "Backend API routes and handlers"
+                        else:
+                            component_id = "pages_ui"
+                            component_name = "Pages & Routes"
+                            component_description = "Frontend pages and routing"
+                    elif file_path.startswith("components/"):
+                        if "ui/" in file_path:
+                            component_id = "ui_components"
+                            component_name = "UI Components"
+                            component_description = "Reusable UI components and design system"
+                        else:
+                            component_id = "feature_components"
+                            component_name = "Feature Components"
+                            component_description = "Business logic components"
+                    elif file_path.startswith("context/"):
+                        component_id = "state_management"
+                        component_name = "State Management"
+                        component_description = "React Context and global state"
+                    elif file_path.startswith("lib/") or file_path.startswith("utils/"):
+                        component_id = "utilities"
+                        component_name = "Utilities"
+                        component_description = "Helper functions and utilities"
+                    else:
+                        component_id = "configuration"
+                        component_name = "Configuration"
+                        component_description = "Config files and setup"
+                    
+                    # Add to component group
+                    if component_id not in component_groups:
+                        component_groups[component_id] = {
+                            "id": component_id,
+                            "name": component_name,
+                            "kind": "component",
+                            "description": component_description,
+                            "files": [],
+                            "symbol_count": 0,
+                            "file_count": 0
+                        }
+                    
+                    component_groups[component_id]["files"].append(file_path)
+                    component_groups[component_id]["symbol_count"] += symbol_count
+                    component_groups[component_id]["file_count"] += 1
+                
+                # Add component nodes
+                for comp in component_groups.values():
+                    nodes.append(comp)
+                    service_nodes.append(comp)  # Treat components as services for edge logic
+
+            # Add DEPENDS_ON edges between services/components
+            for s1 in service_nodes:
+                for s2 in service_nodes:
+                    if s1["id"] == s2["id"]:
+                        continue
+                    
+                    # For traditional services, check service_id
+                    if s1.get("kind") == "service" and "files" not in s1:
+                        await cur.execute("""
+                            SELECT 1 FROM edges e
+                            JOIN symbols sym1 ON sym1.workspace_id = e.workspace_id AND sym1.file_path = e.from_name
+                            JOIN symbols sym2 ON sym2.workspace_id = e.workspace_id AND sym2.file_path = e.to_name
+                            WHERE e.workspace_id = %s AND e.edge_type = 'IMPORTS'
+                              AND sym1.service_id = %s AND sym2.service_id = %s
+                            LIMIT 1
+                        """, (workspace_id, s1["id"], s2["id"]))
+                        
+                        if await cur.fetchone():
+                            edges.append({"from": s1["id"], "to": s2["id"], "type": "DEPENDS_ON"})
+                    
+                    # For component groups, check if any file in s1 calls functions in s2
+                    elif s1.get("kind") == "component" and "files" in s1:
+                        await cur.execute("""
+                            SELECT 1 FROM edges e
+                            JOIN symbols s1_sym ON s1_sym.workspace_id = e.workspace_id AND s1_sym.name = e.from_name
+                            JOIN symbols s2_sym ON s2_sym.workspace_id = e.workspace_id AND s2_sym.name = e.to_name
+                            WHERE e.workspace_id = %s AND e.edge_type = 'CALLS'
+                              AND s1_sym.file_path = ANY(%s) AND s2_sym.file_path = ANY(%s)
+                            LIMIT 1
+                        """, (workspace_id, s1["files"], s2["files"]))
+                        
+                        if await cur.fetchone():
+                            edges.append({"from": s1["id"], "to": s2["id"], "type": "DEPENDS_ON"})
 
     # Deduplicate nodes by ID
     unique_nodes = {n["id"]: n for n in nodes}.values()

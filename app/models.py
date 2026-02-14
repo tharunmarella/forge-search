@@ -264,16 +264,21 @@ class MapRequest(BaseModel):
 class MapNode(BaseModel):
     id: str
     name: str
-    kind: str  # "file", "directory", "class", "function", etc.
+    kind: str  # "file", "directory", "class", "function", "service", etc.
     file_path: str | None = None
     signature: str | None = None
     description: str | None = None
+    # Service-specific fields
+    file_count: int | None = None
+    symbol_count: int | None = None
+    files: list[str] | None = None
+    key_symbols: list[str] | None = None
 
 
 class MapEdge(BaseModel):
     from_id: str = Field(alias="from")
     to_id: str = Field(alias="to")
-    type: str  # "IMPORTS", "CALLS", "BELONGS_TO", "CONTAINS"
+    type: str  # "IMPORTS", "CALLS", "BELONGS_TO", "CONTAINS", "DEPENDS_ON", "PROVIDES_TO"
 
     class Config:
         populate_by_name = True
