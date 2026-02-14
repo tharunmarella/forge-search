@@ -19,7 +19,8 @@ The flow:
   7. Agent can use lookup_documentation tool for library docs on-demand
 """
 
-from typing import Annotated, TypedDict, Literal
+from typing import Annotated, Literal
+from typing_extensions import TypedDict
 import json
 import logging
 import os
@@ -50,11 +51,10 @@ logger = logging.getLogger(__name__)
 # ── Configuration: Enable/Disable Intelligence Phases ──────────────
 ENABLE_PHASE_1 = os.getenv("ENABLE_PHASE_1", "true").lower() == "true"  # Persistent memory
 ENABLE_PHASE_2 = os.getenv("ENABLE_PHASE_2", "true").lower() == "true"  # LLM-powered intelligence
-# Phase 3 (Hierarchical Planning/Checkpoints) disabled for simplicity
 
 logger.info(
-    "[config] Intelligence phases: Phase1=%s, Phase2=%s, Phase3=%s",
-    ENABLE_PHASE_1, ENABLE_PHASE_2, ENABLE_PHASE_3
+    "[config] Intelligence phases: Phase1=%s, Phase2=%s",
+    ENABLE_PHASE_1, ENABLE_PHASE_2
 )
 
 # ── System Prompt ──────────────────────────────────────────────────
