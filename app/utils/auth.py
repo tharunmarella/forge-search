@@ -240,7 +240,7 @@ def success_page(user_info: dict, token: str) -> HTMLResponse:
 
 async def ensure_user_table():
     """Create users table if it doesn't exist. Uses store's connection pool."""
-    from . import store
+    from ..storage import store
     async with store._connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
@@ -262,7 +262,7 @@ async def ensure_user_table():
 
 async def upsert_user(user_info: dict) -> str:
     """Create or update user, return user ID. Uses store's connection pool."""
-    from . import store
+    from ..storage import store
     user_id = hashlib.sha256(
         f"{user_info['provider']}:{user_info['provider_id']}".encode()
     ).hexdigest()[:16]
