@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import InjectedState
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 
@@ -235,37 +236,49 @@ class AgentState(TypedDict):
 
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
 
-# Note: These tools are defined with simple signatures. The workspace_id
-# is injected by execute_server_tools from the state.
-
 @tool
-async def codebase_search(query: str) -> str:
+async def codebase_search(query: str, state: Annotated[AgentState, InjectedState]) -> str:
     """
     Semantic code search - find code by meaning.
     Use for: understanding how things work, finding related code, exploring the codebase.
     Returns relevant code snippets with file paths and line numbers.
     """
-    # The actual execution happens in execute_server_tools with workspace_id from state
-    return "PENDING_SERVER_EXECUTION"
+    workspace_id = state['workspace_id']
+    logger.info("codebase_search: query=%s, workspace=%s", query, workspace_id)
+    query_emb = await embeddings.embed_query(query)
+    results = await store.vector_search(workspace_id, query_emb, top_k=8)
+    logger.info("codebase_search: got %d results", len(results))
+    
+    if results:
+        flat_results = [r["symbol"] for r in results]
+        content = chat_utils.build_context_from_results(flat_results)
+        logger.info("codebase_search: built context len=%d", len(content))
+        return content
+    else:
+        return "No results found for this query. Try a different search term or use read_file to explore specific files."
 
 
 @tool  
-async def trace_call_chain(symbol_name: str, direction: str = "both") -> str:
+async def trace_call_chain(symbol_name: str, state: Annotated[AgentState, InjectedState], direction: str = "both") -> str:
     """
     Deep call-chain traversal.
     Direction: 'upstream' (who calls this), 'downstream' (what does this call), 'both'.
     Returns the execution flow as a graph.
     """
-    return "PENDING_SERVER_EXECUTION"
+    workspace_id = state['workspace_id']
+    result = await store.trace_call_chain(workspace_id, symbol_name, direction=direction, max_depth=3)
+    return json.dumps(result, indent=2)
 
 
 @tool
-async def impact_analysis(symbol_name: str) -> str:
+async def impact_analysis(symbol_name: str, state: Annotated[AgentState, InjectedState]) -> str:
     """
     Blast radius analysis - find what's affected if you change this symbol.
     Returns all callers and dependent code.
     """
-    return "PENDING_SERVER_EXECUTION"
+    workspace_id = state['workspace_id']
+    result = await store.impact_analysis(workspace_id, symbol_name, max_depth=3)
+    return json.dumps(result, indent=2)
 
 
 @tool
@@ -281,7 +294,7 @@ async def lookup_documentation(library: str, query: str) -> str:
     Returns:
         Relevant documentation snippets from official sources.
     """
-    return "PENDING_SERVER_EXECUTION"
+    return await _fetch_documentation(library, query)
 
 
 # ── Plan Management Tools (Cloud-side) ────────────────────────────
@@ -289,7 +302,7 @@ async def lookup_documentation(library: str, query: str) -> str:
 # The IDE shows the plan with live status updates (checkmarks, etc.).
 
 @tool
-async def create_plan(steps: list[str]) -> str:
+async def create_plan(steps: list[str], state: Annotated[AgentState, InjectedState]) -> str:
     """
     Create an execution plan for a complex task.
     Use this BEFORE starting work on tasks that involve multiple files,
@@ -298,21 +311,27 @@ async def create_plan(steps: list[str]) -> str:
     Args:
         steps: List of step descriptions in execution order.
                Each step should be a concrete, actionable item.
-    
-    Example:
-        create_plan([
-            "Read auth/session.py to understand current session handling",
-            "Create auth/jwt.py with JWT token generation and validation",
-            "Update auth/login.py to return JWT tokens",
-            "Update middleware to validate JWT from Authorization header",
-            "Run tests and fix any failures"
-        ])
     """
-    return "PENDING_SERVER_EXECUTION"
+    if not steps:
+        return "Error: steps list cannot be empty."
+    
+    new_steps = [
+        PlanStep(number=i + 1, description=desc, status="pending")
+        for i, desc in enumerate(steps)
+    ]
+    # Auto-mark step 1 as in_progress
+    new_steps[0]["status"] = "in_progress"
+    
+    # We return a special value that the orchestration node will use to update state
+    return json.dumps({
+        "status": f"Plan created with {len(new_steps)} steps. Step 1 is now in progress.",
+        "plan_steps": new_steps,
+        "current_step": 1
+    })
 
 
 @tool
-async def update_plan(step_number: int, status: str, new_description: str = "") -> str:
+async def update_plan(step_number: int, status: str, state: Annotated[AgentState, InjectedState], new_description: str = "") -> str:
     """
     Update a plan step's status or description.
     Call this as you complete each step so the user can see your progress.
@@ -322,7 +341,42 @@ async def update_plan(step_number: int, status: str, new_description: str = "") 
         status: New status — one of: "done", "in_progress", "failed", "pending".
         new_description: Optional new description (leave empty to keep current).
     """
-    return "PENDING_SERVER_EXECUTION"
+    plan_steps = list(state.get('plan_steps', []))
+    current_step = state.get('current_step', 0)
+    
+    if not plan_steps:
+        return "Error: No active plan. Use create_plan first."
+    if step_number < 1 or step_number > len(plan_steps):
+        return f"Error: Invalid step number {step_number}. Plan has {len(plan_steps)} steps."
+    if status not in ("done", "in_progress", "failed", "pending"):
+        return f"Error: Invalid status '{status}'. Use: done, in_progress, failed, pending."
+    
+    idx = step_number - 1
+    old_status = plan_steps[idx]["status"]
+    plan_steps[idx]["status"] = status
+    if new_description:
+        plan_steps[idx]["description"] = new_description
+    
+    # Auto-advance current_step when marking done
+    if status == "done" and step_number == current_step:
+        next_step = step_number + 1
+        if next_step <= len(plan_steps):
+            plan_steps[next_step - 1]["status"] = "in_progress"
+            current_step = next_step
+        else:
+            current_step = 0  # All steps done
+    
+    msg = f"Step {step_number}: {old_status} → {status}"
+    if current_step == 0:
+        msg += " | All steps complete!"
+    elif status == "done":
+        msg += f" | Now on step {current_step}"
+        
+    return json.dumps({
+        "status": msg,
+        "plan_steps": plan_steps,
+        "current_step": current_step
+    })
 
 
 @tool
@@ -332,11 +386,15 @@ async def discard_plan() -> str:
     Use when the approach needs to change fundamentally, or the task
     turned out to be simpler than expected and doesn't need a plan.
     """
-    return "PENDING_SERVER_EXECUTION"
+    return json.dumps({
+        "status": "Plan discarded.",
+        "plan_steps": [],
+        "current_step": 0
+    })
 
 
 @tool
-async def add_plan_step(after_step: int, description: str) -> str:
+async def add_plan_step(after_step: int, description: str, state: Annotated[AgentState, InjectedState]) -> str:
     """
     Insert a new step into the current plan.
     Use when you discover the task needs additional work not in the original plan.
@@ -344,16 +402,41 @@ async def add_plan_step(after_step: int, description: str) -> str:
     Args:
         after_step: Insert the new step AFTER this step number (0 = insert at beginning).
         description: What the new step should accomplish.
-    
-    Example:
-        # Discovered we need database migrations before updating the API
-        add_plan_step(2, "Create database migration for new user_roles table")
     """
-    return "PENDING_SERVER_EXECUTION"
+    plan_steps = list(state.get('plan_steps', []))
+    current_step = state.get('current_step', 0)
+    
+    if not plan_steps:
+        return "Error: No active plan. Use create_plan first."
+    if after_step < 0 or after_step > len(plan_steps):
+        return f"Error: Invalid position. after_step must be 0-{len(plan_steps)}."
+    if not description:
+        return "Error: description cannot be empty."
+    
+    new_step = PlanStep(
+        number=after_step + 1,
+        description=description,
+        status="pending"
+    )
+    plan_steps.insert(after_step, new_step)
+    
+    # Renumber all steps
+    for i, step in enumerate(plan_steps):
+        step["number"] = i + 1
+    
+    # Adjust current_step if we inserted before it
+    if after_step < current_step:
+        current_step += 1
+        
+    return json.dumps({
+        "status": f"Inserted new step {after_step + 1}: '{description[:50]}...' Plan now has {len(plan_steps)} steps.",
+        "plan_steps": plan_steps,
+        "current_step": current_step
+    })
 
 
 @tool
-async def remove_plan_step(step_number: int) -> str:
+async def remove_plan_step(step_number: int, state: Annotated[AgentState, InjectedState]) -> str:
     """
     Remove a step from the current plan.
     Use when a step is no longer needed (already handled, or approach changed).
@@ -361,11 +444,39 @@ async def remove_plan_step(step_number: int) -> str:
     Args:
         step_number: Which step to remove (1-indexed).
     """
-    return "PENDING_SERVER_EXECUTION"
+    plan_steps = list(state.get('plan_steps', []))
+    current_step = state.get('current_step', 0)
+    
+    if not plan_steps:
+        return "Error: No active plan."
+    if step_number < 1 or step_number > len(plan_steps):
+        return f"Error: Invalid step number {step_number}. Plan has {len(plan_steps)} steps."
+    if len(plan_steps) == 1:
+        return "Error: Cannot remove the last step. Use discard_plan instead."
+    
+    removed = plan_steps.pop(step_number - 1)
+    
+    # Renumber remaining steps
+    for i, step in enumerate(plan_steps):
+        step["number"] = i + 1
+    
+    # Adjust current_step
+    if step_number < current_step:
+        current_step -= 1
+    elif step_number == current_step and current_step > len(plan_steps):
+        current_step = len(plan_steps) if plan_steps else 0
+        if plan_steps and current_step > 0:
+            plan_steps[current_step - 1]["status"] = "in_progress"
+            
+    return json.dumps({
+        "status": f"Removed step {step_number}: '{removed['description'][:40]}...' Plan now has {len(plan_steps)} steps.",
+        "plan_steps": plan_steps,
+        "current_step": current_step
+    })
 
 
 @tool
-async def replan(reason: str, new_steps: list[str], keep_completed: bool = True) -> str:
+async def replan(reason: str, new_steps: list[str], state: Annotated[AgentState, InjectedState], keep_completed: bool = True) -> str:
     """
     Replace the current plan with a new one, optionally preserving completed work.
     Use when:
@@ -378,18 +489,38 @@ async def replan(reason: str, new_steps: list[str], keep_completed: bool = True)
         new_steps: The new list of steps to execute.
         keep_completed: If True, completed steps from the old plan are preserved
                        as a "completed" section for context. Default True.
-    
-    Example:
-        replan(
-            reason="Jest tests require different config than expected",
-            new_steps=[
-                "Check existing jest.config.js for test environment",
-                "Update jest config to use jsdom environment",
-                "Re-run failing tests with new config"
-            ]
-        )
     """
-    return "PENDING_SERVER_EXECUTION"
+    old_plan_steps = state.get('plan_steps', [])
+    
+    if not new_steps:
+        return "Error: new_steps list cannot be empty."
+    
+    # Capture completed steps for context
+    completed_summary = ""
+    if keep_completed and old_plan_steps:
+        completed = [s for s in old_plan_steps if s["status"] == "done"]
+        if completed:
+            completed_summary = "Completed work preserved: " + "; ".join(
+                f"✓ {s['description'][:40]}" for s in completed
+            )
+    
+    # Create new plan
+    plan_steps = [
+        PlanStep(number=i + 1, description=desc, status="pending")
+        for i, desc in enumerate(new_steps)
+    ]
+    plan_steps[0]["status"] = "in_progress"
+    current_step = 1
+    
+    status_msg = f"Re-planned: {reason}\nNew plan has {len(plan_steps)} steps. Step 1 is now in progress."
+    if completed_summary:
+        status_msg += f"\n{completed_summary}"
+        
+    return json.dumps({
+        "status": status_msg,
+        "plan_steps": plan_steps,
+        "current_step": current_step
+    })
 
 
 # ── Tool Definitions (IDE-side) ───────────────────────────────────
@@ -579,22 +710,15 @@ LSP_TOOLS = [lsp_go_to_definition, lsp_find_references, lsp_hover, lsp_rename]
 IDE_TOOLS = IDE_FILE_TOOLS + IDE_EXEC_TOOLS + IDE_PORT_TOOLS + IDE_CODE_TOOLS + [grep]
 ALL_TOOLS = SERVER_TOOLS + IDE_TOOLS + LSP_TOOLS
 
-IDE_TOOL_NAMES = {
-    # File operations
-    "read_file", "write_to_file", "replace_in_file", "delete_file", "apply_patch",
-    "list_files", "glob", "grep",
-    # Process management
-    "execute_command", "execute_background", "read_process_output",
-    "check_process_status", "kill_process",
-    # Port management
-    "wait_for_port", "check_port", "kill_port",
-    # Code intelligence
-    "list_code_definition_names", "get_symbol_definition", "find_symbol_references", "diagnostics",
-    # LSP
-    "lsp_go_to_definition", "lsp_find_references", "lsp_hover", "lsp_rename",
-}
-PLAN_TOOL_NAMES = {"create_plan", "update_plan", "discard_plan", "add_plan_step", "remove_plan_step", "replan"}
-SERVER_TOOL_NAMES = {"codebase_search", "trace_call_chain", "impact_analysis", "lookup_documentation"} | PLAN_TOOL_NAMES
+# Tag tools for routing
+for t in SERVER_TOOLS:
+    t.metadata = {"type": "server"}
+for t in IDE_TOOLS + LSP_TOOLS:
+    t.metadata = {"type": "ide"}
+
+IDE_TOOL_NAMES = {t.name for t in IDE_TOOLS + LSP_TOOLS}
+SERVER_TOOL_NAMES = {t.name for t in SERVER_TOOLS}
+PLAN_TOOL_NAMES = {t.name for t in PLAN_TOOLS}
 
 
 # ── Query Decomposition ───────────────────────────────────────────
@@ -1845,204 +1969,47 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
 
 
 async def execute_server_tools(state: AgentState) -> dict:
-    """Execute tools that run on the server (search, trace, impact, plan management)."""
-    workspace_id = state['workspace_id']
+    """Execute tools that run on the server and update agent state."""
     last_message = state['messages'][-1]
     tool_outputs = []
     
-    # Track plan state mutations from plan tools
-    plan_steps = list(state.get('plan_steps', []))
-    current_step = state.get('current_step', 0)
-    plan_changed = False
+    # Track state updates
+    updates = {}
     
     for tool_call in last_message.tool_calls:
         tool_name = tool_call['name']
-        args = tool_call['args']
-        
+        if tool_name not in SERVER_TOOL_NAMES:
+            continue
+            
+        # Find the tool function
+        tool_func = next((t for t in SERVER_TOOLS if t.name == tool_name), None)
+        if not tool_func:
+            continue
+            
         try:
-            if tool_name == "codebase_search":
-                query = args.get('query', '')
-                logger.info("codebase_search: query=%s, workspace=%s", query, workspace_id)
-                query_emb = await embeddings.embed_query(query)
-                results = await store.vector_search(workspace_id, query_emb, top_k=8)
-                logger.info("codebase_search: got %d results", len(results))
-                
-                if results:
-                    flat_results = [r["symbol"] for r in results]
-                    content = chat_utils.build_context_from_results(flat_results)
-                    logger.info("codebase_search: built context len=%d", len(content))
-                else:
-                    content = "No results found for this query. Try a different search term or use read_file to explore specific files."
-                
-            elif tool_name == "trace_call_chain":
-                symbol = args.get('symbol_name', '')
-                direction = args.get('direction', 'both')
-                result = await store.trace_call_chain(workspace_id, symbol, direction=direction, max_depth=3)
-                content = json.dumps(result, indent=2)
-                
-            elif tool_name == "impact_analysis":
-                symbol = args.get('symbol_name', '')
-                result = await store.impact_analysis(workspace_id, symbol, max_depth=3)
-                content = json.dumps(result, indent=2)
+            # Execute the tool
+            # LangGraph's tool execution will automatically inject state if Annotated[..., InjectedState] is used
+            # But since we're calling it manually here in our custom node, we need to pass it.
+            # Actually, we can just use the tool's invoke method which handles this if configured correctly,
+            # but for simplicity in this refactor, we'll just call the function.
             
-            elif tool_name == "lookup_documentation":
-                library = args.get('library', '')
-                query = args.get('query', '')
-                content = await _fetch_documentation(library, query)
+            # Check if tool needs state
+            import inspect
+            sig = inspect.signature(tool_func.func)
+            kwargs = tool_call['args'].copy()
+            if any(p.annotation == Annotated[AgentState, InjectedState] or "InjectedState" in str(p.annotation) for p in sig.parameters.values()):
+                # Find the parameter name for state
+                state_param = next(p.name for p in sig.parameters.values() if p.annotation == Annotated[AgentState, InjectedState] or "InjectedState" in str(p.annotation))
+                kwargs[state_param] = state
             
-            # ── Plan Management Tools ─────────────────────────────
-            elif tool_name == "create_plan":
-                step_descriptions = args.get('steps', [])
-                if not step_descriptions:
-                    content = "Error: steps list cannot be empty."
-                else:
-                    plan_steps = [
-                        PlanStep(number=i + 1, description=desc, status="pending")
-                        for i, desc in enumerate(step_descriptions)
-                    ]
-                    # Auto-mark step 1 as in_progress
-                    plan_steps[0]["status"] = "in_progress"
-                    current_step = 1
-                    plan_changed = True
-                    content = f"Plan created with {len(plan_steps)} steps. Step 1 is now in progress."
-                    logger.info("[create_plan] Created %d steps", len(plan_steps))
+            content = await tool_func.func(**kwargs)
             
-            elif tool_name == "update_plan":
-                step_num = args.get('step_number', 0)
-                new_status = args.get('status', '')
-                new_desc = args.get('new_description', '')
-                
-                if not plan_steps:
-                    content = "Error: No active plan. Use create_plan first."
-                elif step_num < 1 or step_num > len(plan_steps):
-                    content = f"Error: Invalid step number {step_num}. Plan has {len(plan_steps)} steps."
-                elif new_status not in ("done", "in_progress", "failed", "pending"):
-                    content = f"Error: Invalid status '{new_status}'. Use: done, in_progress, failed, pending."
-                else:
-                    idx = step_num - 1
-                    old_status = plan_steps[idx]["status"]
-                    plan_steps[idx]["status"] = new_status
-                    if new_desc:
-                        plan_steps[idx]["description"] = new_desc
-                    
-                    # Auto-advance current_step when marking done
-                    if new_status == "done" and step_num == current_step:
-                        next_step = step_num + 1
-                        if next_step <= len(plan_steps):
-                            plan_steps[next_step - 1]["status"] = "in_progress"
-                            current_step = next_step
-                        else:
-                            current_step = 0  # All steps done
-                    
-                    plan_changed = True
-                    content = f"Step {step_num}: {old_status} → {new_status}"
-                    if current_step == 0:
-                        content += " | All steps complete!"
-                    elif new_status == "done":
-                        content += f" | Now on step {current_step}"
-                    logger.info("[update_plan] Step %d: %s → %s (current=%d)", 
-                               step_num, old_status, new_status, current_step)
-            
-            elif tool_name == "discard_plan":
-                plan_steps = []
-                current_step = 0
-                plan_changed = True
-                content = "Plan discarded."
-                logger.info("[discard_plan] Plan cleared")
-            
-            elif tool_name == "add_plan_step":
-                after_step = args.get('after_step', 0)
-                description = args.get('description', '')
-                
-                if not plan_steps:
-                    content = "Error: No active plan. Use create_plan first."
-                elif after_step < 0 or after_step > len(plan_steps):
-                    content = f"Error: Invalid position. after_step must be 0-{len(plan_steps)}."
-                elif not description:
-                    content = "Error: description cannot be empty."
-                else:
-                    # Insert new step after the specified position
-                    new_step = PlanStep(
-                        number=after_step + 1,  # Will be renumbered
-                        description=description,
-                        status="pending"
-                    )
-                    plan_steps.insert(after_step, new_step)
-                    
-                    # Renumber all steps
-                    for i, step in enumerate(plan_steps):
-                        step["number"] = i + 1
-                    
-                    # Adjust current_step if we inserted before it
-                    if after_step < current_step:
-                        current_step += 1
-                    
-                    plan_changed = True
-                    content = f"Inserted new step {after_step + 1}: '{description[:50]}...' Plan now has {len(plan_steps)} steps."
-                    logger.info("[add_plan_step] Inserted step after %d, total=%d", after_step, len(plan_steps))
-            
-            elif tool_name == "remove_plan_step":
-                step_num = args.get('step_number', 0)
-                
-                if not plan_steps:
-                    content = "Error: No active plan."
-                elif step_num < 1 or step_num > len(plan_steps):
-                    content = f"Error: Invalid step number {step_num}. Plan has {len(plan_steps)} steps."
-                elif len(plan_steps) == 1:
-                    content = "Error: Cannot remove the last step. Use discard_plan instead."
-                else:
-                    removed = plan_steps.pop(step_num - 1)
-                    
-                    # Renumber remaining steps
-                    for i, step in enumerate(plan_steps):
-                        step["number"] = i + 1
-                    
-                    # Adjust current_step
-                    if step_num < current_step:
-                        current_step -= 1
-                    elif step_num == current_step and current_step > len(plan_steps):
-                        current_step = len(plan_steps) if plan_steps else 0
-                        if plan_steps and current_step > 0:
-                            plan_steps[current_step - 1]["status"] = "in_progress"
-                    
-                    plan_changed = True
-                    content = f"Removed step {step_num}: '{removed['description'][:40]}...' Plan now has {len(plan_steps)} steps."
-                    logger.info("[remove_plan_step] Removed step %d, total=%d", step_num, len(plan_steps))
-            
-            elif tool_name == "replan":
-                reason = args.get('reason', 'Re-planning required')
-                new_step_descs = args.get('new_steps', [])
-                keep_completed = args.get('keep_completed', True)
-                
-                if not new_step_descs:
-                    content = "Error: new_steps list cannot be empty."
-                else:
-                    # Capture completed steps for context
-                    completed_summary = ""
-                    if keep_completed and plan_steps:
-                        completed = [s for s in plan_steps if s["status"] == "done"]
-                        if completed:
-                            completed_summary = "Completed work preserved: " + "; ".join(
-                                f"✓ {s['description'][:40]}" for s in completed
-                            )
-                    
-                    # Create new plan
-                    plan_steps = [
-                        PlanStep(number=i + 1, description=desc, status="pending")
-                        for i, desc in enumerate(new_step_descs)
-                    ]
-                    plan_steps[0]["status"] = "in_progress"
-                    current_step = 1
-                    plan_changed = True
-                    
-                    content = f"Re-planned: {reason}\nNew plan has {len(plan_steps)} steps. Step 1 is now in progress."
-                    if completed_summary:
-                        content += f"\n{completed_summary}"
-                    logger.info("[replan] Reason='%s', new_steps=%d", reason, len(plan_steps))
-                
-            else:
-                # Not a server tool, skip
-                continue
+            # Check if the output is a plan update (JSON string with plan_steps)
+            if isinstance(content, str) and content.startswith('{') and '"plan_steps"' in content:
+                plan_data = json.loads(content)
+                updates['plan_steps'] = plan_data['plan_steps']
+                updates['current_step'] = plan_data['current_step']
+                content = plan_data['status']
                 
         except Exception as e:
             content = f"Error executing {tool_name}: {e}"
@@ -2053,65 +2020,38 @@ async def execute_server_tools(state: AgentState) -> dict:
             tool_call_id=tool_call['id']
         ))
     
-    result = {"messages": tool_outputs}
-    
-    # Propagate plan state changes
-    if plan_changed:
-        result["plan_steps"] = plan_steps
-        result["current_step"] = current_step
-    
-    return result
+    updates["messages"] = tool_outputs
+    return updates
 
 
 # ── Router Logic ──────────────────────────────────────────────────
 
 def agent_router(state: AgentState) -> Literal["server_tools", "pause", "end"]:
-    """After agent: route to server tools, pause for IDE, or finish.
-    
-    Server tools (including plan management) are always processed first.
-    If only IDE tools are present, we pause for the IDE to execute them.
-    """
+    """After agent: route to server tools, pause for IDE, or finish."""
     last_message = state['messages'][-1]
     
     if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
         return "end"
     
-    has_server_tools = False
-    has_ide_tools = False
+    # Check if any tool is an IDE tool
+    has_server_tools = any(tc['name'] in SERVER_TOOL_NAMES for tc in last_message.tool_calls)
+    has_ide_tools = any(tc['name'] in IDE_TOOL_NAMES for tc in last_message.tool_calls)
     
-    for tc in last_message.tool_calls:
-        if tc['name'] in IDE_TOOL_NAMES:
-            has_ide_tools = True
-        elif tc['name'] in SERVER_TOOL_NAMES:
-            has_server_tools = True
-    
-    # Server tools first (search, plan management, docs)
     if has_server_tools:
         return "server_tools"
-    
-    # Then IDE tools (pause for the IDE to execute)
     if has_ide_tools:
         return "pause"
-    
     return "end"
 
 
 def post_server_tools_router(state: AgentState) -> Literal["pause", "agent"]:
-    """After server tools: check if the same AI message also had IDE tools.
-    
-    This handles the case where the agent calls both server tools (e.g.,
-    update_plan) and IDE tools (e.g., read_file) in the same turn.
-    Server tools are processed first, then we pause for IDE tools.
-    """
-    # Find the last AIMessage (it's behind the ToolMessages from server tools)
+    """After server tools: check if the same AI message also had IDE tools."""
+    # Find the last AIMessage
     for msg in reversed(state['messages']):
         if isinstance(msg, AIMessage) and msg.tool_calls:
-            for tc in msg.tool_calls:
-                if tc['name'] in IDE_TOOL_NAMES:
-                    logger.info("[post_server_router] → pause (mixed server + IDE tools)")
-                    return "pause"
+            if any(tc['name'] in IDE_TOOL_NAMES for tc in msg.tool_calls):
+                return "pause"
             break
-    
     return "agent"
 
 
