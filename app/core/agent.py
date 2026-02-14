@@ -1219,106 +1219,90 @@ async def _step_enrichment(workspace_id: str, step_description: str) -> str:
         return ""
 
 
+# ── Intent Analysis ───────────────────────────────────────────────
+
+INTENT_ANALYSIS_PROMPT = """You are a retrieval optimizer for an AI software engineer. 
+Analyze the recent conversation history and decide if the AI needs more code context to complete its next step.
+
+If context is needed, generate a concise, focused search query (2-5 words) that targets the specific symbols, logic, or patterns the AI is currently working on.
+If the AI already has enough context or is performing a simple task (like explaining a concept or acknowledging), respond with "NONE_NEEDED".
+
+Examples:
+- User: "Fix the bug in auth.py" -> "auth.py error handling"
+- Assistant: "I see an issue in the JWT validator" -> "JWT validation implementation"
+- User: "Thanks!" -> "NONE_NEEDED"
+
+Respond with ONLY the query or "NONE_NEEDED"."""
+
+
+async def _analyze_retrieval_intent(messages: list[BaseMessage]) -> str:
+    """Use the tool model to identify EXACTLY what context is missing."""
+    try:
+        # Use the tool model as requested for intent analysis
+        model = llm_provider.get_tool_model(temperature=0.0)
+        
+        # Build a compact history
+        history_parts = []
+        for msg in messages[-3:]:
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            history_parts.append(f"{role}: {content[:300]}")
+        
+        history_text = "\n".join(history_parts)
+        
+        response = await model.ainvoke([
+            SystemMessage(content=INTENT_ANALYSIS_PROMPT),
+            HumanMessage(content=f"Conversation history:\n{history_text}")
+        ])
+        
+        intent = response.content.strip().upper()
+        if "NONE_NEEDED" in intent:
+            return "NONE_NEEDED"
+            
+        # Clean up any potential markdown or extra text
+        intent = intent.replace('"', '').replace("'", "").split('\n')[0]
+        logger.info(f"[intent_analysis] Context gap identified using tool model: {intent}")
+        return intent
+    except Exception as e:
+        logger.warning(f"[intent_analysis] Failed: {e}")
+        return "NONE_NEEDED"
+
+
 async def enrich_context(state: AgentState) -> dict:
-    """First node: gather context BEFORE calling the LLM.
-    
-    Behavior:
-    - First turn: full enrichment (query decomposition + multi-query search).
-    - Tool result continuation: check if plan step changed — if so, do a
-      lightweight supplementary search for the new step's context.
-    - Follow-up question: check embedding similarity — re-enrich if topic shifted.
     """
-    import asyncio
-    
+    MCP-STYLE TARGETED RETRIEVAL: 
+    1. Analyzes history to find the 'Context Gap'.
+    2. Generates a precise code-search query.
+    3. Injects only the highly relevant snippets.
+    """
     workspace_id = state['workspace_id']
-    attached_files = state.get('attached_files', {})
-    existing_context = state.get('enriched_context', '')
-    enriched_question = state.get('enriched_question', '')
-    enriched_step = state.get('enriched_step', 0)
-    plan_steps = state.get('plan_steps', [])
-    current_step = state.get('current_step', 0)
+    messages = state['messages']
     
-    # ── Tool result continuation: check for plan step change ──
-    if state['messages'] and isinstance(state['messages'][-1], ToolMessage):
-        # If plan step advanced since last enrichment, supplement the context
-        if (plan_steps and current_step > 0 
-                and current_step != enriched_step 
-                and current_step <= len(plan_steps)):
-            step_desc = plan_steps[current_step - 1]["description"]
-            logger.info("[enrich_context] Plan step changed (%d → %d): %s — supplementing context",
-                       enriched_step, current_step, step_desc[:80])
-            
-            supplement = await _step_enrichment(workspace_id, step_desc)
-            if supplement:
-                # Append to existing context (don't replace — original context is still useful)
-                updated_context = existing_context + supplement
-                # Cap total context to avoid bloat across many steps
-                if len(updated_context) > 100_000:
-                    updated_context = updated_context[:100_000]
-                return {"enriched_context": updated_context, "enriched_step": current_step}
-            else:
-                # No new results, just mark the step as enriched
-                return {"enriched_step": current_step}
-        
-        logger.info("[enrich_context] Skipping - ToolMessage continuation (same step)")
+    # 1. ANALYZE INTENT (The 'MCP' part)
+    # Use a fast model to identify EXACTLY what context is missing.
+    context_intent = await _analyze_retrieval_intent(messages)
+    
+    if context_intent == "NONE_NEEDED":
+        logger.info("[enrich_context] No additional context needed for this turn")
         return {}
-    
-    question = _get_last_question(state)
-    if not question:
-        logger.warning("[enrich_context] No question found in messages")
-        return {"enriched_context": "", "enriched_question": "", "enriched_step": 0}
-    
-    # ── First turn: full enrichment + project profile ──
-    if not existing_context:
-        logger.info("[enrich_context] First turn — enriching for: %s", question[:100])
+
+    # 2. TARGETED SEARCH
+    # We embed the precise intent, not the raw history.
+    try:
+        query_emb = await embeddings.embed_query(context_intent)
+        # Use a slightly higher top_k but stricter threshold for precision
+        results = await store.vector_search(workspace_id, query_emb, top_k=5)
         
-        # Build project profile and code enrichment in parallel
-        existing_profile = state.get('project_profile', '')
-        if not existing_profile:
-            # Profile + enrichment concurrently
-            profile_coro = build_project_profile(attached_files)
-            enrich_coro = build_pre_enrichment(workspace_id, question, attached_files)
-            profile, context = await asyncio.gather(profile_coro, enrich_coro)
-            logger.info("[enrich_context] Built context=%d chars, profile=%d chars", len(context), len(profile))
-        return {
-                "enriched_context": context,
-                "enriched_question": question,
-                "enriched_step": current_step,
-                "project_profile": profile,
-        }
-    else:
-            # Profile already exists (from Redis cache), just enrich
-            context = await build_pre_enrichment(workspace_id, question, attached_files)
-            logger.info("[enrich_context] Built context with %d chars (profile cached)", len(context))
-            return {"enriched_context": context, "enriched_question": question, "enriched_step": current_step}
-    
-    # ── Quick message during plan execution: don't re-enrich, just continue ──
-    # Short messages like "hello", "ok", "yes", "continue" are likely just acknowledgments
-    if plan_steps and current_step > 0 and len(question.strip()) < 50:
-        logger.info("[enrich_context] Short message during plan execution (%s) — keeping existing context",
-                   question[:30])
-        return {}
-    
-    # ── Follow-up question: check for topic shift ──
-    if enriched_question and question != enriched_question:
-        try:
-            old_emb, new_emb = await embeddings.embed_query(enriched_question), await embeddings.embed_query(question)
-            similarity = _cosine_similarity(old_emb, new_emb)
-            logger.info("[enrich_context] Topic similarity: %.3f (threshold=%.2f) | old=%s | new=%s",
-                       similarity, TOPIC_SHIFT_THRESHOLD, enriched_question[:60], question[:60])
-            
-            if similarity < TOPIC_SHIFT_THRESHOLD:
-                logger.info("[enrich_context] Topic shift detected (%.3f < %.2f) — re-enriching",
-                           similarity, TOPIC_SHIFT_THRESHOLD)
-                context = await build_pre_enrichment(workspace_id, question, attached_files)
-                logger.info("[enrich_context] Re-enriched with %d chars", len(context))
-                return {"enriched_context": context, "enriched_question": question, "enriched_step": 0}
-            else:
-                logger.info("[enrich_context] Same topic (%.3f) — keeping existing context", similarity)
-        except Exception as e:
-            logger.warning("[enrich_context] Topic shift check failed (%s), keeping existing context", e)
+        if results:
+            flat_results = [r["symbol"] for r in results]
+            new_context = chat_utils.build_context_from_results(flat_results)
+            logger.info(f"[enrich_context] Injected {len(flat_results)} relevant snippets for: {context_intent}")
+            return {"enriched_context": new_context}
+    except Exception as e:
+        logger.error(f"[enrich_context] Targeted RAG failed: {e}")
     
     return {}
+
 
 
 # ── Context Window Management ─────────────────────────────────────
