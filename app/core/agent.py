@@ -88,7 +88,11 @@ SYSTEM_PROMPT = """You are an expert software engineer in Forge IDE. Execute tas
 - **Deep Understanding**: Use `trace_call_chain` to see the flow of data (who calls this, what does this call).
 - **Refactoring & Impact**: Use `impact_analysis` BEFORE changing a symbol to see what might break. Use `lsp_rename` for renaming.
 - **Search**: Use `codebase_search` for "how does X work" and `grep` for "where is the string 'Y'".
-- **Diagnostics**: Always run `diagnostics` after editing to catch syntax/type errors immediately."""
+- **Diagnostics**: Always run `diagnostics` after editing to catch syntax/type errors immediately.
+
+## Efficiency
+
+**Batch your tool calls.** If you need to read multiple files, perform multiple searches, or run multiple commands, call all of them in a single turn. The system will execute them in parallel where possible to minimize latency. Do not wait for one result before calling the next if they are independent."""
 
 
 # ── Master Planning Prompt (used when Claude is called for planning) ──
@@ -1801,55 +1805,64 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
 
 async def execute_server_tools(state: AgentState) -> dict:
     """Execute tools that run on the server and update agent state."""
+    import asyncio
+    import inspect
     last_message = state['messages'][-1]
-    tool_outputs = []
     
+    # Identify all server tool calls in this turn
+    server_calls = [tc for tc in last_message.tool_calls if tc['name'] in SERVER_TOOL_NAMES]
+    if not server_calls:
+        return {}
+
     # Track state updates
     updates = {}
-    
-    for tool_call in last_message.tool_calls:
+    tool_outputs = []
+
+    async def _run_tool(tool_call):
         tool_name = tool_call['name']
-        if tool_name not in SERVER_TOOL_NAMES:
-            continue
-            
-        # Find the tool function
         tool_func = next((t for t in SERVER_TOOLS if t.name == tool_name), None)
         if not tool_func:
-            continue
+            return ToolMessage(content=f"Error: Tool {tool_name} not found", tool_call_id=tool_call['id'])
             
         try:
-            # Execute the tool
-            # LangGraph's tool execution will automatically inject state if Annotated[..., InjectedState] is used
-            # But since we're calling it manually here in our custom node, we need to pass it.
-            # Actually, we can just use the tool's invoke method which handles this if configured correctly,
-            # but for simplicity in this refactor, we'll just call the function.
-            
-            # Check if tool needs state
-            import inspect
+            # Extract kwargs and inject state if needed
             sig = inspect.signature(tool_func.func)
             kwargs = tool_call['args'].copy()
-            if any(p.annotation == Annotated[AgentState, InjectedState] or "InjectedState" in str(p.annotation) for p in sig.parameters.values()):
-                # Find the parameter name for state
-                state_param = next(p.name for p in sig.parameters.values() if p.annotation == Annotated[AgentState, InjectedState] or "InjectedState" in str(p.annotation))
+            
+            # Find if any parameter expects state
+            state_param = next(
+                (p.name for p in sig.parameters.values() 
+                 if p.annotation == Annotated[AgentState, InjectedState] or "InjectedState" in str(p.annotation)),
+                None
+            )
+            if state_param:
                 kwargs[state_param] = state
             
             content = await tool_func.func(**kwargs)
             
             # Check if the output is a plan update (JSON string with plan_steps)
+            # Note: We capture these updates to return them in the final dict
+            plan_update = None
             if isinstance(content, str) and content.startswith('{') and '"plan_steps"' in content:
                 plan_data = json.loads(content)
-                updates['plan_steps'] = plan_data['plan_steps']
-                updates['current_step'] = plan_data['current_step']
+                plan_update = {
+                    'plan_steps': plan_data['plan_steps'],
+                    'current_step': plan_data['current_step']
+                }
                 content = plan_data['status']
                 
+            return ToolMessage(content=content, tool_call_id=tool_call['id']), plan_update
         except Exception as e:
-            content = f"Error executing {tool_name}: {e}"
             logger.error("Server tool %s failed: %s", tool_name, e)
-            
-        tool_outputs.append(ToolMessage(
-            content=content,
-            tool_call_id=tool_call['id']
-        ))
+            return ToolMessage(content=f"Error executing {tool_name}: {e}", tool_call_id=tool_call['id']), None
+
+    # Execute all server tools in parallel
+    results = await asyncio.gather(*[_run_tool(tc) for tc in server_calls])
+    
+    for msg, plan_upd in results:
+        tool_outputs.append(msg)
+        if plan_upd:
+            updates.update(plan_upd)
     
     updates["messages"] = tool_outputs
     return updates
