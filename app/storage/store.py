@@ -238,6 +238,49 @@ async def clear_workspace(workspace_id: str):
     logger.info("Cleared workspace %s", workspace_id)
 
 
+async def delete_file_data(workspace_id: str, file_path: str):
+    """Delete all data associated with a file (symbols and outgoing edges)."""
+    async with _connection() as conn:
+        try:
+            async with conn.cursor() as cur:
+                # 1. Delete edges originating from symbols in this file
+                await cur.execute("""
+                    DELETE FROM edges 
+                    WHERE workspace_id = %s 
+                    AND from_name IN (
+                        SELECT name FROM symbols 
+                        WHERE workspace_id = %s AND file_path = %s
+                    )
+                """, (workspace_id, workspace_id, file_path))
+
+                # 2. Delete IMPORTS edges from this file
+                await cur.execute("""
+                    DELETE FROM edges 
+                    WHERE workspace_id = %s 
+                    AND from_name = %s 
+                    AND edge_type = 'IMPORTS'
+                """, (workspace_id, file_path))
+
+                # 3. Delete symbols in this file
+                await cur.execute(
+                    "DELETE FROM symbols WHERE workspace_id = %s AND file_path = %s",
+                    (workspace_id, file_path)
+                )
+
+                # 4. Delete the file record itself
+                await cur.execute(
+                    "DELETE FROM files WHERE uid = %s",
+                    (f"{workspace_id}:{file_path}",)
+                )
+
+                await conn.commit()
+                logger.info("Deleted all data for file %s in workspace %s", file_path, workspace_id)
+        except Exception as e:
+            await conn.rollback()
+            logger.error("Failed to delete file data for %s: %s", file_path, e)
+            raise
+
+
 async def get_file_hash(workspace_id: str, file_path: str) -> str | None:
     """Get the content hash for a file (for change detection)."""
     async with _cursor() as cur:
@@ -284,6 +327,25 @@ async def index_file_result(
                     "DELETE FROM symbols WHERE workspace_id = %s AND file_path = %s",
                     (workspace_id, parse_result.file_path)
                 )
+
+                # Remove old edges originating from this file
+                # This ensures that if a call or import is removed, the edge is also removed.
+                await cur.execute("""
+                    DELETE FROM edges 
+                    WHERE workspace_id = %s 
+                    AND from_name IN (
+                        SELECT name FROM symbols 
+                        WHERE workspace_id = %s AND file_path = %s
+                    )
+                """, (workspace_id, workspace_id, parse_result.file_path))
+
+                # Also remove old IMPORTS edges where the file_path itself is the from_name
+                await cur.execute("""
+                    DELETE FROM edges 
+                    WHERE workspace_id = %s 
+                    AND from_name = %s 
+                    AND edge_type = 'IMPORTS'
+                """, (workspace_id, parse_result.file_path))
 
                 # Insert new symbols
                 for defn in parse_result.definitions:
@@ -650,6 +712,165 @@ async def impact_analysis(workspace_id: str, symbol_name: str, max_depth: int = 
             {"file_path": fp, "symbols": sorted(syms, key=lambda s: s.get("start_line", 0))}
             for fp, syms in sorted_files
         ],
+    }
+
+
+async def get_project_map(
+    workspace_id: str,
+    focus_path: str | None = None,
+    focus_symbol: str | None = None,
+    depth: int = 1
+) -> dict[str, Any]:
+    """
+    Build a hierarchical project map.
+    
+    Level 1 (High): Project/Module view (file tree + imports)
+    Level 2 (Mid): File/Class view (symbols inside a file)
+    Level 3 (Low): Method/Call view (call graph for a symbol)
+    """
+    nodes = []
+    edges = []
+
+    async with _cursor() as cur:
+        if focus_symbol:
+            # Level 3: Low-level call graph for a specific symbol
+            # Find the symbol first
+            await cur.execute(
+                "SELECT uid, name, kind, file_path, signature FROM symbols WHERE workspace_id = %s AND name = %s LIMIT 1",
+                (workspace_id, focus_symbol)
+            )
+            root_sym = await cur.fetchone()
+            if not root_sym:
+                return {
+                    "workspace_id": workspace_id,
+                    "nodes": [],
+                    "edges": [],
+                    "focus_path": focus_path,
+                    "focus_symbol": focus_symbol
+                }
+
+            # Add root node
+            nodes.append({
+                "id": root_sym["uid"],
+                "name": root_sym["name"],
+                "kind": root_sym["kind"],
+                "file_path": root_sym["file_path"],
+                "signature": root_sym["signature"]
+            })
+
+            # Find immediate calls (downstream)
+            await cur.execute("""
+                SELECT s.uid, s.name, s.kind, s.file_path, s.signature, e.edge_type
+                FROM edges e
+                JOIN symbols s ON s.workspace_id = e.workspace_id AND s.name = e.to_name
+                WHERE e.workspace_id = %s AND e.from_name = %s AND e.edge_type = 'CALLS'
+                LIMIT 50
+            """, (workspace_id, focus_symbol))
+            
+            async for row in cur:
+                nodes.append({
+                    "id": row["uid"],
+                    "name": row["name"],
+                    "kind": row["kind"],
+                    "file_path": row["file_path"],
+                    "signature": row["signature"]
+                })
+                edges.append({"from": root_sym["uid"], "to": row["uid"], "type": "CALLS"})
+
+            # Find immediate callers (upstream)
+            await cur.execute("""
+                SELECT s.uid, s.name, s.kind, s.file_path, s.signature, e.edge_type
+                FROM edges e
+                JOIN symbols s ON s.workspace_id = e.workspace_id AND s.name = e.from_name
+                WHERE e.workspace_id = %s AND e.to_name = %s AND e.edge_type = 'CALLS'
+                LIMIT 50
+            """, (workspace_id, focus_symbol))
+            
+            async for row in cur:
+                nodes.append({
+                    "id": row["uid"],
+                    "name": row["name"],
+                    "kind": row["kind"],
+                    "file_path": row["file_path"],
+                    "signature": row["signature"]
+                })
+                edges.append({"from": row["uid"], "to": root_sym["uid"], "type": "CALLS"})
+
+        elif focus_path:
+            # Level 2: Mid-level view of symbols inside a file
+            await cur.execute("""
+                SELECT uid, name, kind, file_path, signature, parent
+                FROM symbols
+                WHERE workspace_id = %s AND file_path = %s
+                ORDER BY start_line
+            """, (workspace_id, focus_path))
+            
+            async for row in cur:
+                nodes.append({
+                    "id": row["uid"],
+                    "name": row["name"],
+                    "kind": row["kind"],
+                    "file_path": row["file_path"],
+                    "signature": row["signature"]
+                })
+                if row["parent"]:
+                    # Find parent symbol UID
+                    await cur.execute(
+                        "SELECT uid FROM symbols WHERE workspace_id = %s AND name = %s AND file_path = %s LIMIT 1",
+                        (workspace_id, row["parent"], focus_path)
+                    )
+                    parent_row = await cur.fetchone()
+                    if parent_row:
+                        edges.append({"from": row["uid"], "to": parent_row["uid"], "type": "BELONGS_TO"})
+
+        else:
+            # Level 1: High-level project view (file tree + imports)
+            await cur.execute("SELECT path, language FROM files WHERE workspace_id = %s", (workspace_id,))
+            async for row in cur:
+                nodes.append({
+                    "id": row["path"],
+                    "name": row["path"].split("/")[-1],
+                    "kind": "file",
+                    "file_path": row["path"]
+                })
+
+            # Add directory nodes
+            dirs = set()
+            for node in nodes:
+                parts = node["file_path"].split("/")[:-1]
+                curr = ""
+                for p in parts:
+                    parent = curr
+                    curr = f"{curr}/{p}" if curr else p
+                    if curr not in dirs:
+                        dirs.add(curr)
+                        nodes.append({
+                            "id": curr,
+                            "name": p,
+                            "kind": "directory",
+                            "file_path": curr
+                        })
+                        if parent:
+                            edges.append({"from": curr, "to": parent, "type": "CONTAINS"})
+
+            # Add file-level IMPORTS edges
+            await cur.execute("""
+                SELECT from_name, to_name
+                FROM edges
+                WHERE workspace_id = %s AND edge_type = 'IMPORTS'
+            """, (workspace_id,))
+            async for row in cur:
+                edges.append({"from": row["from_name"], "to": row["to_name"], "type": "IMPORTS"})
+
+    # Deduplicate nodes by ID
+    unique_nodes = {n["id"]: n for n in nodes}.values()
+    
+    return {
+        "workspace_id": workspace_id,
+        "nodes": list(unique_nodes),
+        "edges": edges,
+        "focus_path": focus_path,
+        "focus_symbol": focus_symbol
     }
 
 

@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from watchfiles import awatch, Change
+
 from ..core.parser import parse_file, is_code_file, should_skip, FileParseResult
 
 logger = logging.getLogger(__name__)
@@ -114,9 +116,10 @@ async def scan_and_index(
     root_path: Path,
     store_module,
     index_fn,
+    only_files: list[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Scan a directory, detect changes, and intelligently re-index.
+    Scan a directory (or specific files), detect changes, and intelligently re-index.
 
     Returns stats about what was done.
     """
@@ -134,8 +137,14 @@ async def scan_and_index(
 
     changed_files = []
 
-    # 1. Scan all code files
-    for path in root_path.rglob("*"):
+    # 1. Scan code files
+    files_to_scan = []
+    if only_files:
+        files_to_scan = [root_path / f for f in only_files]
+    else:
+        files_to_scan = list(root_path.rglob("*"))
+
+    for path in files_to_scan:
         if not path.is_file():
             continue
         if not is_code_file(path):
@@ -191,7 +200,7 @@ async def scan_and_index(
 
     # 2. Index changed files via the normal /index pipeline
     if changed_files:
-        from .models import IndexRequest, FilePayload
+        from ..models import IndexRequest, FilePayload
         files_payload = [{"path": f["path"], "content": f["content"]} for f in changed_files]
         await index_fn(workspace_id, files_payload)
 
@@ -246,66 +255,42 @@ async def start_watching(
     root_path: Path,
     store_module,
     index_fn,
-    poll_interval: float = 5.0,
 ) -> None:
     """
     Background task that watches a directory and re-indexes on changes.
-    Uses polling with debounce (no OS-level file watching needed).
+    Uses watchfiles for high-performance, event-driven updates.
     """
-    logger.info("Watching %s for workspace %s (poll every %.0fs)", root_path, workspace_id, poll_interval)
+    logger.info("Watching %s for workspace %s (event-driven)", root_path, workspace_id)
 
     # Initial full scan
     await scan_and_index(workspace_id, root_path, store_module, index_fn)
 
-    # Track file mtimes for change detection
-    last_mtimes: dict[str, float] = {}
-    for path in root_path.rglob("*"):
-        if path.is_file() and is_code_file(path):
-            rel = str(path.relative_to(root_path))
-            last_mtimes[rel] = path.stat().st_mtime
-
-    while True:
-        await asyncio.sleep(poll_interval)
-
-        # Check for mtime changes
+    async for changes in awatch(root_path, debounce=int(DEBOUNCE_SECONDS * 1000)):
         changed_paths = []
-        current_mtimes: dict[str, float] = {}
+        deleted_paths = []
 
-        for path in root_path.rglob("*"):
-            if not path.is_file() or not is_code_file(path):
+        for change_type, path_str in changes:
+            path = Path(path_str)
+            if not is_code_file(path):
                 continue
+            
             rel = str(path.relative_to(root_path))
-            mtime = path.stat().st_mtime
-            current_mtimes[rel] = mtime
-
-            if rel not in last_mtimes or last_mtimes[rel] != mtime:
+            
+            if change_type == Change.deleted:
+                deleted_paths.append(rel)
+            else:
+                # Added or Modified
                 changed_paths.append(rel)
 
-        # Check for deleted files
-        deleted = set(last_mtimes.keys()) - set(current_mtimes.keys())
+        if deleted_paths:
+            logger.info("Detected %d deleted files: %s", len(deleted_paths), deleted_paths)
+            for rel in deleted_paths:
+                await store_module.delete_file_data(workspace_id, rel)
 
-        if not changed_paths and not deleted:
-            continue
-
-        # Debounce: wait for more changes to settle
-        await asyncio.sleep(DEBOUNCE_SECONDS)
-
-        # Re-check after debounce (more files may have changed)
-        for path in root_path.rglob("*"):
-            if not path.is_file() or not is_code_file(path):
-                continue
-            rel = str(path.relative_to(root_path))
-            mtime = path.stat().st_mtime
-            current_mtimes[rel] = mtime
-            if rel not in last_mtimes or last_mtimes[rel] != mtime:
-                if rel not in changed_paths:
-                    changed_paths.append(rel)
-
-        if changed_paths or deleted:
-            logger.info("Detected %d changed, %d deleted files", len(changed_paths), len(deleted))
-            await scan_and_index(workspace_id, root_path, store_module, index_fn)
-
-        last_mtimes = current_mtimes
+        if changed_paths:
+            logger.info("Detected %d changed files: %s", len(changed_paths), changed_paths)
+            # We call scan_and_index with only the changed files for performance
+            await scan_and_index(workspace_id, root_path, store_module, index_fn, only_files=changed_paths)
 
 
 def stop_watching(workspace_id: str) -> bool:
@@ -331,7 +316,7 @@ async def _get_old_parse(store_module, workspace_id: str, file_path: str) -> Fil
     old_defs = []
     for uid, sym in ws.symbols.items():
         if sym["file_path"] == file_path:
-            from .parser import SymbolDef
+            from ..core.parser import SymbolDef
             old_defs.append(SymbolDef(
                 name=sym["name"],
                 kind=sym["kind"],

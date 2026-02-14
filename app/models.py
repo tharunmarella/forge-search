@@ -249,3 +249,39 @@ class SetModelResponse(BaseModel):
     reasoning_model: str
     tool_model: str
     message: str
+
+
+# ── Map models ───────────────────────────────────────────────────
+
+
+class MapRequest(BaseModel):
+    workspace_id: str
+    focus_path: str | None = None
+    focus_symbol: str | None = None
+    depth: int = Field(default=1, ge=1, le=5)
+
+
+class MapNode(BaseModel):
+    id: str
+    name: str
+    kind: str  # "file", "directory", "class", "function", etc.
+    file_path: str | None = None
+    signature: str | None = None
+    description: str | None = None
+
+
+class MapEdge(BaseModel):
+    from_id: str = Field(alias="from")
+    to_id: str = Field(alias="to")
+    type: str  # "IMPORTS", "CALLS", "BELONGS_TO", "CONTAINS"
+
+    class Config:
+        populate_by_name = True
+
+
+class MapResponse(BaseModel):
+    workspace_id: str
+    nodes: list[MapNode]
+    edges: list[MapEdge]
+    focus_path: str | None = None
+    focus_symbol: str | None = None

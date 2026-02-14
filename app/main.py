@@ -95,6 +95,7 @@ from .api import (
     search,
     analysis,
     chat,
+    map,
 )
 
 # Health check (no prefix)
@@ -124,6 +125,9 @@ app.include_router(analysis.router, tags=["analysis"])
 # Chat (already has prefix="/chat" in router)
 app.include_router(chat.router, tags=["chat"])
 
+# Map (no prefix - /map at root)
+app.include_router(map.router, tags=["map"])
+
 logger.info("✓ All API routers registered")
 logger.info("  - /health (health check)")
 logger.info("  - /memory/* (workspace memory)")
@@ -133,4 +137,5 @@ logger.info("  - /auth/* (authentication)")
 logger.info("  - /watch/* (file watching)")
 logger.info("  - /index, /search, /reindex (search & indexing)")
 logger.info("  - /trace, /impact (code analysis)")
+logger.info("  - /map (project visualization)")
 logger.info("  - /chat/* (AI chat)")
