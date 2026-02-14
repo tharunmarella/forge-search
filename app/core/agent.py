@@ -37,8 +37,10 @@ from langchain_core.tools import tool
 from ..storage import store
 from . import embeddings, chat as chat_utils
 from . import llm as llm_provider
+from ..intelligence.phase1 import workspace_memory as ws_memory
 
 # Intelligence System - Phase 1, 2, 3 (Simplified Roo-Code Style)
+ENABLE_PHASE_3 = False
 # (Old imports removed)
 
 # Documentation API configuration
@@ -1589,14 +1591,17 @@ async def call_model(state: AgentState) -> dict:
                 len(enriched_context), len(plan_steps), current_step, len(memory.get('failed_commands', {})))
     
     # ── PHASE 3: Check if we should create a learning checkpoint ────────────────
-    checkpoints = state.get('checkpoints', [])
+    # (Phase 3 disabled in simplified Roo-Code style)
+    if False:
+        checkpoints = state.get('checkpoints', [])
     last_checkpoint_time_str = state.get('last_checkpoint_time')
     last_checkpoint_time = None
     if last_checkpoint_time_str:
         from datetime import datetime
         last_checkpoint_time = datetime.fromisoformat(last_checkpoint_time_str)
     
-    if ENABLE_PHASE_3 and await learning_checkpoints.should_create_checkpoint(state, last_checkpoint_time):
+    # if ENABLE_PHASE_3 and await learning_checkpoints.should_create_checkpoint(state, last_checkpoint_time):
+    if False:
         logger.info("[call_model] Creating learning checkpoint...")
         
         # Extract recent errors and successes
