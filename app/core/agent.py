@@ -1935,7 +1935,7 @@ def create_agent():
         "server_tools",
         post_server_tools_router,
         {
-            "agent": "enrich",      # Go back to enrich to re-evaluate context gap
+            "agent": "agent",       # No IDE tools, continue reasoning
             "pause": END,           # Mixed call — pause for IDE tools
         }
     )
