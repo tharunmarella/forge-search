@@ -157,12 +157,6 @@ class AgentState(TypedDict):
     """The state of the agent graph."""
     messages: Annotated[list[BaseMessage], add_messages]
     workspace_id: str
-    # Pre-enriched context (set by first node)
-    enriched_context: str
-    # The question we enriched for (used to detect topic shifts)
-    enriched_question: str
-    # Which plan step we last enriched for (0 = no step-specific enrichment)
-    enriched_step: int
     # Project profile: tech stack, versions, warnings (built once per workspace)
     project_profile: str
     # Attached files from IDE (live file contents)
@@ -1606,265 +1600,84 @@ async def _step_enrichment(workspace_id: str, step_description: str) -> str:
         return ""
 
 
-# ── Intent Analysis ───────────────────────────────────────────────
-
-INTENT_ANALYSIS_PROMPT = """You are a retrieval optimizer for an AI software engineer. 
-Analyze the recent conversation history and decide if the AI needs more code context to complete its next step.
-
-**When context IS needed:**
-- User asks about the project, codebase, architecture, or "what is this about"
-- User requests to find, read, analyze, or modify specific code
-- User asks "how does X work" or "where is Y implemented"
-- Assistant needs to understand code structure before answering
-- Any question that requires looking at actual code files
-
-**When context is NOT needed:**
-- Simple acknowledgments ("Thanks!", "OK", "Got it")
-- Explaining general programming concepts (no specific codebase context needed)
-- User just provided tool results and assistant is processing them
-
-If context is needed, generate a concise, focused search query (2-5 words) that targets the specific information needed.
-If no context is needed, respond with "NONE_NEEDED".
-
-Examples:
-- User: "what is this project about?" -> "README project overview"
-- User: "Fix the bug in auth.py" -> "auth.py error handling"  
-- User: "how does authentication work?" -> "authentication implementation"
-- Assistant: "I see an issue in the JWT validator" -> "JWT validation implementation"
-- User: "Thanks!" -> "NONE_NEEDED"
-- User provides tool results -> "NONE_NEEDED"
-
-Respond with ONLY the query or "NONE_NEEDED"."""
+# ── Workspace Context Builder ─────────────────────────────────────
 
 
-async def _analyze_retrieval_intent(messages: list[BaseMessage]) -> str:
-    """Use the tool model to identify EXACTLY what context is missing."""
-    try:
-        # Use the tool model as requested for intent analysis
-        model = llm_provider.get_tool_model(temperature=0.0)
-        
-        # Build a compact history
-        history_parts = []
-        for msg in messages[-3:]:
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-            history_parts.append(f"{role}: {content[:300]}")
-        
-        history_text = "\n".join(history_parts)
-        
-        response = await model.ainvoke([
-            SystemMessage(content=INTENT_ANALYSIS_PROMPT),
-            HumanMessage(content=f"Conversation history:\n{history_text}")
-        ])
-        
-        intent = response.content.strip().upper()
-        if "NONE_NEEDED" in intent:
-            return "NONE_NEEDED"
-            
-        # Clean up any potential markdown or extra text
-        intent = intent.replace('"', '').replace("'", "").split('\n')[0]
-        logger.info(f"[intent_analysis] Context gap identified using tool model: {intent}")
-        return intent
-    except Exception as e:
-        logger.warning(f"[intent_analysis] Failed: {e}")
-        return "NONE_NEEDED"
-
-
-async def enrich_context(state: AgentState) -> dict:
+async def build_workspace_context(workspace_id: str) -> str:
     """
-    MCP-STYLE TARGETED RETRIEVAL: 
-    1. Analyzes history to find the 'Context Gap'.
-    2. Generates a precise code-search query.
-    3. Injects only the highly relevant snippets.
+    Build a static workspace overview to inject into the agent's context.
     
-    NOTE: This node now explicitly CLEARS stale context if no new gap is identified,
-    ensuring the model only sees what it needs for the CURRENT turn.
+    This replaces dynamic enrichment with static, predictable context that gives
+    the agent visibility into workspace stats and key entry points.
+    
+    Returns:
+        Formatted markdown string with workspace stats and sample symbols
     """
-    import time
-    start_time = time.time()
-    
-    workspace_id = state['workspace_id']
-    messages = state['messages']
-    
-    # Initialize or get existing metrics
-    step_metrics = state.get('step_metrics', {})
-    
-    # 1. ANALYZE INTENT (The 'MCP' part)
-    # Use a fast model to identify EXACTLY what context is missing.
-    context_intent = await _analyze_retrieval_intent(messages)
-    
-    if context_intent == "NONE_NEEDED":
-        logger.info("[enrich_context] No additional context needed - clearing stale context")
-        
-        # After enrichment, capture metrics
-        enrich_time_ms = (time.time() - start_time) * 1000
-        step_metrics['enrichment'] = {
-            'time_ms': enrich_time_ms,
-            'context_size_chars': 0,
-            'context_snippets': 0,
-            'search_query': context_intent,
-            'component_count': 0,
-            'skipped': True,
-        }
-        
-        # Explicitly return an empty string to clear previous turn's context from state
-        return {
-            "enriched_context": "",
-            "step_metrics": step_metrics,
-        }
-
-    # 2. ARCHITECTURE-AWARE TARGETED SEARCH
-    # First get architectural context to understand the system structure
     try:
-        # Get high-level architecture overview
-        try:
-            arch_map = await store.get_project_map(workspace_id=workspace_id)
-            components = [n for n in arch_map.get("nodes", []) if n.get("kind") == "component"]
-            
-            # Build architecture context
-            arch_context = "🏗️ SYSTEM ARCHITECTURE:\n"
-            for comp in components:
-                arch_context += f"- {comp['name']}: {comp.get('description', 'No description')} ({comp.get('file_count', 0)} files)\n"
-            arch_context += "\n"
-        except Exception as arch_e:
-            logger.warning(f"[enrich_context] Architecture map failed: {arch_e}, proceeding without it")
-            arch_context = "🏗️ SYSTEM ARCHITECTURE: (Architecture map unavailable)\n\n"
+        context_parts = []
         
-        # Perform semantic search with architectural awareness
-        query_emb = await embeddings.embed_query(context_intent)
-        results = await store.vector_search(workspace_id, query_emb, top_k=8)  # Get more results for better coverage
+        # Get workspace stats
+        stats = await store.get_workspace_stats(workspace_id)
         
-        snippet_count = 0
-        component_count = 0
-        if results:
-            # Group results by architectural component for better organization
-            component_groups = {}
-            for r in results:
-                file_path = r["symbol"].get("file_path", "")
-                
-                # Determine which component this file belongs to
-                if file_path.startswith("pages/api/"):
-                    comp = "API Endpoints"
-                elif file_path.startswith("pages/"):
-                    comp = "Pages & Routes"
-                elif file_path.startswith("components/ui/"):
-                    comp = "UI Components"
-                elif file_path.startswith("components/"):
-                    comp = "Feature Components"
-                elif file_path.startswith("context/"):
-                    comp = "State Management"
-                elif file_path.startswith(("lib/", "utils/")):
-                    comp = "Utilities"
-                else:
-                    comp = "Configuration"
-                
-                if comp not in component_groups:
-                    component_groups[comp] = []
-                component_groups[comp].append(r)
-            
-            # Build organized context with architecture information
-            context_parts = [arch_context]
-            context_parts.append("🎯 RELEVANT CODE BY COMPONENT:")
-            context_parts.append("=" * 40)
-            
-            component_count = len(component_groups)
-            for comp_name, comp_results in component_groups.items():
-                if comp_results:  # Only show components that have relevant results
-                    context_parts.append(f"\n📦 {comp_name}:")
-                    context_parts.append("-" * 20)
-                    
-                    flat_results = [r["symbol"] for r in comp_results[:3]]  # Limit per component
-                    snippet_count += len(flat_results)
-                    comp_context = chat_utils.build_context_from_results(flat_results)
-                    context_parts.append(comp_context)
-            
-            new_context = "\n".join(context_parts)
-            logger.info(f"[enrich_context] Injected architecture-aware context for: {context_intent}")
-            
-            # After enrichment, capture metrics
-            enrich_time_ms = (time.time() - start_time) * 1000
-            step_metrics['enrichment'] = {
-                'time_ms': enrich_time_ms,
-                'context_size_chars': len(new_context),
-                'context_snippets': snippet_count,
-                'search_query': context_intent,
-                'component_count': component_count,
-                'skipped': False,
-            }
-            
-            return {
-                "enriched_context": new_context,
-                "step_metrics": step_metrics,
-            }
-        else:
-            # Even if no search results, provide architecture context
-            logger.info(f"[enrich_context] No search results, providing architecture context only")
-            
-            # After enrichment, capture metrics
-            enrich_time_ms = (time.time() - start_time) * 1000
-            step_metrics['enrichment'] = {
-                'time_ms': enrich_time_ms,
-                'context_size_chars': len(arch_context),
-                'context_snippets': 0,
-                'search_query': context_intent,
-                'component_count': 0,
-                'skipped': False,
-            }
-            
-            return {
-                "enriched_context": arch_context,
-                "step_metrics": step_metrics,
-            }
-            
-    except Exception as e:
-        logger.error(f"[enrich_context] Architecture-aware RAG failed: {e}")
-        # Fallback to basic search
+        context_parts.append("## 📊 WORKSPACE OVERVIEW")
+        context_parts.append("=" * 60)
+        context_parts.append(f"**Total Files**: {stats.get('file_count', 0)}")
+        context_parts.append(f"**Total Symbols**: {stats.get('symbol_count', 0)}")
+        context_parts.append(f"  - Functions: {stats.get('function_count', 0)}")
+        context_parts.append(f"  - Classes: {stats.get('class_count', 0)}")
+        context_parts.append(f"  - Methods: {stats.get('method_count', 0)}")
+        context_parts.append("")
+        
+        # Get sample of key files using vector search
+        context_parts.append("## 📁 KEY FILES & SYMBOLS")
+        context_parts.append("=" * 60)
+        context_parts.append("(Use search tools to explore more: `codebase_search`, `list_files`, `read_file`)")
+        context_parts.append("")
+        
         try:
-            query_emb = await embeddings.embed_query(context_intent)
-            results = await store.vector_search(workspace_id, query_emb, top_k=5)
+            # Use a general query to get important entry points
+            query_emb = await embeddings.embed_query("main entry point configuration setup")
+            results = await store.vector_search(workspace_id, query_emb, top_k=15)
             
             if results:
-                flat_results = [r["symbol"] for r in results]
-                new_context = chat_utils.build_context_from_results(flat_results)
-                logger.info(f"[enrich_context] Fallback: Injected {len(flat_results)} snippets for: {context_intent}")
+                # Group by file
+                files_dict = {}
+                for r in results:
+                    sym = r['symbol']
+                    file_path = sym.get('file_path', 'unknown')
+                    if file_path not in files_dict:
+                        files_dict[file_path] = []
+                    files_dict[file_path].append(sym)
                 
-                # After enrichment, capture metrics
-                enrich_time_ms = (time.time() - start_time) * 1000
-                step_metrics['enrichment'] = {
-                    'time_ms': enrich_time_ms,
-                    'context_size_chars': len(new_context),
-                    'context_snippets': len(flat_results),
-                    'search_query': context_intent,
-                    'component_count': 0,
-                    'skipped': False,
-                    'fallback': True,
-                }
-                
-                return {
-                    "enriched_context": new_context,
-                    "step_metrics": step_metrics,
-                }
-        except Exception as fallback_e:
-            logger.error(f"[enrich_context] Fallback also failed: {fallback_e}")
+                # Show files and their key symbols
+                for file_path, symbols in list(files_dict.items())[:10]:
+                    context_parts.append(f"\n📄 **{file_path}**")
+                    for sym in symbols[:5]:
+                        kind = sym.get('kind', 'symbol')
+                        name = sym.get('name', 'unnamed')
+                        line = sym.get('start_line', 0)
+                        context_parts.append(f"   • {kind}: `{name}` (line {line})")
+            else:
+                context_parts.append("No indexed symbols found. Use `list_files` to explore.")
+        except Exception as search_error:
+            logger.warning(f"Could not load sample symbols: {search_error}")
+            context_parts.append("Sample symbols unavailable. Use `list_files` to explore.")
         
-        # After enrichment, capture metrics (error case)
-        enrich_time_ms = (time.time() - start_time) * 1000
-        step_metrics['enrichment'] = {
-            'time_ms': enrich_time_ms,
-            'context_size_chars': 0,
-            'context_snippets': 0,
-            'search_query': context_intent,
-            'component_count': 0,
-            'skipped': False,
-            'error': str(e),
-        }
+        context_parts.append("\n\n💡 **Available Search Tools**:")
+        context_parts.append("  - `codebase_search(query)` - Semantic search across all code")
+        context_parts.append("  - `search_functions(query)` - Find specific functions")
+        context_parts.append("  - `search_classes(query)` - Find specific classes")
+        context_parts.append("  - `list_files(path)` - List files in a directory")
+        context_parts.append("  - `read_file(path)` - Read file contents")
         
-        # Clear context on error to prevent model from acting on stale/wrong information
-        return {
-            "enriched_context": "",
-            "step_metrics": step_metrics,
-        }
-
+        workspace_context = "\n".join(context_parts)
+        logger.info(f"[build_workspace_context] Built context: {len(workspace_context)} chars, {stats.get('file_count', 0)} files, {stats.get('symbol_count', 0)} symbols")
+        
+        return workspace_context
+    
+    except Exception as e:
+        logger.error(f"[build_workspace_context] Failed: {e}")
+        return "## WORKSPACE CONTEXT\n\nUnable to load workspace context. Use list_files and search tools to explore."
 
 
 # ── Context Window Management ─────────────────────────────────────
@@ -2066,10 +1879,9 @@ def _pick_model_name(messages: list[BaseMessage], plan_steps: list[PlanStep] = N
 async def call_model(state: AgentState) -> dict:
     """The 'Brain' node - LLM reasoning with full context.
     
-    Now plan-aware: if there's an active plan, it injects the plan display
-    and current step instructions into the system prompt.
+    Now starts with static workspace context (only injected on first call).
+    No more dynamic enrichment - agent uses search tools when it needs more context.
     """
-    enriched_context = state.get('enriched_context', '')
     plan_steps = list(state.get('plan_steps', []))  # Make mutable copy
     current_step = state.get('current_step', 0)
     workspace_id = state['workspace_id']
@@ -2083,8 +1895,8 @@ async def call_model(state: AgentState) -> dict:
         logger.warning("[call_model] Should ask for help - exhausted approaches detected")
         return {"messages": [AIMessage(content=help_message)]}
     
-    logger.info("[call_model] enriched_context=%d chars, plan_steps=%d, current_step=%d, memory_failures=%d",
-                len(enriched_context), len(plan_steps), current_step, len(memory.get('failed_commands', {})))
+    logger.info("[call_model] plan_steps=%d, current_step=%d, memory_failures=%d",
+                len(plan_steps), current_step, len(memory.get('failed_commands', {})))
     
     # ── PHASE 3: Check if we should create a learning checkpoint ────────────────
     # (Phase 3 disabled in simplified Roo-Code style)
@@ -2201,27 +2013,37 @@ async def call_model(state: AgentState) -> dict:
         logger.info("[call_model] Injected active plan context (step %d/%d)", 
                     current_step, len(plan_steps))
     
-    # Add enriched context as a system message if we have it
-    if enriched_context:
-        # Cap enriched context to avoid blowing up on its own
-        ctx = enriched_context[:80_000] if len(enriched_context) > 80_000 else enriched_context
-        context_msg = f"""## Pre-gathered Context (SEMANTIC SEARCH RESULTS)
+    # Build workspace context ONCE at the start of conversation
+    # (Only on first call, not every turn)
+    workspace_context = ""
+    if is_first_call:
+        import time
+        ctx_start = time.time()
+        workspace_context = await build_workspace_context(workspace_id)
+        ctx_time_ms = (time.time() - ctx_start) * 1000
+        
+        # Track workspace context build metrics
+        step_metrics = state.get('step_metrics', {})
+        step_metrics['workspace_context_build'] = {
+            'time_ms': ctx_time_ms,
+            'context_size_chars': len(workspace_context),
+        }
+        state['step_metrics'] = step_metrics
+        
+        logger.info(f"[call_model] Built workspace context: {len(workspace_context)} chars in {ctx_time_ms:.0f}ms")
+    
+    # Add workspace context as a system message if this is the first call
+    if workspace_context:
+        context_msg = f"""## Workspace Context
 
-The following code was found via AI-powered semantic search on the user's codebase.
-USE THIS CODE as the primary reference for understanding patterns, conventions, and structure.
-
-{ctx}
+{workspace_context}
 
 ---
 
-IMPORTANT: The semantic search above already queried the codebase for relevant code.
-- Study the code snippets above to understand existing patterns before creating your plan
-- Reference specific file paths, function names, and patterns from this context
-- You can call `codebase_search` for ADDITIONAL context if needed, but start with what's above"""
+The overview above shows workspace statistics and key entry points.
+Use the search tools (`codebase_search`, `search_functions`, `list_files`, `read_file`) to explore specific code."""
         messages_to_send.append(SystemMessage(content=context_msg))
-        logger.info("[call_model] Added context message, total messages: %d", len(messages_to_send))
-    else:
-        logger.warning("[call_model] No enriched context to add!")
+        logger.info("[call_model] Injected workspace context, total messages: %d", len(messages_to_send))
     
     # ── PHASE 1: Inject failure summary (pre-emptive blocking) ──────────────
     failure_summary = await ws_memory.get_failure_summary(workspace_id)
@@ -2502,23 +2324,19 @@ def post_server_tools_router(state: AgentState) -> Literal["pause", "agent"]:
 def create_agent():
     """Build the LangGraph agent with tool-based planning.
     
-    The agent decides when to plan using create_plan/update_plan/discard_plan
-    tools. This replaces the old classifier → planning node flow.
+    The agent starts immediately with workspace context injected in call_model.
+    No separate enrichment node - context is static and fast.
     """
     workflow = StateGraph(AgentState)
 
     # Nodes
-    workflow.add_node("enrich", enrich_context)
     workflow.add_node("agent", call_model)
     workflow.add_node("server_tools", execute_server_tools)
 
     # ── Edges ─────────────────────────────────────────────────
     
-    # Entry: pre-enrichment (semantic search, call chains)
-    workflow.set_entry_point("enrich")
-    
-    # After enrichment, go to agent
-    workflow.add_edge("enrich", "agent")
+    # Entry: start directly at agent (workspace context injected in call_model)
+    workflow.set_entry_point("agent")
     
     # After agent, route based on tool calls
     workflow.add_conditional_edges(
