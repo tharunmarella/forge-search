@@ -171,6 +171,18 @@ def _deserialize_messages(data: list[dict]) -> list:
     return messages
 
 
+def _get_pending_tool_call_ids(messages: list) -> set[str]:
+    """Extract tool_call_ids from the last AIMessage that had tool_calls.
+    
+    This is used to validate incoming tool results - they must match
+    a tool_call_id from the most recent assistant message with tool calls.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            return {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
+    return set()
+
+
 # ── ConversationStore (Redis-backed) ─────────────────────────────────
 
 class ConversationStore:
@@ -299,13 +311,28 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
         plan_steps = stored.get("plan_steps", [])
         current_step = stored.get("current_step", 0)
 
+        # Validate tool results against pending tool calls
+        pending_ids = _get_pending_tool_call_ids(messages)
+        valid_results = []
+        orphaned_results = []
+        
         for res in req.tool_results:
-            messages.append(ToolMessage(
-                content=res.output,
-                tool_call_id=res.call_id,
-                status="success" if res.success else "error",
-            ))
-            _process_tool_result_for_memory(req.workspace_id, messages, res)
+            if res.call_id in pending_ids:
+                valid_results.append(res)
+                messages.append(ToolMessage(
+                    content=res.output,
+                    tool_call_id=res.call_id,
+                    status="success" if res.success else "error",
+                ))
+                _process_tool_result_for_memory(req.workspace_id, messages, res)
+            else:
+                orphaned_results.append(res.call_id[:50])
+        
+        if orphaned_results:
+            logger.warning(
+                "[chat] Filtered %d orphaned tool results (no matching tool_call): %s",
+                len(orphaned_results), orphaned_results[:3]
+            )
 
         logger.info(
             "[chat] TOOL CONTINUATION conv=%s, restored %d messages, enriched=%d chars, plan_steps=%d, step=%d",
@@ -346,13 +373,18 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             messages.append(HumanMessage(content=req.question))
 
         if req.tool_results:
+            # Validate tool results against pending tool calls
+            pending_ids = _get_pending_tool_call_ids(messages)
             for res in req.tool_results:
-                messages.append(ToolMessage(
-                    content=res.output,
-                    tool_call_id=res.call_id,
-                    status="success" if res.success else "error",
-                ))
-                _process_tool_result_for_memory(req.workspace_id, messages, res)
+                if res.call_id in pending_ids:
+                    messages.append(ToolMessage(
+                        content=res.output,
+                        tool_call_id=res.call_id,
+                        status="success" if res.success else "error",
+                    ))
+                    _process_tool_result_for_memory(req.workspace_id, messages, res)
+                else:
+                    logger.warning("[chat] Skipped orphaned tool result: %s", res.call_id[:50])
 
         logger.info("[chat] NEW conv=%s, %d messages", conv_id, len(messages))
 
@@ -615,12 +647,17 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 plan_steps = stored.get("plan_steps", [])
                 current_step = stored.get("current_step", 0)
 
+                # Validate tool results against pending tool calls
+                pending_ids = _get_pending_tool_call_ids(messages)
                 for res in req.tool_results:
-                    messages.append(ToolMessage(
-                        content=res.output,
-                        tool_call_id=res.call_id,
-                        status="success" if res.success else "error",
-                    ))
+                    if res.call_id in pending_ids:
+                        messages.append(ToolMessage(
+                            content=res.output,
+                            tool_call_id=res.call_id,
+                            status="success" if res.success else "error",
+                        ))
+                    else:
+                        logger.warning("[stream] Skipped orphaned tool result: %s", res.call_id[:50])
             elif stored and req.question:
                 messages = stored["messages"]
                 enriched_context = stored.get("enriched_context", "")
@@ -650,12 +687,17 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                     messages.append(HumanMessage(content=req.question))
 
                 if req.tool_results:
+                    # Validate tool results against pending tool calls
+                    pending_ids = _get_pending_tool_call_ids(messages)
                     for res in req.tool_results:
-                        messages.append(ToolMessage(
-                            content=res.output,
-                            tool_call_id=res.call_id,
-                            status="success" if res.success else "error",
-                        ))
+                        if res.call_id in pending_ids:
+                            messages.append(ToolMessage(
+                                content=res.output,
+                                tool_call_id=res.call_id,
+                                status="success" if res.success else "error",
+                            ))
+                        else:
+                            logger.warning("[stream] Skipped orphaned tool result: %s", res.call_id[:50])
 
             attached_files_dict_new = {}
             if req.attached_files:
