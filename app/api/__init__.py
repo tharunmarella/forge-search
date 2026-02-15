@@ -13,6 +13,7 @@ from . import watch
 from . import search
 from . import analysis
 from . import chat
+from . import traces
 
 __all__ = [
     "health",
@@ -24,4 +25,5 @@ __all__ = [
     "search",
     "analysis",
     "chat",
+    "traces",
 ]
