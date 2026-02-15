@@ -1607,13 +1607,28 @@ async def _step_enrichment(workspace_id: str, step_description: str) -> str:
 INTENT_ANALYSIS_PROMPT = """You are a retrieval optimizer for an AI software engineer. 
 Analyze the recent conversation history and decide if the AI needs more code context to complete its next step.
 
-If context is needed, generate a concise, focused search query (2-5 words) that targets the specific symbols, logic, or patterns the AI is currently working on.
-If the AI already has enough context or is performing a simple task (like explaining a concept or acknowledging), respond with "NONE_NEEDED".
+**When context IS needed:**
+- User asks about the project, codebase, architecture, or "what is this about"
+- User requests to find, read, analyze, or modify specific code
+- User asks "how does X work" or "where is Y implemented"
+- Assistant needs to understand code structure before answering
+- Any question that requires looking at actual code files
+
+**When context is NOT needed:**
+- Simple acknowledgments ("Thanks!", "OK", "Got it")
+- Explaining general programming concepts (no specific codebase context needed)
+- User just provided tool results and assistant is processing them
+
+If context is needed, generate a concise, focused search query (2-5 words) that targets the specific information needed.
+If no context is needed, respond with "NONE_NEEDED".
 
 Examples:
-- User: "Fix the bug in auth.py" -> "auth.py error handling"
+- User: "what is this project about?" -> "README project overview"
+- User: "Fix the bug in auth.py" -> "auth.py error handling"  
+- User: "how does authentication work?" -> "authentication implementation"
 - Assistant: "I see an issue in the JWT validator" -> "JWT validation implementation"
 - User: "Thanks!" -> "NONE_NEEDED"
+- User provides tool results -> "NONE_NEEDED"
 
 Respond with ONLY the query or "NONE_NEEDED"."""
 
