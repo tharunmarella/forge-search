@@ -105,6 +105,40 @@ async def get_trace(trace_id: str):
     return _serialize_trace(doc)
 
 
+@router.delete("/{trace_id}")
+async def delete_trace(trace_id: str):
+    """Delete a specific trace by ID."""
+    if _traces_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB not configured")
+    
+    try:
+        result = await _traces_collection.delete_one({"_id": ObjectId(trace_id)})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid trace ID: {e}")
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    
+    logger.info(f"Deleted trace: {trace_id}")
+    return {"success": True, "deleted_id": trace_id}
+
+
+@router.delete("/thread/{thread_id}")
+async def delete_thread_traces(thread_id: str):
+    """Delete all traces for a specific thread (conversation run)."""
+    if _traces_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB not configured")
+    
+    result = await _traces_collection.delete_many({"thread_id": thread_id})
+    
+    logger.info(f"Deleted {result.deleted_count} traces for thread: {thread_id}")
+    return {
+        "success": True,
+        "deleted_count": result.deleted_count,
+        "thread_id": thread_id
+    }
+
+
 @router.get("/{trace_id}/flow")
 async def get_trace_flow(trace_id: str):
     """Get trace as a node-edge graph for visualization."""
