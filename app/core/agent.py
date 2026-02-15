@@ -458,12 +458,16 @@ async def get_architecture_map(state: Annotated[AgentState, InjectedState], focu
     workspace_id = state['workspace_id']
     logger.info("get_architecture_map: workspace=%s, focus_path=%s, focus_symbol=%s", workspace_id, focus_path, focus_symbol)
     
-    result = await store.get_project_map(
-        workspace_id=workspace_id,
-        focus_path=focus_path, 
-        focus_symbol=focus_symbol,
-        depth=1
-    )
+    try:
+        result = await store.get_project_map(
+            workspace_id=workspace_id,
+            focus_path=focus_path, 
+            focus_symbol=focus_symbol,
+            depth=1
+        )
+    except Exception as e:
+        logger.warning(f"get_architecture_map failed: {e}")
+        return f"Unable to load architecture map (database table may not exist). Try using list_files or read_file to explore the project structure instead."
     
     # Format the result for the agent
     nodes = result.get("nodes", [])
