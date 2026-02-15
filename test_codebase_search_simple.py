@@ -91,10 +91,14 @@ async def test_database_connection():
     try:
         from app.storage import store
         
-        # Try a simple query
-        metadata = await store.get_workspace_metadata("test")
-        print("✅ Database connection successful")
-        return True
+        # Try a simple connection check
+        is_connected = await store.check_connection()
+        if is_connected:
+            print("✅ Database connection successful")
+            return True
+        else:
+            print("❌ Database connection check returned False")
+            return False
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
         print("\nTroubleshooting:")
@@ -194,7 +198,7 @@ async def test_codebase_search_function():
     print("=" * 80)
     
     try:
-        from app.core.agent import codebase_search, AgentState
+        from app.core.agent import codebase_search
         
         workspace_id = "forge-search"  # Change to your workspace ID
         query = "LLM model configuration"
@@ -213,7 +217,12 @@ async def test_codebase_search_function():
         print(f"Running codebase_search for: '{query}'")
         print(f"Workspace: {workspace_id}")
         
-        result = await codebase_search(query, state)
+        # Call the underlying function (tool.func accesses the actual function)
+        if hasattr(codebase_search, 'func'):
+            result = await codebase_search.func(query, state)
+        else:
+            # Fallback: call invoke method
+            result = await codebase_search.ainvoke({"query": query, "state": state})
         
         if result:
             print(f"✅ codebase_search executed successfully")
