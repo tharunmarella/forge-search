@@ -58,7 +58,7 @@ PROVIDERS: dict[str, dict] = {
         "name": "Google Gemini",
         "env_key": "GEMINI_API_KEY",
         "models": [
-            "gemini/gemini-2.0-flash",
+            "gemini/gemini-2.5-flash",
             "gemini/gemini-2.0-flash-lite",
             "gemini/gemini-1.5-pro",
             "gemini/gemini-1.5-flash",
