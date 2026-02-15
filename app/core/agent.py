@@ -177,6 +177,8 @@ class AgentState(TypedDict):
     consecutive_mistake_count: int
     last_tool_call: str | None
     repetition_count: int
+    # ── Performance Metrics ──
+    step_metrics: dict  # Tracks timing, tokens, context at each step
 
 
 # ── Tool Definitions (Cloud-side) ────────────────────────────────
@@ -1659,8 +1661,14 @@ async def enrich_context(state: AgentState) -> dict:
     NOTE: This node now explicitly CLEARS stale context if no new gap is identified,
     ensuring the model only sees what it needs for the CURRENT turn.
     """
+    import time
+    start_time = time.time()
+    
     workspace_id = state['workspace_id']
     messages = state['messages']
+    
+    # Initialize or get existing metrics
+    step_metrics = state.get('step_metrics', {})
     
     # 1. ANALYZE INTENT (The 'MCP' part)
     # Use a fast model to identify EXACTLY what context is missing.
@@ -1668,26 +1676,47 @@ async def enrich_context(state: AgentState) -> dict:
     
     if context_intent == "NONE_NEEDED":
         logger.info("[enrich_context] No additional context needed - clearing stale context")
+        
+        # After enrichment, capture metrics
+        enrich_time_ms = (time.time() - start_time) * 1000
+        step_metrics['enrichment'] = {
+            'time_ms': enrich_time_ms,
+            'context_size_chars': 0,
+            'context_snippets': 0,
+            'search_query': context_intent,
+            'component_count': 0,
+            'skipped': True,
+        }
+        
         # Explicitly return an empty string to clear previous turn's context from state
-        return {"enriched_context": ""}
+        return {
+            "enriched_context": "",
+            "step_metrics": step_metrics,
+        }
 
     # 2. ARCHITECTURE-AWARE TARGETED SEARCH
     # First get architectural context to understand the system structure
     try:
         # Get high-level architecture overview
-        arch_map = await store.get_project_map(workspace_id=workspace_id)
-        components = [n for n in arch_map.get("nodes", []) if n.get("kind") == "component"]
-        
-        # Build architecture context
-        arch_context = "🏗️ SYSTEM ARCHITECTURE:\n"
-        for comp in components:
-            arch_context += f"- {comp['name']}: {comp.get('description', 'No description')} ({comp.get('file_count', 0)} files)\n"
-        arch_context += "\n"
+        try:
+            arch_map = await store.get_project_map(workspace_id=workspace_id)
+            components = [n for n in arch_map.get("nodes", []) if n.get("kind") == "component"]
+            
+            # Build architecture context
+            arch_context = "🏗️ SYSTEM ARCHITECTURE:\n"
+            for comp in components:
+                arch_context += f"- {comp['name']}: {comp.get('description', 'No description')} ({comp.get('file_count', 0)} files)\n"
+            arch_context += "\n"
+        except Exception as arch_e:
+            logger.warning(f"[enrich_context] Architecture map failed: {arch_e}, proceeding without it")
+            arch_context = "🏗️ SYSTEM ARCHITECTURE: (Architecture map unavailable)\n\n"
         
         # Perform semantic search with architectural awareness
         query_emb = await embeddings.embed_query(context_intent)
         results = await store.vector_search(workspace_id, query_emb, top_k=8)  # Get more results for better coverage
         
+        snippet_count = 0
+        component_count = 0
         if results:
             # Group results by architectural component for better organization
             component_groups = {}
@@ -1719,22 +1748,54 @@ async def enrich_context(state: AgentState) -> dict:
             context_parts.append("🎯 RELEVANT CODE BY COMPONENT:")
             context_parts.append("=" * 40)
             
+            component_count = len(component_groups)
             for comp_name, comp_results in component_groups.items():
                 if comp_results:  # Only show components that have relevant results
                     context_parts.append(f"\n📦 {comp_name}:")
                     context_parts.append("-" * 20)
                     
                     flat_results = [r["symbol"] for r in comp_results[:3]]  # Limit per component
+                    snippet_count += len(flat_results)
                     comp_context = chat_utils.build_context_from_results(flat_results)
                     context_parts.append(comp_context)
             
             new_context = "\n".join(context_parts)
             logger.info(f"[enrich_context] Injected architecture-aware context for: {context_intent}")
-            return {"enriched_context": new_context}
+            
+            # After enrichment, capture metrics
+            enrich_time_ms = (time.time() - start_time) * 1000
+            step_metrics['enrichment'] = {
+                'time_ms': enrich_time_ms,
+                'context_size_chars': len(new_context),
+                'context_snippets': snippet_count,
+                'search_query': context_intent,
+                'component_count': component_count,
+                'skipped': False,
+            }
+            
+            return {
+                "enriched_context": new_context,
+                "step_metrics": step_metrics,
+            }
         else:
             # Even if no search results, provide architecture context
             logger.info(f"[enrich_context] No search results, providing architecture context only")
-            return {"enriched_context": arch_context}
+            
+            # After enrichment, capture metrics
+            enrich_time_ms = (time.time() - start_time) * 1000
+            step_metrics['enrichment'] = {
+                'time_ms': enrich_time_ms,
+                'context_size_chars': len(arch_context),
+                'context_snippets': 0,
+                'search_query': context_intent,
+                'component_count': 0,
+                'skipped': False,
+            }
+            
+            return {
+                "enriched_context": arch_context,
+                "step_metrics": step_metrics,
+            }
             
     except Exception as e:
         logger.error(f"[enrich_context] Architecture-aware RAG failed: {e}")
@@ -1747,12 +1808,43 @@ async def enrich_context(state: AgentState) -> dict:
                 flat_results = [r["symbol"] for r in results]
                 new_context = chat_utils.build_context_from_results(flat_results)
                 logger.info(f"[enrich_context] Fallback: Injected {len(flat_results)} snippets for: {context_intent}")
-                return {"enriched_context": new_context}
+                
+                # After enrichment, capture metrics
+                enrich_time_ms = (time.time() - start_time) * 1000
+                step_metrics['enrichment'] = {
+                    'time_ms': enrich_time_ms,
+                    'context_size_chars': len(new_context),
+                    'context_snippets': len(flat_results),
+                    'search_query': context_intent,
+                    'component_count': 0,
+                    'skipped': False,
+                    'fallback': True,
+                }
+                
+                return {
+                    "enriched_context": new_context,
+                    "step_metrics": step_metrics,
+                }
         except Exception as fallback_e:
             logger.error(f"[enrich_context] Fallback also failed: {fallback_e}")
         
+        # After enrichment, capture metrics (error case)
+        enrich_time_ms = (time.time() - start_time) * 1000
+        step_metrics['enrichment'] = {
+            'time_ms': enrich_time_ms,
+            'context_size_chars': 0,
+            'context_snippets': 0,
+            'search_query': context_intent,
+            'component_count': 0,
+            'skipped': False,
+            'error': str(e),
+        }
+        
         # Clear context on error to prevent model from acting on stale/wrong information
-        return {"enriched_context": ""}
+        return {
+            "enriched_context": "",
+            "step_metrics": step_metrics,
+        }
 
 
 
@@ -2156,14 +2248,66 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
     model_with_tools = model.bind_tools(ALL_TOOLS)
     
     # Invoke
+    import time
+    start_time = time.time()
+    
+    # Initialize or get existing metrics
+    step_metrics = state.get('step_metrics', {})
+    agent_turns = step_metrics.get('agent_turns', [])
+    
     try:
         response = await model_with_tools.ainvoke(messages_to_send)
+        
+        # After LLM invocation, capture metrics
+        turn_time_ms = (time.time() - start_time) * 1000
+        
+        turn_metrics = {
+            'turn_number': len(agent_turns) + 1,
+            'time_ms': turn_time_ms,
+            'model_name': model_name,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'total_tokens': 0,
+            'tool_calls_count': len(response.tool_calls) if response.tool_calls else 0,
+        }
+        
+        # Try to extract token usage (LangChain ChatLiteLLM format)
+        if hasattr(response, 'response_metadata'):
+            usage = response.response_metadata.get('usage', {})
+            turn_metrics['input_tokens'] = usage.get('input_tokens', 0) or usage.get('prompt_tokens', 0)
+            turn_metrics['output_tokens'] = usage.get('output_tokens', 0) or usage.get('completion_tokens', 0)
+            turn_metrics['total_tokens'] = usage.get('total_tokens', 0)
+        
+        agent_turns.append(turn_metrics)
+        step_metrics['agent_turns'] = agent_turns
+        
     except Exception as e:
         config = llm_provider.get_config()
         if model_name != config.reasoning_model:
             fallback_model = llm_provider.get_chat_model(config.reasoning_model, temperature=0.1)
             model_with_tools = fallback_model.bind_tools(ALL_TOOLS)
             response = await model_with_tools.ainvoke(messages_to_send)
+            
+            # Capture metrics for fallback call
+            turn_time_ms = (time.time() - start_time) * 1000
+            turn_metrics = {
+                'turn_number': len(agent_turns) + 1,
+                'time_ms': turn_time_ms,
+                'model_name': config.reasoning_model,
+                'input_tokens': 0,
+                'output_tokens': 0,
+                'total_tokens': 0,
+                'tool_calls_count': len(response.tool_calls) if response.tool_calls else 0,
+                'is_fallback': True,
+            }
+            if hasattr(response, 'response_metadata'):
+                usage = response.response_metadata.get('usage', {})
+                turn_metrics['input_tokens'] = usage.get('input_tokens', 0) or usage.get('prompt_tokens', 0)
+                turn_metrics['output_tokens'] = usage.get('output_tokens', 0) or usage.get('completion_tokens', 0)
+                turn_metrics['total_tokens'] = usage.get('total_tokens', 0)
+            
+            agent_turns.append(turn_metrics)
+            step_metrics['agent_turns'] = agent_turns
         else:
             raise
     
@@ -2175,25 +2319,39 @@ IMPORTANT: The semantic search above already queried the codebase for relevant c
             if state.get('last_tool_call') == current_call:
                 repetition_count = state.get('repetition_count', 0) + 1
                 if repetition_count >= 3:
-                    return {"messages": [AIMessage(content=f"I've attempted the same tool call `{tc['name']}` 3 times without success. I'll stop to avoid a loop. Please guide me on how to proceed.")]}
+                    return {
+                        "messages": [AIMessage(content=f"I've attempted the same tool call `{tc['name']}` 3 times without success. I'll stop to avoid a loop. Please guide me on how to proceed.")],
+                        "step_metrics": step_metrics,
+                    }
             
     # Empty response fallback
     if not response.content and not response.tool_calls:
-        return {"messages": [AIMessage(content="I encountered an issue. Let me try a different approach.")]}
+        return {
+            "messages": [AIMessage(content="I encountered an issue. Let me try a different approach.")],
+            "step_metrics": step_metrics,
+        }
     
-    return {"messages": [response]}
+    return {
+        "messages": [response],
+        "step_metrics": step_metrics,
+    }
 
 
 async def execute_server_tools(state: AgentState) -> dict:
     """Execute tools that run on the server and update agent state."""
     import asyncio
     import inspect
+    import time
     last_message = state['messages'][-1]
     
     # Identify all server tool calls in this turn
     server_calls = [tc for tc in last_message.tool_calls if tc['name'] in SERVER_TOOL_NAMES]
     if not server_calls:
         return {}
+
+    # Initialize or get existing metrics
+    step_metrics = state.get('step_metrics', {})
+    tool_executions = step_metrics.get('tool_executions', [])
 
     # Track state updates
     updates = {}
@@ -2202,8 +2360,17 @@ async def execute_server_tools(state: AgentState) -> dict:
     async def _run_tool(tool_call):
         tool_name = tool_call['name']
         tool_func = next((t for t in SERVER_TOOLS if t.name == tool_name), None)
+        start_time = time.time()
+        
         if not tool_func:
-            return ToolMessage(content=f"Error: Tool {tool_name} not found", tool_call_id=tool_call['id'])
+            error_msg = f"Error: Tool {tool_name} not found"
+            tool_executions.append({
+                'tool_name': tool_name,
+                'time_ms': (time.time() - start_time) * 1000,
+                'success': False,
+                'error': error_msg,
+            })
+            return ToolMessage(content=error_msg, tool_call_id=tool_call['id']), None
             
         try:
             # Extract kwargs and inject state if needed
@@ -2236,10 +2403,24 @@ async def execute_server_tools(state: AgentState) -> dict:
                     'current_step': plan_data['current_step']
                 }
                 content = plan_data['status']
+            
+            # Capture metrics
+            tool_executions.append({
+                'tool_name': tool_name,
+                'time_ms': (time.time() - start_time) * 1000,
+                'success': True,
+                'result_size_chars': len(str(content)),
+            })
                 
             return ToolMessage(content=content, tool_call_id=tool_call['id']), plan_update
         except Exception as e:
             logger.error("Server tool %s failed: %s", tool_name, e)
+            tool_executions.append({
+                'tool_name': tool_name,
+                'time_ms': (time.time() - start_time) * 1000,
+                'success': False,
+                'error': str(e)[:200],
+            })
             return ToolMessage(content=f"Error executing {tool_name}: {e}", tool_call_id=tool_call['id']), None
 
     # Execute all server tools in parallel
@@ -2250,7 +2431,9 @@ async def execute_server_tools(state: AgentState) -> dict:
         if plan_upd:
             updates.update(plan_upd)
     
+    step_metrics['tool_executions'] = tool_executions
     updates["messages"] = tool_outputs
+    updates["step_metrics"] = step_metrics
     return updates
 
 

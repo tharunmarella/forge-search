@@ -185,12 +185,58 @@ export default function RunPage() {
             Copy as Markdown
           </Button>
         </div>
+        {/* Enrichment Node - Always shown first */}
+        <div className="flex flex-col items-center">
+          <div className="w-full p-4 rounded-lg border bg-card border-amber-500/20">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-amber-500/10 text-xs font-medium text-amber-600">
+                0
+              </div>
+              <Layers className="h-4 w-4 text-amber-600" />
+              <div className="font-medium text-sm text-amber-600">enrichment</div>
+              <Badge variant="outline" className="text-xs border-amber-500/30">
+                pre-processing
+              </Badge>
+              {trace.step_metrics?.enrichment && (
+                <Badge variant="outline" className="text-xs ml-auto border-amber-500/30 text-amber-600">
+                  {trace.step_metrics.enrichment.time_ms.toFixed(1)}ms
+                </Badge>
+              )}
+            </div>
+            <div className="text-xs pl-9 text-muted-foreground">
+              {trace.step_metrics?.enrichment ? (
+                <div className="space-y-1">
+                  <div>✓ Query: <span className="text-amber-600/80 font-mono">{trace.step_metrics.enrichment.search_query}</span></div>
+                  <div className="flex gap-4">
+                    <div>✓ Snippets: <span className="text-foreground">{trace.step_metrics.enrichment.context_snippets}</span></div>
+                    <div>✓ Components: <span className="text-foreground">{trace.step_metrics.enrichment.component_count}</span></div>
+                    <div>✓ Size: <span className="text-foreground">{(trace.step_metrics.enrichment.context_size_chars / 1024).toFixed(1)}KB</span></div>
+                  </div>
+                  {trace.step_metrics.enrichment.fallback && <div className="text-amber-600 italic">! Used fallback search</div>}
+                  {trace.step_metrics.enrichment.error && <div className="text-destructive">! Error: {trace.step_metrics.enrichment.error}</div>}
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <div>✓ Semantic search from pgvector</div>
+                  <div>✓ Architecture map loaded</div>
+                  <div>✓ Context injected before LLM</div>
+                </div>
+              )}
+            </div>
+          </div>
+          <ArrowDown className="h-5 w-5 my-2 text-muted-foreground" />
+        </div>
 
         {messages.map((msg: any, index: number) => {
           const isLast = index === messages.length - 1;
           const isExpanded = expandedMessages.has(index);
           const nodeNumber = index + 1;
           
+          let aiTurnIndex = -1;
+          if (msg.type === "ai") {
+            aiTurnIndex = messages.slice(0, index + 1).filter((m: any) => m.type === "ai").length - 1;
+          }
+
           // Human Message
           if (msg.type === 'human') {
             const content = msg.content || '';
@@ -262,6 +308,16 @@ export default function RunPage() {
                       <Badge variant="secondary" className="text-xs">
                         {msg.tool_calls.length} tool call{msg.tool_calls.length > 1 ? 's' : ''}
                       </Badge>
+                    )}
+                    {trace.step_metrics?.agent_turns?.[aiTurnIndex] && (
+                      <>
+                        <Badge variant="outline" className="text-xs font-mono border-purple-500/30 text-purple-600">
+                          {trace.step_metrics.agent_turns[aiTurnIndex].total_tokens} tokens
+                        </Badge>
+                        <Badge variant="outline" className="text-xs border-purple-500/30 text-purple-600">
+                          {trace.step_metrics.agent_turns[aiTurnIndex].time_ms.toFixed(0)}ms
+                        </Badge>
+                      </>
                     )}
                     <div className="ml-auto flex items-center gap-2">
                       <div className="text-xs text-muted-foreground flex items-center gap-1">
@@ -361,6 +417,11 @@ export default function RunPage() {
                     <Badge variant="outline" className="text-xs">
                       {toolName}
                     </Badge>
+                    {trace.step_metrics?.tool_executions?.find((t: any) => t.tool_name === toolName) && (
+                      <Badge variant="outline" className="text-xs border-green-500/30 text-green-600">
+                        {trace.step_metrics.tool_executions.find((t: any) => t.tool_name === toolName).time_ms.toFixed(1)}ms
+                      </Badge>
+                    )}
                     {hasError && (
                       <Badge variant="destructive" className="text-xs">
                         error
@@ -511,6 +572,44 @@ export default function RunPage() {
                   </div>
                 </CardContent>
               </Card>
+
+              {/* Performance Metrics Summary */}
+              {lastTrace?.step_metrics && (
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm font-medium">Performance Metrics</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="space-y-1">
+                        <div className="text-2xl font-bold text-amber-600">
+                          {lastTrace.step_metrics.enrichment?.time_ms?.toFixed(0) || 0}ms
+                        </div>
+                        <div className="text-xs text-muted-foreground">Enrichment Time</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-2xl font-bold text-purple-600">
+                          {lastTrace.step_metrics.agent_turns?.reduce((sum: number, t: any) => sum + (t.total_tokens || 0), 0) || 0}
+                        </div>
+                        <div className="text-xs text-muted-foreground">Total Tokens</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-2xl font-bold text-purple-600">
+                          {lastTrace.step_metrics.agent_turns?.reduce((sum: number, t: any) => sum + (t.time_ms || 0), 0).toFixed(0) || 0}ms
+                        </div>
+                        <div className="text-xs text-muted-foreground">LLM Reasoning Time</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-2xl font-bold text-green-600">
+                          {lastTrace.step_metrics.tool_executions?.reduce((sum: number, t: any) => sum + (t.time_ms || 0), 0).toFixed(0) || 0}ms
+                        </div>
+                        <div className="text-xs text-muted-foreground">Tool Execution Time</div>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
 
               {/* Plan Steps if available */}
               {lastTrace?.response?.plan_steps && lastTrace.response.plan_steps.length > 0 && (

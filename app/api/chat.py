@@ -57,12 +57,49 @@ async def _log_trace_to_mongo(
     execution_time_ms: float,
     status: str,
     error: str = None,
+    step_metrics: dict = None,
 ):
-    """Log a complete trace (request + response) to MongoDB."""
+    """Log a complete trace (request + response) to MongoDB with detailed metrics.
+    
+    step_metrics format:
+    {
+        "enrichment": {
+            "time_ms": float,
+            "context_size_chars": int,
+            "context_snippets": int,
+            "search_query": str,
+        },
+        "agent_turns": [
+            {
+                "turn_number": int,
+                "time_ms": float,
+                "input_tokens": int,
+                "output_tokens": int,
+                "total_tokens": int,
+                "tool_calls": [{"name": str, "time_ms": float}],
+            }
+        ],
+        "total_tokens": int,
+        "total_tool_calls": int,
+    }
+    """
     if _traces_collection is None:
         return
 
     try:
+        # Calculate additional metrics
+        messages = response_data.get("messages", [])
+        message_count = len(messages)
+        tool_call_count = sum(
+            len(m.get("tool_calls", [])) 
+            for m in messages 
+            if m.get("type") == "ai"
+        )
+        
+        # Check if response has a plan
+        has_plan = bool(response_data.get("plan_steps"))
+        current_step = response_data.get("current_step")
+        
         trace_doc = {
             "thread_id": thread_id,
             "workspace_id": workspace_id,
@@ -73,11 +110,17 @@ async def _log_trace_to_mongo(
             "execution_time_ms": execution_time_ms,
             "status": status,
             "error": error,
+            # Enhanced metrics
+            "message_count": message_count,
+            "tool_call_count": tool_call_count,
+            "has_plan": has_plan,
+            "current_step": current_step,
+            "step_metrics": step_metrics or {},
         }
         await _traces_collection.insert_one(trace_doc)
         logger.info(
-            "[mongo_trace] Logged trace for thread=%s, time=%.1fms, status=%s",
-            thread_id, execution_time_ms, status,
+            "[mongo_trace] Logged trace for thread=%s, time=%.1fms, status=%s, msgs=%d, tools=%d",
+            thread_id, execution_time_ms, status, message_count, tool_call_count,
         )
     except Exception as e:
         logger.error("[mongo_trace] Failed to log trace: %s", e)
@@ -501,6 +544,7 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(auth.get_current_
             },
             execution_time_ms=elapsed,
             status=status,
+            step_metrics=result.get('step_metrics', {}),
         )
 
         return ChatResponse(
@@ -745,6 +789,7 @@ async def chat_stream_endpoint(req: ChatRequest, user: dict = Depends(auth.get_c
                 },
                 execution_time_ms=elapsed,
                 status="done",
+                step_metrics=result.get('step_metrics', {}),
             )
 
             yield f"event: done\ndata: {json.dumps({'answer': answer, 'total_time_ms': round(elapsed, 1)})}\n\n"

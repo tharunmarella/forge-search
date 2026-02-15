@@ -78,7 +78,7 @@ async def list_traces(
             "error": trace.get("error"),
             "message_count": trace.get("response", {}).get("message_count", 0),
             "has_plan": bool(trace.get("response", {}).get("plan_steps")),
-            "tool_call_count": len(trace.get("response", {}).get("tool_calls", [])),
+            "tool_call_count": len(trace.get("response", {}).get("tool_calls") or []),
         })
     
     return {
